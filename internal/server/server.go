@@ -181,8 +181,13 @@ func (s *Server) mountMCP(r chi.Router, tokens mcpauth.TokenVerifier) {
 		// clients derive from the resource URL.
 		metaURL := s.cfg.AppBaseURL + "/.well-known/oauth-protected-resource"
 		meta := mcpauth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
-			Resource:               s.cfg.MCPResource,
-			AuthorizationServers:   []string{s.cfg.OIDCIssuer},
+			Resource:             s.cfg.MCPResource,
+			AuthorizationServers: []string{s.cfg.OIDCIssuer},
+			// Without this, MCP clients fall back to every scope the issuer
+			// publishes, and Logto answers invalid_scope to a client that
+			// identifies itself with a metadata document (CIMD): it grants
+			// those only openid and offline_access.
+			ScopesSupported:        []string{"openid", "offline_access"},
 			BearerMethodsSupported: []string{"header"},
 			ResourceName:           "Specola",
 		})

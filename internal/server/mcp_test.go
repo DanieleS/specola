@@ -144,9 +144,11 @@ func TestMCPProtectedResourceMetadata(t *testing.T) {
 		var meta struct {
 			Resource             string   `json:"resource"`
 			AuthorizationServers []string `json:"authorization_servers"`
+			ScopesSupported      []string `json:"scopes_supported"`
 		}
 		mustJSON(t, body, &meta)
-		if meta.Resource != testResource || len(meta.AuthorizationServers) != 1 || meta.AuthorizationServers[0] != fi.URL {
+		if meta.Resource != testResource || len(meta.AuthorizationServers) != 1 || meta.AuthorizationServers[0] != fi.URL ||
+			strings.Join(meta.ScopesSupported, " ") != "openid offline_access" {
 			t.Fatalf("GET %s: %+v", path, meta)
 		}
 	}
