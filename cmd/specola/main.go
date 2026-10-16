@@ -44,12 +44,15 @@ func main() {
 	defer pool.Close()
 
 	var authn *auth.Auth
-	if cfg.OIDCConfigured() {
+	switch {
+	case cfg.TrustedUserHeader != "":
+		slog.Info("auth: trusting proxy header", "header", cfg.TrustedUserHeader)
+	case cfg.UsesOwnOIDC():
 		if authn, err = auth.New(ctx, cfg); err != nil {
 			fatal("oidc discovery", err)
 		}
-	} else {
-		slog.Warn("OIDC not configured — running with dev auth bypass", "dev_email", cfg.DevAuthEmail)
+	default:
+		slog.Warn("auth: dev bypass — every request is one user", "dev_email", cfg.DevAuthEmail)
 	}
 
 	srv := &http.Server{

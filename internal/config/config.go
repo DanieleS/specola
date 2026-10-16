@@ -21,7 +21,14 @@ type Config struct {
 	LogtoAppID     string
 	LogtoAppSecret string
 
-	// DevAuthEmail bypasses OIDC entirely and treats every request as this
+	// TrustedUserHeader, when set, makes Specola read the caller's identity from
+	// this request header (e.g. X-Forwarded-User) instead of running its own
+	// OIDC. Use it only behind a trusted authenticating proxy that sets the
+	// header and is the sole network path to Specola — the header must not be
+	// client-settable.
+	TrustedUserHeader string
+
+	// DevAuthEmail bypasses auth entirely and treats every request as this
 	// user. For local development only; never set in production.
 	DevAuthEmail string
 }
@@ -34,22 +41,32 @@ func Load() (*Config, error) {
 		SessionSecret:  os.Getenv("SPECOLA_SESSION_SECRET"),
 		LogtoEndpoint:  os.Getenv("SPECOLA_LOGTO_ENDPOINT"),
 		LogtoAppID:     os.Getenv("SPECOLA_LOGTO_APP_ID"),
-		LogtoAppSecret: os.Getenv("SPECOLA_LOGTO_APP_SECRET"),
-		DevAuthEmail:   os.Getenv("SPECOLA_DEV_AUTH_EMAIL"),
+		LogtoAppSecret:    os.Getenv("SPECOLA_LOGTO_APP_SECRET"),
+		TrustedUserHeader: os.Getenv("SPECOLA_TRUSTED_USER_HEADER"),
+		DevAuthEmail:      os.Getenv("SPECOLA_DEV_AUTH_EMAIL"),
 	}
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("SPECOLA_DATABASE_URL is required")
 	}
-	if c.DevAuthEmail == "" && c.SessionSecret == "" {
-		return nil, fmt.Errorf("SPECOLA_SESSION_SECRET is required (or set SPECOLA_DEV_AUTH_EMAIL for local dev)")
+	if c.TrustedUserHeader == "" && !c.OIDCConfigured() && c.DevAuthEmail == "" {
+		return nil, fmt.Errorf("configure one auth mode: SPECOLA_TRUSTED_USER_HEADER, SPECOLA_LOGTO_* or SPECOLA_DEV_AUTH_EMAIL")
+	}
+	// Own OIDC login needs a secret to sign the session cookie.
+	if c.UsesOwnOIDC() && c.SessionSecret == "" {
+		return nil, fmt.Errorf("SPECOLA_SESSION_SECRET is required for OIDC login")
 	}
 	return c, nil
 }
 
-// OIDCConfigured reports whether real Logto login is wired up. When false the
-// server falls back to DevAuthEmail.
+// OIDCConfigured reports whether Logto credentials are present.
 func (c *Config) OIDCConfigured() bool {
 	return c.LogtoEndpoint != "" && c.LogtoAppID != "" && c.LogtoAppSecret != ""
+}
+
+// UsesOwnOIDC reports whether Specola runs its own OIDC flow (as opposed to
+// trusting a proxy header, which takes precedence).
+func (c *Config) UsesOwnOIDC() bool {
+	return c.TrustedUserHeader == "" && c.OIDCConfigured()
 }
 
 func (c *Config) Secure() bool { return strings.HasPrefix(c.AppBaseURL, "https") }

@@ -73,16 +73,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.Serve
 // stashes it in the request context.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		email := s.cfg.DevAuthEmail
-		if s.auth != nil {
+		var email string
+		switch {
+		case s.cfg.TrustedUserHeader != "":
+			email = strings.TrimSpace(r.Header.Get(s.cfg.TrustedUserHeader))
+		case s.auth != nil:
 			email = s.auth.Email(r)
+		default:
+			email = s.cfg.DevAuthEmail
 		}
 		if email == "" {
-			if strings.HasPrefix(r.URL.Path, "/api") {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			// Only our own OIDC flow can recover an anonymous browser request.
+			if s.auth != nil && !strings.HasPrefix(r.URL.Path, "/api") {
+				http.Redirect(w, r, "/auth/login", http.StatusFound)
 				return
 			}
-			http.Redirect(w, r, "/auth/login", http.StatusFound)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), emailKey, email)))
