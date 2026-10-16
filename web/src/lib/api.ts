@@ -1,3 +1,5 @@
+export type Role = "owner" | "editor" | "viewer";
+
 export type TreeItem = {
   id: string;
   kind: "folder" | "page";
@@ -5,6 +7,8 @@ export type TreeItem = {
   slug: string;
   version?: number;
   updatedAt: string;
+  role: Role;
+  shared: boolean;
 };
 
 export type PageMeta = {
@@ -14,7 +18,21 @@ export type PageMeta = {
   folderId: string | null;
   version: number;
   updatedAt: string;
+  role: Role;
+  shared: boolean;
 };
+
+export type Share = {
+  sub: string;
+  email?: string;
+  name?: string;
+  role: "viewer" | "editor";
+  createdAt: string;
+};
+
+export type ItemKind = "page" | "folder";
+
+const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
 
 export class Unauthorized extends Error {
   constructor() {
@@ -52,4 +70,12 @@ export const api = {
   createPage: (name: string, html: string, folderId: string | null) =>
     req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId }),
   pageMeta: (id: string) => req<PageMeta>("GET", `/api/pages/${id}`),
+  shared: () => req<TreeItem[]>("GET", "/api/shared"),
+  shares: (kind: ItemKind, id: string) => req<Share[]>("GET", aclPath(kind, id)),
+  share: (kind: ItemKind, id: string, email: string, role: Share["role"]) =>
+    req<void>("PUT", aclPath(kind, id), { email, role }),
+  setShareRole: (kind: ItemKind, id: string, sub: string, role: Share["role"]) =>
+    req<void>("PUT", aclPath(kind, id), { sub, role }),
+  unshare: (kind: ItemKind, id: string, sub: string) =>
+    req<void>("DELETE", `${aclPath(kind, id)}?sub=${encodeURIComponent(sub)}`),
 };

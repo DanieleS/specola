@@ -50,11 +50,11 @@ func (s *Store) MintGrant(ctx context.Context, req GrantRequest, ttl time.Durati
 		if req.Name == "" {
 			return "", time.Time{}, errors.New("name is required")
 		}
-		if err := checkFolder(ctx, s.pool, req.FolderID, req.Sub); err != nil {
+		if err := checkFolder(ctx, s.pool, req.FolderID, req.Sub, RoleEditor); err != nil {
 			return "", time.Time{}, err
 		}
 	case GrantUploadVersion:
-		if err := checkPage(ctx, s.pool, req.AssetID, req.Sub); err != nil {
+		if err := checkPage(ctx, s.pool, req.AssetID, req.Sub, RoleEditor); err != nil {
 			return "", time.Time{}, err
 		}
 		assetID = &req.AssetID
@@ -81,7 +81,7 @@ func (s *Store) MintGrant(ctx context.Context, req GrantRequest, ttl time.Durati
 // RedeemUpload uses an upload grant: it creates the page or adds the version
 // as the minting user, and marks the grant consumed, all in one transaction.
 // It returns ErrNotFound for an unknown token or when the user has lost access
-// to the target, ErrGrantGone for a used or expired grant, and ErrGrantKind
+// to the target (ErrForbidden if they can still see it but no longer edit), ErrGrantGone for a used or expired grant, and ErrGrantKind
 // for a grant that isn't an upload.
 func (s *Store) RedeemUpload(ctx context.Context, token, html string) (id string, version int, err error) {
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
@@ -138,27 +138,6 @@ func (s *Store) SweepGrants(ctx context.Context, grace time.Duration) (int64, er
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
-}
-
-// checkPage returns ErrNotFound unless assetID names an active page owned by
-// sub.
-func checkPage(ctx context.Context, q querier, assetID, sub string) error {
-	var ok bool
-	err := q.QueryRow(ctx, `
-		SELECT EXISTS (
-		  SELECT 1 FROM asset
-		  WHERE id = $1::uuid AND created_by_sub = $2
-		    AND deleted_at IS NULL AND archived_at IS NULL)`, assetID, sub).Scan(&ok)
-	if err != nil {
-		if isInvalidText(err) {
-			return ErrNotFound
-		}
-		return err
-	}
-	if !ok {
-		return ErrNotFound
-	}
-	return nil
 }
 
 func hashToken(token string) string {

@@ -80,6 +80,12 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Post("/pages", s.handleCreatePage)
 			r.Get("/pages/{id}", s.handlePageMeta)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
+			r.Get("/shared", s.handleShared)
+			for _, k := range []string{"pages", "folders"} {
+				r.Get("/"+k+"/{id}/acl", s.handleListShares)
+				r.Put("/"+k+"/{id}/acl", s.handleShare)
+				r.Delete("/"+k+"/{id}/acl", s.handleUnshare)
+			}
 		})
 	})
 
@@ -281,6 +287,81 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, meta)
 }
 
+func (s *Server) handleShared(w http.ResponseWriter, r *http.Request) {
+	items, err := s.st.SharedWithMe(r.Context(), subOf(r.Context()))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// itemKind maps the /api/{pages|folders}/... path segment to a store kind.
+func itemKind(r *http.Request) store.ItemKind {
+	if strings.HasPrefix(r.URL.Path, "/api/folders/") {
+		return store.KindFolder
+	}
+	return store.KindPage
+}
+
+func (s *Server) handleListShares(w http.ResponseWriter, r *http.Request) {
+	shares, err := s.st.Shares(r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id"))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, shares)
+}
+
+type shareReq struct {
+	// Email names the subject; Sub may be given instead.
+	Email string `json:"email"`
+	Sub   string `json:"sub"`
+	Role  string `json:"role"`
+}
+
+func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
+	var req shareReq
+	if !decode(w, r, &req) {
+		return
+	}
+	role, ok := store.ParseShareRole(req.Role)
+	if !ok {
+		http.Error(w, `role must be "viewer" or "editor"`, http.StatusBadRequest)
+		return
+	}
+	subject := strings.TrimSpace(req.Sub)
+	if subject == "" {
+		if strings.TrimSpace(req.Email) == "" {
+			http.Error(w, "email is required", http.StatusBadRequest)
+			return
+		}
+		var err error
+		if subject, err = s.st.UserByEmail(r.Context(), req.Email); err != nil {
+			httpError(w, err)
+			return
+		}
+	}
+	if err := s.st.Share(r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id"), subject, role); err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUnshare(w http.ResponseWriter, r *http.Request) {
+	subject := strings.TrimSpace(r.URL.Query().Get("sub"))
+	if subject == "" {
+		http.Error(w, "sub query parameter is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.st.Unshare(r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id"), subject); err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleView serves a page's stored HTML. The CSP sandbox puts the page on an
 // opaque origin so its scripts cannot read Specola's cookies or call its API.
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
@@ -342,7 +423,10 @@ func httpError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrGrantGone):
 		http.Error(w, err.Error(), http.StatusGone)
 		return
-	case errors.Is(err, store.ErrGrantKind):
+	case errors.Is(err, store.ErrForbidden):
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	case errors.Is(err, store.ErrGrantKind), errors.Is(err, store.ErrUnknownUser), errors.Is(err, store.ErrSelfShare):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

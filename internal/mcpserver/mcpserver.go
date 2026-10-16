@@ -45,6 +45,7 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "list", Description: listDesc}, t.list)
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_page", Description: getPageDesc}, t.getPage)
 	mcp.AddTool(srv, &mcp.Tool{Name: "create_upload_grant", Description: grantDesc}, t.createUploadGrant)
+	mcp.AddTool(srv, &mcp.Tool{Name: "share", Description: shareDesc}, t.share)
 
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
 		Stateless:                  true,
@@ -64,8 +65,9 @@ const htmlNote = ` The HTML must be a complete, self-contained document: inline 
 const (
 	publishDesc    = `Publish a new HTML page to the user's Specola gallery and return its id and link.` + htmlNote
 	newVersionDesc = `Replace the content of an existing page by adding a new version. Earlier versions stay in the history.` + htmlNote
-	listDesc       = `List the folders and pages in a folder of the user's gallery (the root when folder_id is omitted).`
+	listDesc       = `List the folders and pages in a folder of the user's gallery (the user's own root when folder_id is omitted), or with shared_with_me the items other users shared with them. Each item carries the user's role: owner, editor or viewer.`
 	getPageDesc    = `Get a page's metadata and the HTML of its current version.`
+	shareDesc      = `Share a page or folder the user owns with another Specola user by email. role "viewer" can read, "editor" can also add versions and create items inside a folder, "none" removes the share. Sharing a folder covers everything beneath it. The other user must have signed in to Specola at least once.`
 	grantDesc      = `Get a one-time URL to upload a large HTML file over plain HTTP instead of passing it as a tool argument. kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. PUT the raw HTML file as the request body (see the returned curl command) within 10 minutes; the response holds the page id, version and url.`
 )
 
@@ -94,8 +96,11 @@ func (t *tools) pageURL(id string) string { return t.opts.BaseURL + "/#/p/" + id
 
 // toolError maps store errors to messages an agent can act on.
 func toolError(err error, what string) error {
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		return fmt.Errorf("%s not found", what)
+	case errors.Is(err, store.ErrForbidden):
+		return fmt.Errorf("the user has access to this %s but not enough to do that", what)
 	}
 	return err
 }
@@ -153,7 +158,8 @@ func (t *tools) newVersion(ctx context.Context, req *mcp.CallToolRequest, in new
 }
 
 type listIn struct {
-	FolderID *string `json:"folder_id,omitempty" jsonschema:"folder to list; the root when omitted"`
+	FolderID     *string `json:"folder_id,omitempty" jsonschema:"folder to list; the root when omitted"`
+	SharedWithMe bool    `json:"shared_with_me,omitempty" jsonschema:"list the items shared with the user instead"`
 }
 
 type listItem struct {
@@ -170,7 +176,12 @@ func (t *tools) list(ctx context.Context, req *mcp.CallToolRequest, in listIn) (
 	if err != nil {
 		return nil, listOut{}, err
 	}
-	items, err := t.st.Tree(ctx, who.Sub, in.FolderID)
+	var items []store.TreeItem
+	if in.SharedWithMe {
+		items, err = t.st.SharedWithMe(ctx, who.Sub)
+	} else {
+		items, err = t.st.Tree(ctx, who.Sub, in.FolderID)
+	}
 	if err != nil {
 		return nil, listOut{}, toolError(err, "folder")
 	}
@@ -257,4 +268,45 @@ func (t *tools) createUploadGrant(ctx context.Context, req *mcp.CallToolRequest,
 		ExpiresAt: expires,
 		Curl:      fmt.Sprintf("curl -sS -X PUT -H 'Content-Type: text/html' --data-binary @page.html '%s'", url),
 	}, nil
+}
+
+type shareIn struct {
+	Kind  string `json:"kind" jsonschema:"page or folder"`
+	ID    string `json:"id" jsonschema:"id of the page or folder"`
+	Email string `json:"email" jsonschema:"email of the user to share with"`
+	Role  string `json:"role" jsonschema:"viewer, editor, or none to remove the share"`
+}
+
+type shareOut struct {
+	Shares []store.Share `json:"shares"`
+}
+
+func (t *tools) share(ctx context.Context, req *mcp.CallToolRequest, in shareIn) (*mcp.CallToolResult, shareOut, error) {
+	who, err := t.caller(ctx, req)
+	if err != nil {
+		return nil, shareOut{}, err
+	}
+	kind := store.ItemKind(in.Kind)
+	if kind != store.KindPage && kind != store.KindFolder {
+		return nil, shareOut{}, errors.New(`kind must be "page" or "folder"`)
+	}
+	subject, err := t.st.UserByEmail(ctx, in.Email)
+	if err != nil {
+		return nil, shareOut{}, err
+	}
+	if in.Role == "none" {
+		err = t.st.Unshare(ctx, who.Sub, kind, in.ID, subject)
+	} else if role, ok := store.ParseShareRole(in.Role); ok {
+		err = t.st.Share(ctx, who.Sub, kind, in.ID, subject, role)
+	} else {
+		return nil, shareOut{}, errors.New(`role must be "viewer", "editor" or "none"`)
+	}
+	if err != nil {
+		return nil, shareOut{}, toolError(err, in.Kind)
+	}
+	shares, err := t.st.Shares(ctx, who.Sub, kind, in.ID)
+	if err != nil {
+		return nil, shareOut{}, toolError(err, in.Kind)
+	}
+	return nil, shareOut{Shares: shares}, nil
 }

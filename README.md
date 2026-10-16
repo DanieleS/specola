@@ -5,14 +5,14 @@ self-contained HTML page (an explainer, a report, a small interactive app),
 organise pages in folders, keep a version history, and share them read-only or
 read-write with other people — all behind your own OIDC login.
 
-Until sharing lands, every folder and page is private to the user who created
-it; anything else answers 404.
+Pages are private to their author until shared. An item you can't see answers
+404; one you can see but not change answers 403.
 
 Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
-> Status: early. Publish, browse, version, view, and an OAuth-protected MCP
-> endpoint for agents. Sharing ACLs and search land next.
+> Status: early. Publish, browse, version, view, share, and an OAuth-protected
+> MCP endpoint for agents. Search lands next.
 
 ## Stack
 
@@ -42,6 +42,23 @@ tokens), not by email.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
   HTML body instead of inlining it in a request.
 - **favorite** — personal stars.
+
+## Sharing
+
+Share a folder or page with another user by email, as **viewer** (read) or
+**editor** (also add versions and create items inside a folder).
+
+- The **owner** is whoever created the item or any folder above it, so pages
+  an editor adds to your shared folder stay yours to manage. Only owners
+  manage shares.
+- A folder share applies to everything beneath it. The nearest share wins:
+  a viewer share on a sub-folder narrows an editor share above it.
+- You can only share with someone who has signed in once, since that's how
+  their email maps to a `sub`.
+- Shared items show up under **Shared with me**.
+
+API: `GET/PUT/DELETE /api/{pages|folders}/{id}/acl` (`PUT` takes
+`{"email" | "sub", "role"}`, `DELETE` takes `?sub=`), and `GET /api/shared`.
 
 ## Configuration
 
@@ -109,6 +126,7 @@ land in that user's gallery.
 | `new_version` | `id`, `html` | `{version, url}` |
 | `list` | `folder_id?` | folders and pages |
 | `get_page` | `id` | metadata and the current HTML |
+| `share` | `kind`, `id`, `email`, `role` (`viewer` / `editor` / `none`) | the item's shares |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?` | one-time upload URL and a `curl` example |
 
 Large pages shouldn't travel as tool arguments (models truncate long outputs),

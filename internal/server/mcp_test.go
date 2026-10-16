@@ -318,3 +318,43 @@ func TestMCPUploadGrant(t *testing.T) {
 		t.Fatalf("bob grant on alice's page succeeded: %+v", res)
 	}
 }
+
+func TestMCPShare(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ts := newMCPTestServer(t, fi)
+	const bob = "bob@example.com"
+	call(t, ts, bob, "GET", "/api/me", "") // bob signs in once
+
+	alice, err := connect(t, ts, fi.token(t, "alice", testResource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Close()
+	var pub struct{ ID string }
+	callTool(t, alice, "publish_page", map[string]any{"title": "Shared", "html": "<p>hi</p>"}, &pub)
+
+	var out struct{ Shares []struct{ Sub, Role string } }
+	callTool(t, alice, "share", map[string]any{"kind": "page", "id": pub.ID, "email": bob, "role": "viewer"}, &out)
+	if len(out.Shares) != 1 || out.Shares[0].Sub != bob || out.Shares[0].Role != "viewer" {
+		t.Fatalf("share = %+v", out)
+	}
+
+	bobMCP, err := connect(t, ts, fi.token(t, bob, testResource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bobMCP.Close()
+	var list struct{ Items []struct{ ID, Role string } }
+	callTool(t, bobMCP, "list", map[string]any{"shared_with_me": true}, &list)
+	if len(list.Items) != 1 || list.Items[0].ID != pub.ID || list.Items[0].Role != "viewer" {
+		t.Fatalf("bob shared list = %+v", list)
+	}
+	if res := callTool(t, bobMCP, "new_version", map[string]any{"id": pub.ID, "html": "x"}, nil); !res.IsError {
+		t.Fatal("viewer added a version")
+	}
+
+	callTool(t, alice, "share", map[string]any{"kind": "page", "id": pub.ID, "email": bob, "role": "none"}, &out)
+	if len(out.Shares) != 0 {
+		t.Fatalf("after unshare = %+v", out)
+	}
+}

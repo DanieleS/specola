@@ -29,6 +29,8 @@ type TreeItem struct {
 	Slug      string    `json:"slug"`
 	Version   int       `json:"version,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	Role      string    `json:"role"`   // the caller's Role on the item
+	Shared    bool      `json:"shared"` // the item itself has shares
 }
 
 // PageMeta is the metadata the viewer header needs.
@@ -39,98 +41,84 @@ type PageMeta struct {
 	FolderID  *string   `json:"folderId"`
 	Version   int       `json:"version"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	Role      string    `json:"role"`
+	Shared    bool      `json:"shared"`
 }
 
-// Visibility: until sharing lands, folders and pages are private to the user
-// who created them. Every read and write below is scoped to the caller's sub,
-// and an item the caller can't see is reported as ErrNotFound so its existence
-// isn't leaked.
-
-// querier is the part of pgxpool.Pool and pgx.Tx the helpers below need.
+// querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// checkFolder returns ErrNotFound unless folderID is nil (the root) or names an
-// active folder owned by sub.
-func checkFolder(ctx context.Context, q querier, folderID *string, sub string) error {
-	if folderID == nil {
-		return nil
-	}
-	var ok bool
-	err := q.QueryRow(ctx, `
-		SELECT EXISTS (
-		  SELECT 1 FROM folder
-		  WHERE id = $1::uuid AND created_by_sub = $2
-		    AND deleted_at IS NULL AND archived_at IS NULL)`, *folderID, sub).Scan(&ok)
-	if err != nil {
-		if isInvalidText(err) {
-			return ErrNotFound
-		}
-		return err
-	}
-	if !ok {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// Tree lists sub's active folders and pages directly under parentID (nil =
-// root).
+// Tree lists the active folders and pages directly under parentID. At the root
+// (nil) that is the caller's own items; inside a folder they can see, it is
+// everything there, whoever created it.
 func (s *Store) Tree(ctx context.Context, sub string, parentID *string) ([]TreeItem, error) {
-	if err := checkFolder(ctx, s.pool, parentID, sub); err != nil {
+	if err := checkFolder(ctx, s.pool, parentID, sub, RoleViewer); err != nil {
 		return nil, err
 	}
+	return listItems(ctx, s.pool, `
+		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($2, f.id),
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.folder_id = f.id)
+		FROM folder f
+		WHERE f.deleted_at IS NULL AND f.archived_at IS NULL
+		  AND f.parent_id IS NOT DISTINCT FROM $1::uuid
+		  AND ($1::uuid IS NOT NULL OR f.created_by_sub = $2)
+		ORDER BY f.name`, `
+		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($2, a.id),
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		FROM asset a
+		WHERE a.deleted_at IS NULL AND a.archived_at IS NULL
+		  AND a.folder_id IS NOT DISTINCT FROM $1::uuid
+		  AND ($1::uuid IS NOT NULL OR a.created_by_sub = $2)
+		ORDER BY a.updated_at DESC`, parentID, sub)
+}
+
+// SharedWithMe lists the active folders and pages shared directly with sub.
+func (s *Store) SharedWithMe(ctx context.Context, sub string) ([]TreeItem, error) {
+	return listItems(ctx, s.pool, `
+		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($1, f.id), true
+		FROM acl_entry e JOIN folder f ON f.id = e.folder_id
+		WHERE e.subject_sub = $1 AND f.deleted_at IS NULL AND f.archived_at IS NULL
+		ORDER BY f.name`, `
+		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($1, a.id), true
+		FROM acl_entry e JOIN asset a ON a.id = e.asset_id
+		WHERE e.subject_sub = $1 AND a.deleted_at IS NULL AND a.archived_at IS NULL
+		ORDER BY a.updated_at DESC`, sub)
+}
+
+// listItems runs a folder query then a page query with the same arguments,
+// each selecting kind, id, name, slug, version, updated_at, role, shared.
+func listItems(ctx context.Context, q querier, folders, pages string, args ...any) ([]TreeItem, error) {
 	items := []TreeItem{}
-
-	fr, err := s.pool.Query(ctx, `
-		SELECT id::text, name, slug, updated_at
-		FROM folder
-		WHERE deleted_at IS NULL AND archived_at IS NULL
-		  AND parent_id IS NOT DISTINCT FROM $1::uuid
-		  AND created_by_sub = $2
-		ORDER BY name`, parentID, sub)
-	if err != nil {
-		return nil, err
-	}
-	for fr.Next() {
-		it := TreeItem{Kind: "folder"}
-		if err := fr.Scan(&it.ID, &it.Name, &it.Slug, &it.UpdatedAt); err != nil {
-			fr.Close()
+	for _, sql := range []string{folders, pages} {
+		rows, err := q.Query(ctx, sql, args...)
+		if err != nil {
 			return nil, err
 		}
-		items = append(items, it)
-	}
-	fr.Close()
-	if err := fr.Err(); err != nil {
-		return nil, err
-	}
-
-	ar, err := s.pool.Query(ctx, `
-		SELECT id::text, name, slug, current_version, updated_at
-		FROM asset
-		WHERE deleted_at IS NULL AND archived_at IS NULL
-		  AND folder_id IS NOT DISTINCT FROM $1::uuid
-		  AND created_by_sub = $2
-		ORDER BY updated_at DESC`, parentID, sub)
-	if err != nil {
-		return nil, err
-	}
-	defer ar.Close()
-	for ar.Next() {
-		it := TreeItem{Kind: "page"}
-		if err := ar.Scan(&it.ID, &it.Name, &it.Slug, &it.Version, &it.UpdatedAt); err != nil {
+		for rows.Next() {
+			var it TreeItem
+			var r Role
+			if err := rows.Scan(&it.Kind, &it.ID, &it.Name, &it.Slug, &it.Version, &it.UpdatedAt, &r, &it.Shared); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			it.Role = r.String()
+			items = append(items, it)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		items = append(items, it)
 	}
-	return items, ar.Err()
+	return items, nil
 }
 
 // CreateFolder inserts a folder under parentID (nil = root), retrying the slug
-// on collision. The parent must be visible to sub.
+// on collision. sub needs edit access to the parent.
 func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub string) (string, error) {
-	if err := checkFolder(ctx, s.pool, parentID, sub); err != nil {
+	if err := checkFolder(ctx, s.pool, parentID, sub, RoleEditor); err != nil {
 		return "", err
 	}
 	base := slugify(name)
@@ -151,8 +139,8 @@ func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub st
 	return "", errors.New("could not allocate a unique folder slug")
 }
 
-// CreatePage creates an asset and its version 1 in one transaction. The folder
-// must be visible to sub.
+// CreatePage creates an asset and its version 1 in one transaction. sub needs
+// edit access to the folder.
 func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, sub string) (id string, version int, err error) {
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
 		id, version, err = createPage(ctx, tx, folderID, name, html, sub)
@@ -161,7 +149,7 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, su
 	return id, version, err
 }
 
-// AddVersion appends a new version to one of sub's pages and returns its
+// AddVersion appends a new version to a page sub can edit and returns its
 // number.
 func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (version int, err error) {
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
@@ -185,7 +173,7 @@ func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 }
 
 func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, sub string) (id string, version int, err error) {
-	if err = checkFolder(ctx, tx, folderID, sub); err != nil {
+	if err = checkFolder(ctx, tx, folderID, sub, RoleEditor); err != nil {
 		return "", 0, err
 	}
 
@@ -218,14 +206,16 @@ func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, su
 }
 
 func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string) (int, error) {
+	if err := checkPage(ctx, tx, assetID, sub, RoleEditor); err != nil {
+		return 0, err
+	}
 	var next int
 	err := tx.QueryRow(ctx, `
 		UPDATE asset
 		SET current_version = current_version + 1, updated_at = now(), updated_by_sub = $2
-		WHERE id = $1::uuid AND created_by_sub = $2
-		  AND deleted_at IS NULL AND archived_at IS NULL
+		WHERE id = $1::uuid AND deleted_at IS NULL AND archived_at IS NULL
 		RETURNING current_version`, assetID, sub).Scan(&next)
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, ErrNotFound
 	}
 	if err != nil {
@@ -246,15 +236,18 @@ func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, 
 	return err
 }
 
-// PageMeta returns the metadata of one of sub's pages.
+// PageMeta returns the metadata of a page sub can see.
 func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error) {
 	var m PageMeta
+	var r Role
 	err := s.pool.QueryRow(ctx, `
-		SELECT id::text, name, slug, folder_id::text, current_version, updated_at
-		FROM asset
-		WHERE id = $1::uuid AND created_by_sub = $2
-		  AND deleted_at IS NULL AND archived_at IS NULL`, id, sub).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt)
+		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
+		WHERE a.id = $1::uuid AND r.level > 0
+		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared)
+	m.Role = r.String()
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound
 	}
@@ -264,14 +257,15 @@ func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error)
 	return &m, nil
 }
 
-// CurrentContent returns the HTML of the current version of one of sub's pages.
+// CurrentContent returns the HTML of the current version of a page sub can
+// see.
 func (s *Store) CurrentContent(ctx context.Context, sub, id string) (string, error) {
 	var html string
 	err := s.pool.QueryRow(ctx, `
 		SELECT av.content
 		FROM asset a
 		JOIN asset_version av ON av.asset_id = a.id AND av.version = a.current_version
-		WHERE a.id = $1::uuid AND a.created_by_sub = $2
+		WHERE a.id = $1::uuid AND asset_access($2, a.id) > 0
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).Scan(&html)
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return "", ErrNotFound
