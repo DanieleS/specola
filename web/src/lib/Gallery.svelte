@@ -1,11 +1,12 @@
 <script lang="ts" module>
   import type { Role } from "./api";
 
-  type Tab = "mine" | "shared" | "archived";
+  type Tab = "mine" | "favorites" | "shared" | "archived";
   type Crumb = { id: string | null; name: string; role: Role };
 
   const homes: Record<Tab, Crumb> = {
     mine: { id: null, name: "Home", role: "owner" },
+    favorites: { id: null, name: "Favorites", role: "viewer" },
     shared: { id: null, name: "Shared with me", role: "viewer" },
     archived: { id: null, name: "Archived", role: "owner" },
   };
@@ -50,7 +51,7 @@
   let menuFor = $state<string | null>(null);
 
   let here = $derived(stack[stack.length - 1]);
-  // Top-level lists (shared, archived) aren't folders you can add to.
+  // Top-level lists (favorites, shared, archived) aren't folders you can add to.
   let canEdit = $derived(here.id !== null ? here.role !== "viewer" : tab === "mine");
 
   $effect(() => save({ tab, stack }));
@@ -66,11 +67,13 @@
     const load =
       crumb.id !== null
         ? api.tree(crumb.id)
-        : tab === "shared"
-          ? api.shared()
-          : tab === "archived"
-            ? api.archived()
-            : api.tree(null);
+        : tab === "favorites"
+          ? api.favorites()
+          : tab === "shared"
+            ? api.shared()
+            : tab === "archived"
+              ? api.archived()
+              : api.tree(null);
     load
       .then((d) => (items = d))
       .catch((e) => (error = String(e)))
@@ -110,6 +113,19 @@
   function rename(it: TreeItem) {
     const name = prompt(`Rename “${it.name}”`, it.name);
     if (name && name.trim() !== it.name) act(() => api.rename(it.kind, it.id, name.trim()));
+  }
+
+  // Flipped in place so the star answers at once; reverted if the call fails.
+  // In Favorites an unstarred item goes on the next reload, not under the cursor.
+  async function toggleFavorite(it: TreeItem) {
+    const on = !it.favorite;
+    it.favorite = on;
+    try {
+      await api.setFavorite(it.kind, it.id, on);
+    } catch (e) {
+      it.favorite = !on;
+      error = e instanceof Error ? e.message : String(e);
+    }
   }
 
   function archive(it: TreeItem) {
@@ -158,6 +174,7 @@
   <div class="flex flex-wrap items-center justify-between gap-3 text-sm mb-4">
     <div class="flex gap-1">
       <button class={tabClass("mine")} onclick={() => switchTab("mine")}>My pages</button>
+      <button class={tabClass("favorites")} onclick={() => switchTab("favorites")}>Favorites</button>
       <button class={tabClass("shared")} onclick={() => switchTab("shared")}>Shared with me</button>
       <button class={tabClass("archived")} onclick={() => switchTab("archived")}>Archived</button>
     </div>
@@ -230,7 +247,9 @@
       <p class="text-red-400">{error}</p>
     {:else if items.length === 0}
       <div class="text-center py-20 text-white/40">
-        {#if tab === "shared" && here.id === null}
+        {#if tab === "favorites" && here.id === null}
+          <p>No favorites yet. Star a page or folder to find it here.</p>
+        {:else if tab === "shared" && here.id === null}
           <p>Nothing has been shared with you yet.</p>
         {:else if tab === "archived"}
           <p>Nothing archived.</p>
@@ -262,10 +281,21 @@
                   >
                 {/if}
               </div>
-              <div class="font-medium truncate pr-6">{it.name}</div>
-              <div class="text-xs text-white/40 mt-1">{subtitle(it)}</div>
+              <div class="font-medium truncate">{it.name}</div>
+              <!-- Room on the right for the star and the ⋯ that sit over this line. -->
+              <div class="text-xs text-white/40 mt-1 pr-16">{subtitle(it)}</div>
             </button>
 
+            {#if tab !== "archived"}
+              <button
+                class="absolute bottom-3 {it.role === 'viewer' ? 'right-3' : 'right-10'} w-7 h-7 rounded hover:bg-white/10 {it.favorite
+                  ? 'text-amber-400'
+                  : 'text-white/30 hover:text-amber-300'}"
+                aria-label={it.favorite ? `Remove ${it.name} from favorites` : `Add ${it.name} to favorites`}
+                aria-pressed={!!it.favorite}
+                onclick={() => toggleFavorite(it)}>{it.favorite ? "★" : "☆"}</button
+              >
+            {/if}
             {#if tab === "archived"}
               <button
                 class="absolute bottom-3 right-3 text-xs px-2 py-1 rounded border border-white/15 hover:bg-white/10"

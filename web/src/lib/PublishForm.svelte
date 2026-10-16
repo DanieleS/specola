@@ -5,6 +5,7 @@
 
   let name = $state("");
   let html = $state("");
+  let note = $state("");
   let busy = $state(false);
   let error = $state("");
 
@@ -13,7 +14,7 @@
     busy = true;
     error = "";
     try {
-      const r = await api.createPage(name.trim(), html, folderId);
+      const r = await api.createPage(name.trim(), html, folderId, note);
       location.hash = `#/p/${r.id}`;
     } catch (err) {
       error = String(err);
@@ -49,6 +50,16 @@
         placeholder="<!doctype html>…"
         class="w-full px-3 py-2 rounded-md bg-white/5 border border-white/15 focus:border-amber-400 outline-none font-mono text-sm"
       ></textarea>
+    </div>
+    <div>
+      <label for="note" class="block text-sm text-white/60 mb-1">Note <span class="text-white/30">(optional)</span></label>
+      <input
+        id="note"
+        bind:value={note}
+        maxlength="500"
+        placeholder="What this version is"
+        class="w-full px-3 py-2 rounded-md bg-white/5 border border-white/15 focus:border-amber-400 outline-none"
+      />
     </div>
     {#if error}<p class="text-red-400 text-sm">{error}</p>{/if}
     <div class="flex gap-3">

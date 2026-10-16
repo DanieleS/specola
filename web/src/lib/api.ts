@@ -9,6 +9,8 @@ export type TreeItem = {
   updatedAt: string;
   role: Role;
   shared: boolean;
+  /** Starred by the caller. Absent on search results. */
+  favorite?: boolean;
 };
 
 export type PageMeta = {
@@ -20,6 +22,7 @@ export type PageMeta = {
   updatedAt: string;
   role: Role;
   shared: boolean;
+  favorite: boolean;
   /** Where to load the rendered page from; may be on a separate origin. */
   viewUrl: string;
 };
@@ -45,6 +48,8 @@ export type VersionInfo = {
   createdAt: string;
   editedBy?: string;
   restoredFrom?: number;
+  /** What changed, as written by whoever published it. */
+  note?: string;
 };
 
 const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
@@ -82,11 +87,14 @@ export const api = {
     req<TreeItem[]>("GET", "/api/tree" + (parent ? `?parent=${encodeURIComponent(parent)}` : "")),
   createFolder: (name: string, parentId: string | null) =>
     req<{ id: string }>("POST", "/api/folders", { name, parentId }),
-  createPage: (name: string, html: string, folderId: string | null) =>
-    req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId }),
+  createPage: (name: string, html: string, folderId: string | null, note: string) =>
+    req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId, note }),
   pageMeta: (id: string) => req<PageMeta>("GET", `/api/pages/${id}`),
   shared: () => req<TreeItem[]>("GET", "/api/shared"),
   archived: () => req<TreeItem[]>("GET", "/api/archived"),
+  favorites: () => req<TreeItem[]>("GET", "/api/favorites"),
+  setFavorite: (kind: ItemKind, id: string, on: boolean) =>
+    req<void>(on ? "PUT" : "DELETE", `/api/${kind}s/${id}/favorite`),
   versions: (id: string) => req<VersionInfo[]>("GET", `/api/pages/${id}/versions`),
   restoreVersion: (id: string, from: number) =>
     req<{ version: number }>("POST", `/api/pages/${id}/versions`, { restoreFrom: from }),

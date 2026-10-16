@@ -31,11 +31,21 @@ func Handler() http.Handler {
 			serveIndex(w, index)
 			return
 		}
+		if strings.HasPrefix(p, "assets/") {
+			// Vite puts a content hash in these names: a new build is a new URL.
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			// Fixed names (the favicon): reuse for a day.
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		}
 		files.ServeHTTP(w, r)
 	})
 }
 
+// serveIndex sends the shell. It names the hashed bundle of the running
+// build, so it must be revalidated or a deploy wouldn't reach the browser.
 func serveIndex(w http.ResponseWriter, index []byte) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(index)
 }

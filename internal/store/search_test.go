@@ -14,7 +14,7 @@ func TestSearch(t *testing.T) {
 
 	page := func(name, html, sub string) string {
 		t.Helper()
-		id, _, err := st.CreatePage(ctx, nil, name, html, sub)
+		id, _, err := st.CreatePage(ctx, nil, name, html, "", sub)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +66,7 @@ func TestSearch(t *testing.T) {
 	})
 
 	t.Run("new version replaces the indexed text", func(t *testing.T) {
-		if _, err := st.AddVersion(ctx, budget, "<p>Revised forecast.</p>", "alice"); err != nil {
+		if _, err := st.AddVersion(ctx, budget, "<p>Revised forecast.</p>", "", "alice"); err != nil {
 			t.Fatal(err)
 		}
 		if got := ids(search("alice", "hardware")); len(got) != 0 {

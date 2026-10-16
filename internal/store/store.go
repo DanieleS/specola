@@ -8,7 +8,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -31,6 +34,8 @@ type TreeItem struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 	Role      string    `json:"role"`   // the caller's Role on the item
 	Shared    bool      `json:"shared"` // the item itself has shares
+	// Favorite: the caller starred the item. Search results leave it unset.
+	Favorite bool `json:"favorite,omitempty"`
 }
 
 // PageMeta is the metadata the viewer header needs.
@@ -43,6 +48,7 @@ type PageMeta struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 	Role      string    `json:"role"`
 	Shared    bool      `json:"shared"`
+	Favorite  bool      `json:"favorite"`
 }
 
 // querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
@@ -61,14 +67,14 @@ func (s *Store) Tree(ctx context.Context, sub string, parentID *string) ([]TreeI
 	}
 	return listItems(ctx, s.pool, `
 		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($2, f.id),
-		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.folder_id = f.id)
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.folder_id = f.id), `+favoriteFolder("$2")+`
 		FROM folder f
 		WHERE f.deleted_at IS NULL AND f.archived_at IS NULL
 		  AND f.parent_id IS NOT DISTINCT FROM $1::uuid
 		  AND ($1::uuid IS NOT NULL OR f.created_by_sub = $2)
 		ORDER BY f.name`, `
 		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($2, a.id),
-		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`
 		FROM asset a
 		WHERE a.deleted_at IS NULL AND a.archived_at IS NULL
 		  AND a.folder_id IS NOT DISTINCT FROM $1::uuid
@@ -79,18 +85,29 @@ func (s *Store) Tree(ctx context.Context, sub string, parentID *string) ([]TreeI
 // SharedWithMe lists the active folders and pages shared directly with sub.
 func (s *Store) SharedWithMe(ctx context.Context, sub string) ([]TreeItem, error) {
 	return listItems(ctx, s.pool, `
-		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($1, f.id), true
+		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($1, f.id), true, `+favoriteFolder("$1")+`
 		FROM acl_entry e JOIN folder f ON f.id = e.folder_id
 		WHERE e.subject_sub = $1 AND f.deleted_at IS NULL AND f.archived_at IS NULL
 		ORDER BY f.name`, `
-		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($1, a.id), true
+		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($1, a.id), true, `+favoritePage("$1")+`
 		FROM acl_entry e JOIN asset a ON a.id = e.asset_id
 		WHERE e.subject_sub = $1 AND a.deleted_at IS NULL AND a.archived_at IS NULL
 		ORDER BY a.updated_at DESC`, sub)
 }
 
+// favoriteFolder and favoritePage are the SQL for "the user in param starred
+// folder f / page a", the last column every listItems query selects.
+func favoriteFolder(param string) string {
+	return `EXISTS (SELECT 1 FROM favorite fv WHERE fv.user_sub = ` + param + ` AND fv.folder_id = f.id)`
+}
+
+func favoritePage(param string) string {
+	return `EXISTS (SELECT 1 FROM favorite fv WHERE fv.user_sub = ` + param + ` AND fv.asset_id = a.id)`
+}
+
 // listItems runs a folder query then a page query with the same arguments,
-// each selecting kind, id, name, slug, version, updated_at, role, shared.
+// each selecting kind, id, name, slug, version, updated_at, role, shared,
+// favorite.
 func listItems(ctx context.Context, q querier, folders, pages string, args ...any) ([]TreeItem, error) {
 	items := []TreeItem{}
 	for _, sql := range []string{folders, pages} {
@@ -101,7 +118,7 @@ func listItems(ctx context.Context, q querier, folders, pages string, args ...an
 		for rows.Next() {
 			var it TreeItem
 			var r Role
-			if err := rows.Scan(&it.Kind, &it.ID, &it.Name, &it.Slug, &it.Version, &it.UpdatedAt, &r, &it.Shared); err != nil {
+			if err := rows.Scan(&it.Kind, &it.ID, &it.Name, &it.Slug, &it.Version, &it.UpdatedAt, &r, &it.Shared, &it.Favorite); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -141,23 +158,47 @@ func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub st
 }
 
 // CreatePage creates an asset and its version 1 in one transaction. sub needs
-// edit access to the folder.
-func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, sub string) (id string, version int, err error) {
+// edit access to the folder. note is optional (see CleanNote).
+func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, note, sub string) (id string, version int, err error) {
+	n, err := CleanNote(note)
+	if err != nil {
+		return "", 0, err
+	}
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		id, version, err = createPage(ctx, tx, folderID, name, html, sub)
+		id, version, err = createPage(ctx, tx, folderID, name, html, n, sub)
 		return err
 	})
 	return id, version, err
 }
 
 // AddVersion appends a new version to a page sub can edit and returns its
-// number.
-func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (version int, err error) {
+// number. note is optional (see CleanNote).
+func (s *Store) AddVersion(ctx context.Context, assetID, html, note, sub string) (version int, err error) {
+	n, err := CleanNote(note)
+	if err != nil {
+		return 0, err
+	}
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		version, err = addVersion(ctx, tx, assetID, html, sub, nil)
+		version, err = addVersion(ctx, tx, assetID, html, n, sub, nil)
 		return err
 	})
 	return version, err
+}
+
+// MaxNoteRunes bounds a version note: a line or two on what changed, not a
+// document.
+const MaxNoteRunes = 500
+
+// CleanNote trims a version note; an empty one is stored as NULL.
+func CleanNote(note string) (*string, error) {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return nil, nil
+	}
+	if utf8.RuneCountInString(note) > MaxNoteRunes {
+		return nil, &ErrInvalid{fmt.Sprintf("note is longer than %d characters", MaxNoteRunes)}
+	}
+	return &note, nil
 }
 
 // inTx runs fn in a transaction, committing only if it returns nil.
@@ -173,7 +214,7 @@ func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
-func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, sub string) (id string, version int, err error) {
+func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html string, note *string, sub string) (id string, version int, err error) {
 	if err = checkFolder(ctx, tx, folderID, sub, RoleEditor); err != nil {
 		return "", 0, err
 	}
@@ -200,7 +241,7 @@ func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, su
 		return "", 0, errors.New("could not allocate a unique page slug")
 	}
 
-	if err = insertVersion(ctx, tx, id, 1, html, sub, nil); err != nil {
+	if err = insertVersion(ctx, tx, id, 1, html, note, sub, nil); err != nil {
 		return "", 0, err
 	}
 	return id, 1, nil
@@ -208,7 +249,7 @@ func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, su
 
 // addVersion adds html as the next version of a page sub can edit.
 // restoredFrom records the version it was copied from, if any.
-func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string, restoredFrom *int) (int, error) {
+func addVersion(ctx context.Context, tx pgx.Tx, assetID, html string, note *string, sub string, restoredFrom *int) (int, error) {
 	if err := checkPage(ctx, tx, assetID, sub, RoleEditor); err != nil {
 		return 0, err
 	}
@@ -224,7 +265,7 @@ func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string, resto
 	if err != nil {
 		return 0, err
 	}
-	if err := insertVersion(ctx, tx, assetID, next, html, sub, restoredFrom); err != nil {
+	if err := insertVersion(ctx, tx, assetID, next, html, note, sub, restoredFrom); err != nil {
 		return 0, err
 	}
 	return next, nil
@@ -232,12 +273,12 @@ func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string, resto
 
 // insertVersion stores a page version, which becomes current, and reindexes
 // the page for search.
-func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html, sub string, restoredFrom *int) error {
+func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html string, note *string, sub string, restoredFrom *int) error {
 	sum := sha256.Sum256([]byte(html))
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub, restored_from_version)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)`,
-		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub, restoredFrom); err != nil {
+		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub, restored_from_version, note)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)`,
+		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub, restoredFrom, note); err != nil {
 		return err
 	}
 	return reindex(ctx, tx, assetID, &html)
@@ -249,11 +290,11 @@ func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error)
 	var r Role
 	err := s.pool.QueryRow(ctx, `
 		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
-		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`
 		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
 		WHERE a.id = $1::uuid AND r.level > 0
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared)
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite)
 	m.Role = r.String()
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound
@@ -278,6 +319,22 @@ func (s *Store) CurrentContent(ctx context.Context, sub, id string) (string, err
 		return "", ErrNotFound
 	}
 	return html, err
+}
+
+// CurrentVersion returns the number and content hash of the current version of
+// a page sub can see, so a cached copy can be validated without loading the
+// HTML.
+func (s *Store) CurrentVersion(ctx context.Context, sub, id string) (version int, hash string, err error) {
+	err = s.pool.QueryRow(ctx, `
+		SELECT av.version, av.content_hash
+		FROM asset a
+		JOIN asset_version av ON av.asset_id = a.id AND av.version = a.current_version
+		WHERE a.id = $1::uuid AND asset_access($2, a.id) > 0
+		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).Scan(&version, &hash)
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
+		return 0, "", ErrNotFound
+	}
+	return version, hash, err
 }
 
 func isUniqueViolation(err error) bool {

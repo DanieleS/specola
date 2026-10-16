@@ -46,7 +46,7 @@ func TestUploadGrants(t *testing.T) {
 		}
 	})
 
-	page, _, err := st.CreatePage(ctx, nil, "Page", "<p>v1</p>", "alice")
+	page, _, err := st.CreatePage(ctx, nil, "Page", "<p>v1</p>", "", "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestUploadGrants(t *testing.T) {
 	})
 
 	t.Run("access lost before redeem", func(t *testing.T) {
-		victim, _, err := st.CreatePage(ctx, nil, "Victim", "<p>v1</p>", "alice")
+		victim, _, err := st.CreatePage(ctx, nil, "Victim", "<p>v1</p>", "", "alice")
 		if err != nil {
 			t.Fatal(err)
 		}

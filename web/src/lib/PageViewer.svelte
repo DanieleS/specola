@@ -65,6 +65,18 @@
     }
   }
 
+  async function toggleFavorite() {
+    if (!meta) return;
+    const on = !meta.favorite;
+    meta.favorite = on;
+    try {
+      await api.setFavorite("page", id, on);
+    } catch (e) {
+      if (meta) meta.favorite = !on;
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   async function copyLink() {
     const url = `${location.origin}/#/p/${id}`;
     try {
@@ -86,6 +98,14 @@
     <div class="flex items-center gap-3 min-w-0">
       <a href="#/" class="text-white/50 hover:text-white/90" aria-label="Back to gallery">←</a>
       <span class="font-medium truncate">{meta?.name ?? "…"}</span>
+      {#if meta}
+        <button
+          class={meta.favorite ? "text-amber-400" : "text-white/30 hover:text-amber-300"}
+          aria-label={meta.favorite ? "Remove from favorites" : "Add to favorites"}
+          aria-pressed={meta.favorite}
+          onclick={toggleFavorite}>{meta.favorite ? "★" : "☆"}</button
+        >
+      {/if}
       {#if meta}<span class="text-xs text-white/40">v{shown}</span>{/if}
       {#if meta && meta.role !== "owner"}
         <span class="text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
@@ -156,6 +176,7 @@
                     {#if current}<span class="text-[10px] uppercase text-amber-400/80">current</span>{/if}
                     <span class="ml-auto text-xs text-white/40">{kb(v.sizeBytes)}</span>
                   </div>
+                  {#if v.note}<div class="text-white/80 mt-0.5 break-words">{v.note}</div>{/if}
                   <div class="text-xs text-white/40">{fmt(v.createdAt)}</div>
                   <div class="text-xs text-white/40 truncate">
                     {v.editedBy ?? ""}{#if v.restoredFrom} · restored v{v.restoredFrom}{/if}

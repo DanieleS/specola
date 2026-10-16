@@ -59,7 +59,10 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	}
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+	// Compress: pages are text, often with their data inlined, and shrink
+	// several times over; so does the SPA bundle. Only the types chi lists as
+	// compressible are touched (HTML, CSS, JS, JSON, SVG).
+	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, middleware.Compress(5))
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -81,7 +84,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		s.viewHost = cfg.ViewHost()
 		s.tokens = newViewTokens(cfg.SessionSecret)
 		vr := chi.NewRouter()
-		vr.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+		vr.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, middleware.Compress(5))
 		vr.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 		vr.Get("/view/{id}", s.handleTokenView)
 		s.viewMux = vr
@@ -102,11 +105,14 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
 			r.Get("/shared", s.handleShared)
 			r.Get("/archived", s.handleArchived)
+			r.Get("/favorites", s.handleFavorites)
 			r.Get("/search", s.handleSearch)
 			for _, k := range []string{"pages", "folders"} {
 				r.Patch("/"+k+"/{id}", s.handleUpdateItem)
 				r.Post("/"+k+"/{id}/archive", s.handleArchive)
 				r.Post("/"+k+"/{id}/unarchive", s.handleUnarchive)
+				r.Put("/"+k+"/{id}/favorite", s.handleFavorite)
+				r.Delete("/"+k+"/{id}/favorite", s.handleFavorite)
 				r.Get("/"+k+"/{id}/acl", s.handleListShares)
 				r.Put("/"+k+"/{id}/acl", s.handleShare)
 				r.Delete("/"+k+"/{id}/acl", s.handleUnshare)
@@ -281,6 +287,7 @@ type createPageReq struct {
 	Name     string  `json:"name"`
 	HTML     string  `json:"html"`
 	FolderID *string `json:"folderId"`
+	Note     string  `json:"note"`
 }
 
 func (s *Server) handleCreatePage(w http.ResponseWriter, r *http.Request) {
@@ -292,7 +299,7 @@ func (s *Server) handleCreatePage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name and html are required", http.StatusBadRequest)
 		return
 	}
-	id, version, err := s.st.CreatePage(r.Context(), req.FolderID, req.Name, req.HTML, subOf(r.Context()))
+	id, version, err := s.st.CreatePage(r.Context(), req.FolderID, req.Name, req.HTML, req.Note, subOf(r.Context()))
 	if err != nil {
 		httpError(w, err)
 		return
@@ -301,10 +308,11 @@ func (s *Server) handleCreatePage(w http.ResponseWriter, r *http.Request) {
 }
 
 // addVersionReq carries either new HTML or the number of an earlier version to
-// restore as the new one.
+// restore as the new one, and optionally a note on what changed.
 type addVersionReq struct {
 	HTML        string `json:"html"`
 	RestoreFrom int    `json:"restoreFrom"`
+	Note        string `json:"note"`
 }
 
 func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
@@ -321,9 +329,9 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 		err     error
 	)
 	if req.RestoreFrom != 0 {
-		version, err = s.st.RestoreVersion(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"), req.RestoreFrom)
+		version, err = s.st.RestoreVersion(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"), req.RestoreFrom, req.Note)
 	} else {
-		version, err = s.st.AddVersion(r.Context(), chi.URLParam(r, "id"), req.HTML, subOf(r.Context()))
+		version, err = s.st.AddVersion(r.Context(), chi.URLParam(r, "id"), req.HTML, req.Note, subOf(r.Context()))
 	}
 	if err != nil {
 		httpError(w, err)
@@ -420,6 +428,25 @@ func (s *Server) handleArchived(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request) {
+	items, err := s.st.Favorites(r.Context(), subOf(r.Context()))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// handleFavorite stars an item on PUT and unstars it on DELETE.
+func (s *Server) handleFavorite(w http.ResponseWriter, r *http.Request) {
+	on := r.Method == http.MethodPut
+	if err := s.st.SetFavorite(r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id"), on); err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleShared(w http.ResponseWriter, r *http.Request) {
@@ -527,23 +554,42 @@ func (s *Server) handleTokenView(w http.ResponseWriter, r *http.Request) {
 // CSP sandbox puts the page on an opaque origin so its scripts cannot read
 // Specola's cookies or call its API; frame-ancestors keeps other sites from
 // framing it, and no-referrer keeps a view token out of the page's requests.
+//
+// Caching is private, since access is per user. A numbered version never
+// changes, so the browser keeps it for good; the viewer always asks for one.
+// The current version is revalidated on every load against its content hash,
+// which answers 304 without reading the HTML out of the database.
 func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id string) {
 	ctx := r.Context()
 	var (
-		html string
-		err  error
+		n   int
+		err error
 	)
 	if v := r.URL.Query().Get("v"); v != "" {
-		n, convErr := strconv.Atoi(v)
-		if convErr != nil || n < 1 {
+		if n, err = strconv.Atoi(v); err != nil || n < 1 {
 			http.Error(w, "v must be a version number", http.StatusBadRequest)
 			return
 		}
-		html, err = s.st.VersionContent(ctx, sub, id, n)
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	} else {
-		html, err = s.st.CurrentContent(ctx, sub, id)
+		var hash string
+		if n, hash, err = s.st.CurrentVersion(ctx, sub, id); err != nil {
+			httpError(w, err)
+			return
+		}
+		// Weak: the same version is sent gzipped or not, depending on the client.
+		etag := `W/"` + hash + `"`
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "private, no-cache")
+		if etagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
+	html, err := s.st.VersionContent(ctx, sub, id, n)
 	if err != nil {
+		w.Header().Del("Cache-Control")
+		w.Header().Del("ETag")
 		httpError(w, err)
 		return
 	}
@@ -554,10 +600,25 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Cache-Control", "private, no-cache")
 	w.Header().Set("Content-Security-Policy",
 		"sandbox allow-scripts allow-popups allow-forms allow-modals; frame-ancestors "+ancestors)
 	_, _ = io.WriteString(w, html)
+}
+
+// etagMatches reports whether an If-None-Match header names etag. Comparison
+// is weak, as RFC 9110 requires for If-None-Match.
+func etagMatches(header, etag string) bool {
+	if header == "" {
+		return false
+	}
+	want := strings.TrimPrefix(etag, "W/")
+	for _, t := range strings.Split(header, ",") {
+		t = strings.TrimSpace(t)
+		if t == "*" || strings.TrimPrefix(t, "W/") == want {
+			return true
+		}
+	}
+	return false
 }
 
 // maxUploadBytes bounds a page uploaded through a grant. Grants exist for pages

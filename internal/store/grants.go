@@ -39,11 +39,17 @@ type GrantRequest struct {
 	FolderID *string
 	// For GrantUploadVersion: the page to add a version to.
 	AssetID string
+	// Optional note for the version the upload creates (see CleanNote).
+	Note string
 }
 
 // MintGrant checks that req.Sub may perform the upload now, then stores a new
 // grant valid for ttl and returns its token.
 func (s *Store) MintGrant(ctx context.Context, req GrantRequest, ttl time.Duration) (token string, expires time.Time, err error) {
+	note, err := CleanNote(req.Note)
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	var assetID *string
 	switch req.Kind {
 	case GrantUploadNew:
@@ -68,10 +74,10 @@ func (s *Store) MintGrant(ctx context.Context, req GrantRequest, ttl time.Durati
 	}
 	token = base64.RawURLEncoding.EncodeToString(b)
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO asset_grant (kind, secret_hash, asset_id, folder_id, name, created_by_sub, expires_at)
-		VALUES ($1, $2, $3::uuid, $4::uuid, NULLIF($5, ''), $6, now() + make_interval(secs => $7))
+		INSERT INTO asset_grant (kind, secret_hash, asset_id, folder_id, name, created_by_sub, expires_at, note)
+		VALUES ($1, $2, $3::uuid, $4::uuid, NULLIF($5, ''), $6, now() + make_interval(secs => $7), $8)
 		RETURNING expires_at`,
-		req.Kind, hashToken(token), assetID, req.FolderID, req.Name, req.Sub, ttl.Seconds()).Scan(&expires)
+		req.Kind, hashToken(token), assetID, req.FolderID, req.Name, req.Sub, ttl.Seconds(), note).Scan(&expires)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -88,16 +94,16 @@ func (s *Store) RedeemUpload(ctx context.Context, token, html string) (id string
 		var (
 			grantID, kind, sub string
 			assetID, folderID  *string
-			name               *string
+			name, note         *string
 			gone               bool
 		)
 		err := tx.QueryRow(ctx, `
-			SELECT id::text, kind::text, asset_id::text, folder_id::text, name, created_by_sub,
+			SELECT id::text, kind::text, asset_id::text, folder_id::text, name, created_by_sub, note,
 			       consumed_at IS NOT NULL OR expires_at <= now()
 			FROM asset_grant
 			WHERE secret_hash = $1
 			FOR UPDATE`, hashToken(token)).
-			Scan(&grantID, &kind, &assetID, &folderID, &name, &sub, &gone)
+			Scan(&grantID, &kind, &assetID, &folderID, &name, &sub, &note, &gone)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -110,10 +116,10 @@ func (s *Store) RedeemUpload(ctx context.Context, token, html string) (id string
 
 		switch {
 		case kind == GrantUploadNew && name != nil:
-			id, version, err = createPage(ctx, tx, folderID, *name, html, sub)
+			id, version, err = createPage(ctx, tx, folderID, *name, html, note, sub)
 		case kind == GrantUploadVersion && assetID != nil:
 			id = *assetID
-			version, err = addVersion(ctx, tx, id, html, sub, nil)
+			version, err = addVersion(ctx, tx, id, html, note, sub, nil)
 		default:
 			return ErrGrantKind
 		}

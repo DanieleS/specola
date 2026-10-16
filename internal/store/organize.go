@@ -24,6 +24,7 @@ type VersionInfo struct {
 	CreatedAt    time.Time `json:"createdAt"`
 	EditedBy     string    `json:"editedBy,omitempty"` // email, or sub when unknown
 	RestoredFrom *int      `json:"restoredFrom,omitempty"`
+	Note         *string   `json:"note,omitempty"`
 }
 
 // Versions lists a page's versions, newest first. sub must be able to see it.
@@ -32,7 +33,7 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT v.version, v.size_bytes, v.created_at, COALESCE(u.email, v.edited_by_sub, ''), v.restored_from_version
+		SELECT v.version, v.size_bytes, v.created_at, COALESCE(u.email, v.edited_by_sub, ''), v.restored_from_version, v.note
 		FROM asset_version v LEFT JOIN app_user u ON u.sub = v.edited_by_sub
 		WHERE v.asset_id = $1::uuid
 		ORDER BY v.version DESC`, id)
@@ -43,7 +44,7 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 	out := []VersionInfo{}
 	for rows.Next() {
 		var v VersionInfo
-		if err := rows.Scan(&v.Version, &v.SizeBytes, &v.CreatedAt, &v.EditedBy, &v.RestoredFrom); err != nil {
+		if err := rows.Scan(&v.Version, &v.SizeBytes, &v.CreatedAt, &v.EditedBy, &v.RestoredFrom, &v.Note); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -69,8 +70,13 @@ func versionContent(ctx context.Context, q querier, id string, version int) (str
 }
 
 // RestoreVersion copies an earlier version's HTML into a new current version,
-// keeping the history intact, and returns the new version number.
-func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int) (version int, err error) {
+// keeping the history intact, and returns the new version number. note is
+// optional (see CleanNote).
+func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int, note string) (version int, err error) {
+	n, err := CleanNote(note)
+	if err != nil {
+		return 0, err
+	}
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
 		if err := checkPage(ctx, tx, id, sub, RoleEditor); err != nil {
 			return err
@@ -79,7 +85,7 @@ func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int) (v
 		if err != nil {
 			return err
 		}
-		version, err = addVersion(ctx, tx, id, html, sub, &from)
+		version, err = addVersion(ctx, tx, id, html, n, sub, &from)
 		return err
 	})
 	return version, err
@@ -184,14 +190,14 @@ func (s *Store) Unarchive(ctx context.Context, sub string, kind ItemKind, id str
 func (s *Store) Archived(ctx context.Context, sub string) ([]TreeItem, error) {
 	return listItems(ctx, s.pool, `
 		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.archived_at, 3,
-		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.folder_id = f.id)
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.folder_id = f.id), `+favoriteFolder("$1")+`
 		FROM folder f
 		WHERE f.archived_at IS NOT NULL AND f.deleted_at IS NULL
 		  AND folder_access($1, f.id, true) = 3
 		  AND (f.parent_id IS NULL OR NOT folder_hidden(f.parent_id))
 		ORDER BY f.archived_at DESC`, `
 		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.archived_at, 3,
-		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$1")+`
 		FROM asset a
 		WHERE a.archived_at IS NOT NULL AND a.deleted_at IS NULL
 		  AND asset_access($1, a.id, true) = 3

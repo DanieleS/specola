@@ -11,8 +11,8 @@ Pages are private to their author until shared. An item you can't see answers
 Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
-> Status: early. Publish, browse, version, view, share, and an OAuth-protected
-> MCP endpoint for agents, and full-text search.
+> Status: early. Publish, browse, version with notes, view, share, favorites,
+> full-text search, and an OAuth-protected MCP endpoint for agents.
 
 ## Stack
 
@@ -36,7 +36,8 @@ tokens), not by email.
   name. Used to resolve an email to a `sub` when sharing.
 - **folder** — a tree; soft-delete + archive aware.
 - **asset** — a page. `current_version` points at the latest version.
-- **asset_version** — immutable history; the HTML lives inline in `content`.
+- **asset_version** — immutable history; the HTML lives inline in `content`,
+  with an optional `note` on what changed.
 - **acl_entry** — one user (`sub`), one role (`VIEWER` / `EDITOR`) on a folder *xor* an
   asset. A folder grant is inherited by everything beneath it.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
@@ -56,6 +57,29 @@ tokens), not by email.
 - **History**: every publish is a new version. Open any version in the
   viewer and restore it as a new version; nothing is ever overwritten.
   `/view/{id}?v=N` serves a specific version.
+- **Notes**: a version can carry a one-line note (up to 500 characters) on
+  what changed, shown in the history. `note` is accepted by
+  `POST /api/pages`, `POST /api/pages/{id}/versions` (also when restoring),
+  and the MCP publishing tools.
+- **Favorites**: star a folder or page, yours or shared with you, from its
+  card or the viewer; starred items are listed under **Favorites**. A star
+  you can no longer see (unshared, archived) is hidden, not dropped, and comes
+  back with the access. API: `PUT/DELETE /api/{pages|folders}/{id}/favorite`,
+  `GET /api/favorites`.
+
+## Caching and compression
+
+Responses in HTML, CSS, JS, JSON and SVG are gzip-compressed for clients that
+accept it; pages with their data inlined shrink several times over.
+
+- `/view/{id}?v=N` is immutable: `Cache-Control: private, max-age=31536000,
+  immutable`. The viewer always asks for a numbered version, so reopening a
+  page costs no download.
+- `/view/{id}` (the current version) carries a weak `ETag` from the version's
+  content hash and `Cache-Control: private, no-cache`; a matching
+  `If-None-Match` answers 304 without reading the HTML out of the database.
+- The SPA shell is `no-cache`, so a deploy reaches the browser at once; the
+  bundle under `/assets/` has hashed names and is cached for a year.
 
 ## Sharing
 
@@ -140,18 +164,28 @@ variables.
 ## MCP endpoint
 
 `/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server
-(streamable HTTP) that lets an AI agent publish pages **as the user**, so they
-land in that user's gallery.
+(streamable HTTP) that lets an AI agent publish and organise pages **as the
+user**, so they land in that user's gallery.
 
 | Tool | Input | Output |
 | --- | --- | --- |
-| `publish_page` | `title`, `html`, `folder_id?` | `{id, version, url}` |
-| `new_version` | `id`, `html` | `{version, url}` |
-| `list` | `folder_id?` | folders and pages |
-| `get_page` | `id` | metadata and the current HTML |
+| `publish_page` | `title`, `html`, `folder_id?`, `note?` | `{id, version, url}` |
+| `new_version` | `id`, `html`, `note?` | `{version, url}` |
+| `list` | `folder_id?`, `shared_with_me?` or `archived?` | folders and pages |
+| `get_page` | `id`, `version?` | metadata and the HTML of that version (default current) |
+| `list_versions` | `id` | the history, newest first, with notes |
 | `search` | `query`, `limit?` | matching pages with snippets |
+| `create_folder` | `name`, `parent_id?` | `{id}` |
+| `rename` | `kind`, `id`, `name` | `{ok}` |
+| `move` | `kind`, `id`, `folder_id?` (the root when omitted) | `{ok}` |
+| `archive` / `unarchive` | `kind`, `id` | `{ok}` |
 | `share` | `kind`, `id`, `email`, `role` (`viewer` / `editor` / `none`) | the item's shares |
-| `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?` | one-time upload URL and a `curl` example |
+| `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
+
+The same access rules as the UI apply to every tool. Tools carry MCP
+annotations: the reading ones (`list`, `get_page`, `list_versions`, `search`)
+are `readOnlyHint`, which clients such as Hermes use to retry them safely and
+to skip confirmation; the organising ones are `idempotentHint`.
 
 Large pages shouldn't travel as tool arguments (models truncate long outputs),
 so an agent can ask for an **upload grant** and send the file over plain HTTP:
