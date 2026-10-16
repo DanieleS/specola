@@ -48,7 +48,7 @@ type session struct {
 
 // New builds an Auth by discovering the provider's OIDC metadata.
 func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
-	provider, err := oidc.NewProvider(ctx, cfg.LogtoEndpoint)
+	provider, err := oidc.NewProvider(ctx, cfg.OIDCIssuer)
 	if err != nil {
 		return nil, err
 	}
@@ -63,13 +63,13 @@ func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
 		endSession: meta.EndSession,
 		cfg:        cfg,
 		oauth: oauth2.Config{
-			ClientID:     cfg.LogtoAppID,
-			ClientSecret: cfg.LogtoAppSecret,
+			ClientID:     cfg.OIDCClientID,
+			ClientSecret: cfg.OIDCClientSecret,
 			Endpoint:     provider.Endpoint(),
 			RedirectURL:  cfg.AppBaseURL + "/auth/callback",
 			Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		verifier: provider.Verifier(&oidc.Config{ClientID: cfg.LogtoAppID}),
+		verifier: provider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID}),
 		sc:       sc,
 	}, nil
 }
@@ -141,7 +141,7 @@ func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := url.Values{
-		"client_id":                {a.cfg.LogtoAppID},
+		"client_id":                {a.cfg.OIDCClientID},
 		"post_logout_redirect_uri": {a.cfg.AppBaseURL + "/"},
 	}
 	http.Redirect(w, r, a.endSession+"?"+q.Encode(), http.StatusFound)

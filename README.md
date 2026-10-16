@@ -11,8 +11,8 @@ it; anything else answers 404.
 Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
-> Status: early. Phase 1 is the core — publish, browse, version, view. Sharing
-> ACLs, an authenticated MCP endpoint, and search land next.
+> Status: early. Publish, browse, version, view, and an OAuth-protected MCP
+> endpoint for agents. Sharing ACLs and search land next.
 
 ## Stack
 
@@ -52,9 +52,10 @@ All via environment variables (see [`specola.env.example`](./specola.env.example
 | `SPECOLA_DATABASE_URL` | yes | Postgres DSN |
 | `SPECOLA_BASE_URL` | yes | public origin, e.g. `https://specola.example.com` |
 | `SPECOLA_SESSION_SECRET` | yes* | random ≥32 bytes, signs the session cookie |
-| `SPECOLA_LOGTO_ENDPOINT` | prod | OIDC issuer URL, e.g. `https://auth.example.com/oidc` |
-| `SPECOLA_LOGTO_APP_ID` | prod | OIDC client id |
-| `SPECOLA_LOGTO_APP_SECRET` | prod | OIDC client secret |
+| `SPECOLA_OIDC_ISSUER` | prod | OIDC issuer URL, e.g. `https://auth.example.com/oidc`; also enables the MCP endpoint |
+| `SPECOLA_OIDC_CLIENT_ID` | prod | OIDC client id |
+| `SPECOLA_OIDC_CLIENT_SECRET` | prod | OIDC client secret |
+| `SPECOLA_MCP_RESOURCE` | no | audience required on MCP access tokens (default `<base>/mcp`) |
 | `SPECOLA_TRUSTED_USER_HEADER` | no | trust this proxy header as the user's `sub` instead of running OIDC |
 | `SPECOLA_DEV_AUTH_EMAIL` | dev | bypass OIDC; treat every request as this user (used as both `sub` and email) |
 | `SPECOLA_LISTEN` | no | listen address (default `:8080`) |
@@ -93,8 +94,47 @@ docker run -p 8080:8080 --env-file specola.env specola
 ```
 
 Create an OIDC "traditional web" application in your identity provider with the
-redirect URI `https://<your-host>/auth/callback`, then fill the `SPECOLA_LOGTO_*`
+redirect URI `https://<your-host>/auth/callback`, then fill the `SPECOLA_OIDC_*`
 variables.
+
+## MCP endpoint
+
+`/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server
+(streamable HTTP) that lets an AI agent publish pages **as the user**, so they
+land in that user's gallery.
+
+| Tool | Input | Output |
+| --- | --- | --- |
+| `publish_page` | `title`, `html`, `folder_id?` | `{id, version, url}` |
+| `new_version` | `id`, `html` | `{version, url}` |
+| `list` | `folder_id?` | folders and pages |
+| `get_page` | `id` | metadata and the current HTML |
+
+Specola is an OAuth 2.1 **resource server**. `/mcp` requires
+`Authorization: Bearer <JWT>` issued by `SPECOLA_OIDC_ISSUER` with
+`aud` = `SPECOLA_MCP_RESOURCE`; the token's `sub` is the user. Unauthenticated
+requests get a 401 whose `WWW-Authenticate` header points clients at
+`/.well-known/oauth-protected-resource` (RFC 9728), which names the issuer as
+the authorization server.
+
+With the dev bypass and no issuer, `/mcp` needs no token and acts as the dev
+user. With neither, it is off.
+
+### Logto setup
+
+Logto has no Dynamic Client Registration; it supports **Client ID Metadata
+Documents**, which MCP clients use instead.
+
+1. Create an **API resource** whose indicator equals `SPECOLA_MCP_RESOURCE`
+   (e.g. `https://specola.example.com/mcp`). Without it Logto won't issue a
+   JWT with that audience.
+2. Enable **Dynamic apps**: Console → Applications → Third-party apps →
+   Dynamic app (Logto ≥ 1.43, OIDC SSRF protection left on).
+3. Grant the dynamic app permission on that API resource.
+4. Optional, Logto ≥ 1.44: turn on "Add consent prompt for offline access" so
+   MCP clients get refresh tokens.
+
+CIMD clients then connect without being registered in advance.
 
 ## Security notes
 

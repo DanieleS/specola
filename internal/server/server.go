@@ -11,14 +11,18 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/danieles/specola/internal/auth"
 	"github.com/danieles/specola/internal/config"
+	"github.com/danieles/specola/internal/mcpserver"
 	"github.com/danieles/specola/internal/store"
 	"github.com/danieles/specola/internal/webui"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 )
 
 type ctxKey int
@@ -36,7 +40,10 @@ type Server struct {
 	seen sync.Map
 }
 
-func New(cfg *config.Config, st *store.Store, a *auth.Auth) *Server {
+// New builds the server. a is nil unless Specola runs its own OIDC login.
+// tokens verifies MCP access tokens and is required when cfg.MCPMode() is
+// "oauth"; it is ignored otherwise.
+func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.TokenVerifier) *Server {
 	s := &Server{cfg: cfg, st: st, auth: a}
 	if a != nil {
 		a.OnLogin = func(ctx context.Context, id auth.Identity, name string) error {
@@ -57,6 +64,8 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth) *Server {
 		r.Get("/auth/callback", a.Callback)
 		r.Get("/auth/logout", a.Logout)
 	}
+
+	s.mountMCP(r, tokens)
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAuth)
@@ -111,6 +120,47 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 	})
+}
+
+// mountMCP serves the MCP endpoint at /mcp according to cfg.MCPMode().
+func (s *Server) mountMCP(r chi.Router, tokens mcpauth.TokenVerifier) {
+	opts := mcpserver.Options{
+		BaseURL: s.cfg.AppBaseURL,
+		OnUser:  s.recordUser,
+	}
+	switch s.cfg.MCPMode() {
+	case "oauth":
+		// RFC 9728 metadata, at the root and at the path-suffixed location
+		// clients derive from the resource URL.
+		metaURL := s.cfg.AppBaseURL + "/.well-known/oauth-protected-resource"
+		meta := mcpauth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+			Resource:               s.cfg.MCPResource,
+			AuthorizationServers:   []string{s.cfg.OIDCIssuer},
+			BearerMethodsSupported: []string{"header"},
+			ResourceName:           "Specola",
+		})
+		r.Handle("/.well-known/oauth-protected-resource", meta)
+		r.Handle("/.well-known/oauth-protected-resource/mcp", meta)
+		bearer := mcpauth.RequireBearerToken(tokens, &mcpauth.RequireBearerTokenOptions{
+			ResourceMetadataURL: metaURL,
+			ClockSkew:           time.Minute,
+		})
+		r.Handle("/mcp", bearer(mcpserver.Handler(s.st, opts)))
+	case "dev":
+		// No tokens locally: every request acts as the dev user.
+		opts.LocalhostProtection = true
+		dev := &mcpauth.TokenInfo{UserID: s.cfg.DevAuthEmail, Extra: map[string]any{"email": s.cfg.DevAuthEmail}}
+		verify := mcpauth.RequireBearerToken(func(context.Context, string, *http.Request) (*mcpauth.TokenInfo, error) {
+			ti := *dev
+			ti.Expiration = time.Now().Add(time.Hour)
+			return &ti, nil
+		}, nil)
+		h := verify(mcpserver.Handler(s.st, opts))
+		r.Handle("/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Header.Set("Authorization", "Bearer dev")
+			h.ServeHTTP(w, r)
+		}))
+	}
 }
 
 // recordUser upserts app_user the first time this process sees a sub. A failure

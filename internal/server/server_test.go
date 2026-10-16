@@ -20,7 +20,7 @@ const userHeader = "X-Test-User"
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	cfg := &config.Config{AppBaseURL: "http://test", TrustedUserHeader: userHeader}
-	ts := httptest.NewServer(New(cfg, store.New(testdb.New(t)), nil))
+	ts := httptest.NewServer(New(cfg, store.New(testdb.New(t)), nil, nil))
 	t.Cleanup(ts.Close)
 	return ts
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver for goose
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/pressly/goose/v3"
 )
 
@@ -55,9 +56,22 @@ func main() {
 		slog.Warn("auth: dev bypass — every request is one user", "dev_email", cfg.DevAuthEmail)
 	}
 
+	var tokens mcpauth.TokenVerifier
+	switch cfg.MCPMode() {
+	case "oauth":
+		if tokens, err = auth.NewAccessTokenVerifier(ctx, cfg.OIDCIssuer, cfg.MCPResource); err != nil {
+			fatal("oidc discovery for mcp", err)
+		}
+		slog.Info("mcp: bearer tokens", "issuer", cfg.OIDCIssuer, "resource", cfg.MCPResource)
+	case "dev":
+		slog.Warn("mcp: dev bypass — no token required", "dev_email", cfg.DevAuthEmail)
+	default:
+		slog.Info("mcp: disabled (set SPECOLA_OIDC_ISSUER to enable)")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           server.New(cfg, store.New(pool), authn),
+		Handler:           server.New(cfg, store.New(pool), authn, tokens),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
