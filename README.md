@@ -109,6 +109,20 @@ land in that user's gallery.
 | `new_version` | `id`, `html` | `{version, url}` |
 | `list` | `folder_id?` | folders and pages |
 | `get_page` | `id` | metadata and the current HTML |
+| `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?` | one-time upload URL and a `curl` example |
+
+Large pages shouldn't travel as tool arguments (models truncate long outputs),
+so an agent can ask for an **upload grant** and send the file over plain HTTP:
+
+```sh
+curl -sS -X PUT -H 'Content-Type: text/html' --data-binary @page.html \
+  https://specola.example.com/upload/<token>
+# → {"id": "...", "version": 1, "url": "https://specola.example.com/#/p/..."}
+```
+
+A grant is single-use and valid for 10 minutes; only its sha256 is stored.
+Access is checked again when it is redeemed, so access lost in between is
+respected. Used or expired grants answer 410.
 
 Specola is an OAuth 2.1 **resource server**. `/mcp` requires
 `Authorization: Bearer <JWT>` issued by `SPECOLA_OIDC_ISSUER` with

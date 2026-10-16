@@ -154,12 +154,37 @@ func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub st
 // CreatePage creates an asset and its version 1 in one transaction. The folder
 // must be visible to sub.
 func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, sub string) (id string, version int, err error) {
+	err = s.inTx(ctx, func(tx pgx.Tx) error {
+		id, version, err = createPage(ctx, tx, folderID, name, html, sub)
+		return err
+	})
+	return id, version, err
+}
+
+// AddVersion appends a new version to one of sub's pages and returns its
+// number.
+func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (version int, err error) {
+	err = s.inTx(ctx, func(tx pgx.Tx) error {
+		version, err = addVersion(ctx, tx, assetID, html, sub)
+		return err
+	})
+	return version, err
+}
+
+// inTx runs fn in a transaction, committing only if it returns nil.
+func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", 0, err
+		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, sub string) (id string, version int, err error) {
 	if err = checkFolder(ctx, tx, folderID, sub); err != nil {
 		return "", 0, err
 	}
@@ -186,30 +211,15 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, su
 		return "", 0, errors.New("could not allocate a unique page slug")
 	}
 
-	sum := sha256.Sum256([]byte(html))
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
-		VALUES ($1::uuid, 1, $2, $3, $4, $5)`,
-		id, html, hex.EncodeToString(sum[:]), len(html), sub); err != nil {
-		return "", 0, err
-	}
-	if err = tx.Commit(ctx); err != nil {
+	if err = insertVersion(ctx, tx, id, 1, html, sub); err != nil {
 		return "", 0, err
 	}
 	return id, 1, nil
 }
 
-// AddVersion appends a new version to one of sub's pages and returns its
-// number.
-func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (int, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
+func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string) (int, error) {
 	var next int
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		UPDATE asset
 		SET current_version = current_version + 1, updated_at = now(), updated_by_sub = $2
 		WHERE id = $1::uuid AND created_by_sub = $2
@@ -221,18 +231,19 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (int,
 	if err != nil {
 		return 0, err
 	}
-
-	sum := sha256.Sum256([]byte(html))
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
-		assetID, next, html, hex.EncodeToString(sum[:]), len(html), sub); err != nil {
-		return 0, err
-	}
-	if err = tx.Commit(ctx); err != nil {
+	if err := insertVersion(ctx, tx, assetID, next, html, sub); err != nil {
 		return 0, err
 	}
 	return next, nil
+}
+
+func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html, sub string) error {
+	sum := sha256.Sum256([]byte(html))
+	_, err := tx.Exec(ctx, `
+		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
+		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub)
+	return err
 }
 
 // PageMeta returns the metadata of one of sub's pages.

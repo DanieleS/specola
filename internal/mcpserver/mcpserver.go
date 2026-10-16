@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/danieles/specola/internal/auth"
 	"github.com/danieles/specola/internal/store"
@@ -43,6 +44,7 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "new_version", Description: newVersionDesc}, t.newVersion)
 	mcp.AddTool(srv, &mcp.Tool{Name: "list", Description: listDesc}, t.list)
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_page", Description: getPageDesc}, t.getPage)
+	mcp.AddTool(srv, &mcp.Tool{Name: "create_upload_grant", Description: grantDesc}, t.createUploadGrant)
 
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
 		Stateless:                  true,
@@ -54,16 +56,21 @@ func Handler(st *store.Store, opts Options) http.Handler {
 
 const instructions = `Specola stores versioned, interactive HTML pages in the user's own gallery.
 Publish a page with publish_page, update it with new_version (each call adds a version; history is kept), and find existing pages with list.
-Pages must be self-contained HTML: inline CSS and JS; imports from public CDNs are fine. Pages run in a sandbox without access to Specola itself.`
+Pages must be self-contained HTML: inline CSS and JS; imports from public CDNs are fine. Pages run in a sandbox without access to Specola itself.
+For HTML over ~100 KB, don't inline it in a tool argument: call create_upload_grant and PUT the file to the returned URL with curl.`
 
-const htmlNote = ` The HTML must be a complete, self-contained document: inline CSS and JS (CDN imports are fine). It is rendered in a sandboxed iframe.`
+const htmlNote = ` The HTML must be a complete, self-contained document: inline CSS and JS (CDN imports are fine). It is rendered in a sandboxed iframe. For HTML over ~100 KB use create_upload_grant instead, so the content isn't truncated.`
 
 const (
 	publishDesc    = `Publish a new HTML page to the user's Specola gallery and return its id and link.` + htmlNote
 	newVersionDesc = `Replace the content of an existing page by adding a new version. Earlier versions stay in the history.` + htmlNote
 	listDesc       = `List the folders and pages in a folder of the user's gallery (the root when folder_id is omitted).`
 	getPageDesc    = `Get a page's metadata and the HTML of its current version.`
+	grantDesc      = `Get a one-time URL to upload a large HTML file over plain HTTP instead of passing it as a tool argument. kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. PUT the raw HTML file as the request body (see the returned curl command) within 10 minutes; the response holds the page id, version and url.`
 )
+
+// GrantTTL is how long an upload grant stays valid.
+const GrantTTL = 10 * time.Minute
 
 type tools struct {
 	st   *store.Store
@@ -202,4 +209,52 @@ func (t *tools) getPage(ctx context.Context, req *mcp.CallToolRequest, in getPag
 		return nil, getPageOut{}, toolError(err, "page")
 	}
 	return nil, getPageOut{PageMeta: *meta, URL: t.pageURL(in.ID), HTML: html}, nil
+}
+
+type grantIn struct {
+	Kind     string  `json:"kind" jsonschema:"new (publish a new page) or version (add a version to page id)"`
+	Title    string  `json:"title,omitempty" jsonschema:"title of the new page; required for kind new"`
+	FolderID *string `json:"folder_id,omitempty" jsonschema:"folder for the new page; the root when omitted"`
+	ID       string  `json:"id,omitempty" jsonschema:"page to add a version to; required for kind version"`
+}
+
+type grantOut struct {
+	UploadURL string    `json:"upload_url"`
+	Method    string    `json:"method"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Curl      string    `json:"curl"`
+}
+
+func (t *tools) createUploadGrant(ctx context.Context, req *mcp.CallToolRequest, in grantIn) (*mcp.CallToolResult, grantOut, error) {
+	who, err := t.caller(ctx, req)
+	if err != nil {
+		return nil, grantOut{}, err
+	}
+	gr := store.GrantRequest{Sub: who.Sub}
+	var what string
+	switch in.Kind {
+	case "new":
+		if in.Title == "" {
+			return nil, grantOut{}, errors.New("title is required for kind new")
+		}
+		gr.Kind, gr.Name, gr.FolderID, what = store.GrantUploadNew, in.Title, in.FolderID, "folder"
+	case "version":
+		if in.ID == "" {
+			return nil, grantOut{}, errors.New("id is required for kind version")
+		}
+		gr.Kind, gr.AssetID, what = store.GrantUploadVersion, in.ID, "page"
+	default:
+		return nil, grantOut{}, errors.New(`kind must be "new" or "version"`)
+	}
+	token, expires, err := t.st.MintGrant(ctx, gr, GrantTTL)
+	if err != nil {
+		return nil, grantOut{}, toolError(err, what)
+	}
+	url := t.opts.BaseURL + "/upload/" + token
+	return nil, grantOut{
+		UploadURL: url,
+		Method:    http.MethodPut,
+		ExpiresAt: expires,
+		Curl:      fmt.Sprintf("curl -sS -X PUT -H 'Content-Type: text/html' --data-binary @page.html '%s'", url),
+	}, nil
 }

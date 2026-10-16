@@ -260,3 +260,61 @@ func TestMCPPublishActsAsTheTokenUser(t *testing.T) {
 		t.Fatalf("bob new_version succeeded: %+v", res)
 	}
 }
+
+func TestMCPUploadGrant(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ts := newMCPTestServer(t, fi)
+	cs, err := connect(t, ts, fi.token(t, "alice", testResource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+
+	var grant struct {
+		UploadURL string `json:"upload_url"`
+		Method    string
+		Curl      string
+	}
+	callTool(t, cs, "create_upload_grant", map[string]any{"kind": "new", "title": "Large"}, &grant)
+	const prefix = "http://specola.test/upload/"
+	if !strings.HasPrefix(grant.UploadURL, prefix) || grant.Method != "PUT" || !strings.Contains(grant.Curl, grant.UploadURL) {
+		t.Fatalf("grant = %+v", grant)
+	}
+	path := "/upload/" + strings.TrimPrefix(grant.UploadURL, prefix)
+
+	// No session or token: the grant itself is the credential.
+	html := "<p>" + strings.Repeat("x", 300<<10) + "</p>"
+	code, body := call(t, ts, "", "PUT", path, html)
+	if code != http.StatusCreated {
+		t.Fatalf("upload: %d %s", code, body)
+	}
+	var up struct {
+		ID      string
+		Version int
+		URL     string
+	}
+	mustJSON(t, body, &up)
+	if up.Version != 1 || up.URL != "http://specola.test/#/p/"+up.ID {
+		t.Fatalf("upload = %+v", up)
+	}
+	if _, got := call(t, ts, "alice", "GET", "/view/"+up.ID, ""); got != html {
+		t.Fatalf("alice /view: %d bytes, want %d", len(got), len(html))
+	}
+
+	if code, _ := call(t, ts, "", "PUT", path, "<p>again</p>"); code != http.StatusGone {
+		t.Fatalf("second use: %d, want 410", code)
+	}
+	if code, _ := call(t, ts, "", "PUT", "/upload/unknown", "<p>x</p>"); code != http.StatusNotFound {
+		t.Fatalf("unknown token: %d, want 404", code)
+	}
+
+	// Version grants for someone else's page are refused at mint time.
+	bob, err := connect(t, ts, fi.token(t, "bob", testResource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Close()
+	if res := callTool(t, bob, "create_upload_grant", map[string]any{"kind": "version", "id": up.ID}, nil); !res.IsError {
+		t.Fatalf("bob grant on alice's page succeeded: %+v", res)
+	}
+}

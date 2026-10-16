@@ -67,6 +67,9 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 
 	s.mountMCP(r, tokens)
 
+	// The token is the credential: no session needed, so agents can curl it.
+	r.Put("/upload/{token}", s.handleUpload)
+
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAuth)
 		r.Get("/view/{id}", s.handleView)
@@ -292,6 +295,31 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, html)
 }
 
+// maxUploadBytes bounds a page uploaded through a grant. Grants exist for pages
+// too large to inline in a tool argument, so this is well above the JSON limit.
+const maxUploadBytes = 64 << 20
+
+// handleUpload redeems an upload grant with the raw HTML request body.
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxUploadBytes))
+	if err != nil {
+		http.Error(w, "body too large or unreadable", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if len(body) == 0 {
+		http.Error(w, "empty body: send the HTML as the request body", http.StatusBadRequest)
+		return
+	}
+	id, version, err := s.st.RedeemUpload(r.Context(), chi.URLParam(r, "token"), string(body))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": id, "version": version, "url": s.cfg.AppBaseURL + "/#/p/" + id,
+	})
+}
+
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(dst); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
@@ -307,9 +335,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func httpError(w http.ResponseWriter, err error) {
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
 		return
+	case errors.Is(err, store.ErrGrantGone):
+		http.Error(w, err.Error(), http.StatusGone)
+		return
+	case errors.Is(err, store.ErrGrantKind):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
+	slog.Error("request failed", "err", err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
