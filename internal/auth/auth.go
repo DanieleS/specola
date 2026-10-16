@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -25,6 +26,8 @@ type Auth struct {
 	oauth    oauth2.Config
 	verifier *oidc.IDTokenVerifier
 	sc       *securecookie.SecureCookie
+	// endSession is the provider's RP-initiated logout URL, if it advertises one.
+	endSession string
 }
 
 type session struct {
@@ -37,9 +40,15 @@ func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	var meta struct {
+		EndSession string `json:"end_session_endpoint"`
+	}
+	_ = provider.Claims(&meta)
+
 	sc := securecookie.New([]byte(cfg.SessionSecret), nil)
 	sc.MaxAge(int(sessionTTL.Seconds()))
 	return &Auth{
+		endSession: meta.EndSession,
 		cfg: cfg,
 		oauth: oauth2.Config{
 			ClientID:     cfg.LogtoAppID,
@@ -103,10 +112,19 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-// Logout clears the session cookie.
+// Logout clears the session cookie and, when the provider supports it, ends the
+// provider session too — otherwise the next visit would silently log back in.
 func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
-	http.Redirect(w, r, "/", http.StatusFound)
+	if a.endSession == "" {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	q := url.Values{
+		"client_id":                {a.cfg.LogtoAppID},
+		"post_logout_redirect_uri": {a.cfg.AppBaseURL + "/"},
+	}
+	http.Redirect(w, r, a.endSession+"?"+q.Encode(), http.StatusFound)
 }
 
 // Email returns the signed-in email, or "" when there is no valid session.

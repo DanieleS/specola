@@ -16,6 +16,17 @@ export type PageMeta = {
   updatedAt: string;
 };
 
+export class Unauthorized extends Error {
+  constructor() {
+    super("unauthorized");
+  }
+}
+
+// Fired on any 401 so the app can swap to the login screen. We never redirect
+// automatically: the user starts the login from an explicit button, so a
+// failing login cannot turn into a redirect loop.
+export const UNAUTHORIZED_EVENT = "specola:unauthorized";
+
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -24,8 +35,8 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     credentials: "same-origin",
   });
   if (res.status === 401) {
-    window.location.href = "/auth/login";
-    throw new Error("unauthorized");
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    throw new Unauthorized();
   }
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   const ct = res.headers.get("content-type") ?? "";
