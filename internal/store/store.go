@@ -49,6 +49,7 @@ type PageMeta struct {
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // Tree lists the active folders and pages directly under parentID. At the root
@@ -227,13 +228,17 @@ func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string) (int,
 	return next, nil
 }
 
+// insertVersion stores a page version, which becomes current, and reindexes
+// the page for search.
 func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html, sub string) error {
 	sum := sha256.Sum256([]byte(html))
-	_, err := tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
 		VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
-		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub)
-	return err
+		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub); err != nil {
+		return err
+	}
+	return reindex(ctx, tx, assetID, &html)
 }
 
 // PageMeta returns the metadata of a page sub can see.

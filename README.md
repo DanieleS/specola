@@ -12,7 +12,7 @@ Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
 > Status: early. Publish, browse, version, view, share, and an OAuth-protected
-> MCP endpoint for agents. Search lands next.
+> MCP endpoint for agents, and full-text search.
 
 ## Stack
 
@@ -42,6 +42,8 @@ tokens), not by email.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
   HTML body instead of inlining it in a request.
 - **favorite** — personal stars.
+- **search_document** — per page, the title and tag-stripped text of the
+  current version with a `tsvector`, for full-text search.
 
 ## Sharing
 
@@ -59,6 +61,14 @@ Share a folder or page with another user by email, as **viewer** (read) or
 
 API: `GET/PUT/DELETE /api/{pages|folders}/{id}/acl` (`PUT` takes
 `{"email" | "sub", "role"}`, `DELETE` takes `?sub=`), and `GET /api/shared`.
+
+## Search
+
+The search box (and `GET /api/search?q=`, and the MCP `search` tool) searches
+the titles and visible text of every page you can see. It uses PostgreSQL
+full-text search with web-search syntax: `"quoted phrases"`, `OR`, `-word`.
+Matching is on whole words without stemming, so it behaves the same in any
+language. The index is updated with every new version.
 
 ## Configuration
 
@@ -126,6 +136,7 @@ land in that user's gallery.
 | `new_version` | `id`, `html` | `{version, url}` |
 | `list` | `folder_id?` | folders and pages |
 | `get_page` | `id` | metadata and the current HTML |
+| `search` | `query`, `limit?` | matching pages with snippets |
 | `share` | `kind`, `id`, `email`, `role` (`viewer` / `editor` / `none`) | the item's shares |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?` | one-time upload URL and a `curl` example |
 

@@ -201,7 +201,7 @@ func TestMCPPublishActsAsTheTokenUser(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names = append(names, tool.Name)
 	}
-	for _, want := range []string{"publish_page", "new_version", "list", "get_page"} {
+	for _, want := range []string{"publish_page", "new_version", "list", "get_page", "search", "share", "create_upload_grant"} {
 		if !strings.Contains(strings.Join(names, ","), want) {
 			t.Fatalf("tools = %v, missing %s", names, want)
 		}
@@ -237,6 +237,12 @@ func TestMCPPublishActsAsTheTokenUser(t *testing.T) {
 	callTool(t, cs, "list", map[string]any{}, &list)
 	if len(list.Items) != 1 || list.Items[0].ID != pub.ID || list.Items[0].URL == "" {
 		t.Fatalf("list = %+v", list)
+	}
+
+	var found struct{ Results []struct{ ID, Snippet string } }
+	callTool(t, cs, "search", map[string]any{"query": "agent"}, &found)
+	if len(found.Results) != 1 || found.Results[0].ID != pub.ID {
+		t.Fatalf("search = %+v", found)
 	}
 
 	// The page is in alice's web gallery, and nobody else's.

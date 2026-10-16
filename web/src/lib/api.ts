@@ -30,6 +30,11 @@ export type Share = {
   createdAt: string;
 };
 
+export type SearchResult = TreeItem & {
+  /** Safe HTML from the server: escaped text, matches wrapped in <mark>. */
+  snippet: string;
+};
+
 export type ItemKind = "page" | "folder";
 
 const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
@@ -71,6 +76,7 @@ export const api = {
     req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId }),
   pageMeta: (id: string) => req<PageMeta>("GET", `/api/pages/${id}`),
   shared: () => req<TreeItem[]>("GET", "/api/shared"),
+  search: (q: string) => req<SearchResult[]>("GET", `/api/search?q=${encodeURIComponent(q)}`),
   shares: (kind: ItemKind, id: string) => req<Share[]>("GET", aclPath(kind, id)),
   share: (kind: ItemKind, id: string, email: string, role: Share["role"]) =>
     req<void>("PUT", aclPath(kind, id), { email, role }),

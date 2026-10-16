@@ -81,6 +81,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Get("/pages/{id}", s.handlePageMeta)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
 			r.Get("/shared", s.handleShared)
+			r.Get("/search", s.handleSearch)
 			for _, k := range []string{"pages", "folders"} {
 				r.Get("/"+k+"/{id}/acl", s.handleListShares)
 				r.Put("/"+k+"/{id}/acl", s.handleShare)
@@ -294,6 +295,15 @@ func (s *Server) handleShared(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	res, err := s.st.Search(r.Context(), subOf(r.Context()), r.URL.Query().Get("q"), 50)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // itemKind maps the /api/{pages|folders}/... path segment to a store kind.

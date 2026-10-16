@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"time"
 
@@ -46,6 +47,7 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_page", Description: getPageDesc}, t.getPage)
 	mcp.AddTool(srv, &mcp.Tool{Name: "create_upload_grant", Description: grantDesc}, t.createUploadGrant)
 	mcp.AddTool(srv, &mcp.Tool{Name: "share", Description: shareDesc}, t.share)
+	mcp.AddTool(srv, &mcp.Tool{Name: "search", Description: searchDesc}, t.search)
 
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
 		Stateless:                  true,
@@ -56,7 +58,7 @@ func Handler(st *store.Store, opts Options) http.Handler {
 }
 
 const instructions = `Specola stores versioned, interactive HTML pages in the user's own gallery.
-Publish a page with publish_page, update it with new_version (each call adds a version; history is kept), and find existing pages with list.
+Publish a page with publish_page, update it with new_version (each call adds a version; history is kept), and find existing pages with search or list.
 Pages must be self-contained HTML: inline CSS and JS; imports from public CDNs are fine. Pages run in a sandbox without access to Specola itself.
 For HTML over ~100 KB, don't inline it in a tool argument: call create_upload_grant and PUT the file to the returned URL with curl.`
 
@@ -67,6 +69,7 @@ const (
 	newVersionDesc = `Replace the content of an existing page by adding a new version. Earlier versions stay in the history.` + htmlNote
 	listDesc       = `List the folders and pages in a folder of the user's gallery (the user's own root when folder_id is omitted), or with shared_with_me the items other users shared with them. Each item carries the user's role: owner, editor or viewer.`
 	getPageDesc    = `Get a page's metadata and the HTML of its current version.`
+	searchDesc     = `Full-text search over the titles and text of every page the user can see, their own and shared with them, best match first. Supports "quoted phrases", OR, and -excluded words. Matching is on whole words, without stemming.`
 	shareDesc      = `Share a page or folder the user owns with another Specola user by email. role "viewer" can read, "editor" can also add versions and create items inside a folder, "none" removes the share. Sharing a folder covers everything beneath it. The other user must have signed in to Specola at least once.`
 	grantDesc      = `Get a one-time URL to upload a large HTML file over plain HTTP instead of passing it as a tool argument. kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. PUT the raw HTML file as the request body (see the returned curl command) within 10 minutes; the response holds the page id, version and url.`
 )
@@ -309,4 +312,41 @@ func (t *tools) share(ctx context.Context, req *mcp.CallToolRequest, in shareIn)
 		return nil, shareOut{}, toolError(err, in.Kind)
 	}
 	return nil, shareOut{Shares: shares}, nil
+}
+
+type searchIn struct {
+	Query string `json:"query" jsonschema:"words to search for"`
+	Limit int    `json:"limit,omitempty" jsonschema:"maximum results, default 20, at most 100"`
+}
+
+type searchHit struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+	Role    string `json:"role"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet" jsonschema:"matching text, matches wrapped in <mark>"`
+}
+
+type searchOut struct {
+	Results []searchHit `json:"results"`
+}
+
+func (t *tools) search(ctx context.Context, req *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, searchOut, error) {
+	who, err := t.caller(ctx, req)
+	if err != nil {
+		return nil, searchOut{}, err
+	}
+	res, err := t.st.Search(ctx, who.Sub, in.Query, in.Limit)
+	if err != nil {
+		return nil, searchOut{}, err
+	}
+	out := searchOut{Results: make([]searchHit, 0, len(res))}
+	for _, r := range res {
+		out.Results = append(out.Results, searchHit{
+			ID: r.ID, Name: r.Name, Version: r.Version, Role: r.Role,
+			URL: t.pageURL(r.ID), Snippet: html.UnescapeString(r.Snippet),
+		})
+	}
+	return nil, out, nil
 }
