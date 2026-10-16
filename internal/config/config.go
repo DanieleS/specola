@@ -35,12 +35,12 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr:     env("SPECOLA_LISTEN", ":8080"),
-		DatabaseURL:    os.Getenv("SPECOLA_DATABASE_URL"),
-		AppBaseURL:     env("SPECOLA_BASE_URL", "http://localhost:8080"),
-		SessionSecret:  os.Getenv("SPECOLA_SESSION_SECRET"),
-		LogtoEndpoint:  os.Getenv("SPECOLA_LOGTO_ENDPOINT"),
-		LogtoAppID:     os.Getenv("SPECOLA_LOGTO_APP_ID"),
+		ListenAddr:        env("SPECOLA_LISTEN", ":8080"),
+		DatabaseURL:       os.Getenv("SPECOLA_DATABASE_URL"),
+		AppBaseURL:        env("SPECOLA_BASE_URL", "http://localhost:8080"),
+		SessionSecret:     os.Getenv("SPECOLA_SESSION_SECRET"),
+		LogtoEndpoint:     os.Getenv("SPECOLA_LOGTO_ENDPOINT"),
+		LogtoAppID:        os.Getenv("SPECOLA_LOGTO_APP_ID"),
 		LogtoAppSecret:    os.Getenv("SPECOLA_LOGTO_APP_SECRET"),
 		TrustedUserHeader: os.Getenv("SPECOLA_TRUSTED_USER_HEADER"),
 		DevAuthEmail:      os.Getenv("SPECOLA_DEV_AUTH_EMAIL"),

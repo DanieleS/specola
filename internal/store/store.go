@@ -89,14 +89,14 @@ func (s *Store) Tree(ctx context.Context, parentID *string) ([]TreeItem, error) 
 
 // CreateFolder inserts a folder under parentID (nil = root), retrying the slug
 // on collision.
-func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, email string) (string, error) {
+func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub string) (string, error) {
 	base := slugify(name)
 	for i := 0; i < 25; i++ {
 		var id string
 		err := s.pool.QueryRow(ctx, `
-			INSERT INTO folder (parent_id, name, slug, created_by_email, updated_by_email)
+			INSERT INTO folder (parent_id, name, slug, created_by_sub, updated_by_sub)
 			VALUES ($1::uuid, $2, $3, $4, $4)
-			RETURNING id::text`, parentID, name, withSuffix(base, i), email).Scan(&id)
+			RETURNING id::text`, parentID, name, withSuffix(base, i), sub).Scan(&id)
 		if err == nil {
 			return id, nil
 		}
@@ -109,7 +109,7 @@ func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, email 
 }
 
 // CreatePage creates an asset and its version 1 in one transaction.
-func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, email string) (id string, version int, err error) {
+func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, sub string) (id string, version int, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", 0, err
@@ -120,9 +120,9 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, em
 	created := false
 	for i := 0; i < 25; i++ {
 		err = tx.QueryRow(ctx, `
-			INSERT INTO asset (folder_id, name, slug, created_by_email, updated_by_email, current_version)
+			INSERT INTO asset (folder_id, name, slug, created_by_sub, updated_by_sub, current_version)
 			VALUES ($1::uuid, $2, $3, $4, $4, 1)
-			RETURNING id::text`, folderID, name, withSuffix(base, i), email).Scan(&id)
+			RETURNING id::text`, folderID, name, withSuffix(base, i), sub).Scan(&id)
 		if err == nil {
 			created = true
 			break
@@ -137,9 +137,9 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, em
 
 	sum := sha256.Sum256([]byte(html))
 	if _, err = tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_email)
+		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
 		VALUES ($1::uuid, 1, $2, $3, $4, $5)`,
-		id, html, hex.EncodeToString(sum[:]), len(html), email); err != nil {
+		id, html, hex.EncodeToString(sum[:]), len(html), sub); err != nil {
 		return "", 0, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -149,7 +149,7 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, em
 }
 
 // AddVersion appends a new version to an existing page and returns its number.
-func (s *Store) AddVersion(ctx context.Context, assetID, html, email string) (int, error) {
+func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -159,9 +159,9 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, email string) (in
 	var next int
 	err = tx.QueryRow(ctx, `
 		UPDATE asset
-		SET current_version = current_version + 1, updated_at = now(), updated_by_email = $2
+		SET current_version = current_version + 1, updated_at = now(), updated_by_sub = $2
 		WHERE id = $1::uuid AND deleted_at IS NULL AND archived_at IS NULL
-		RETURNING current_version`, assetID, email).Scan(&next)
+		RETURNING current_version`, assetID, sub).Scan(&next)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, ErrNotFound
 	}
@@ -171,9 +171,9 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, email string) (in
 
 	sum := sha256.Sum256([]byte(html))
 	if _, err = tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_email)
+		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
 		VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
-		assetID, next, html, hex.EncodeToString(sum[:]), len(html), email); err != nil {
+		assetID, next, html, hex.EncodeToString(sum[:]), len(html), sub); err != nil {
 		return 0, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -216,4 +216,17 @@ func (s *Store) CurrentContent(ctx context.Context, id string) (string, error) {
 func isUniqueViolation(err error) bool {
 	var pg *pgconn.PgError
 	return errors.As(err, &pg) && pg.Code == "23505"
+}
+
+// UpsertUser records a user seen at login, keyed by their OIDC subject. Empty
+// email or name never overwrite a value already on file.
+func (s *Store) UpsertUser(ctx context.Context, sub, email, name string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO app_user (sub, email, name)
+		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
+		ON CONFLICT (sub) DO UPDATE SET
+		  email         = COALESCE(EXCLUDED.email, app_user.email),
+		  name          = COALESCE(EXCLUDED.name, app_user.name),
+		  last_login_at = now()`, sub, email, name)
+	return err
 }

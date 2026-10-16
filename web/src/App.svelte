@@ -22,7 +22,7 @@
   api
     .me()
     .then((m) => {
-      email = m.email;
+      email = m.email || m.sub;
       auth = "in";
     })
     .catch((e) => {

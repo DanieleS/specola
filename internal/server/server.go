@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/danieles/specola/internal/auth"
 	"github.com/danieles/specola/internal/config"
@@ -21,17 +23,26 @@ import (
 
 type ctxKey int
 
-const emailKey ctxKey = iota
+const identityKey ctxKey = iota
 
 type Server struct {
 	cfg  *config.Config
 	st   *store.Store
-	auth *auth.Auth // nil in dev-bypass mode
+	auth *auth.Auth // nil in trusted-header and dev-bypass modes
 	mux  http.Handler
+
+	// seen holds the subs already recorded in app_user by this process, for the
+	// modes that have no login step to hook (trusted header, dev bypass).
+	seen sync.Map
 }
 
 func New(cfg *config.Config, st *store.Store, a *auth.Auth) *Server {
 	s := &Server{cfg: cfg, st: st, auth: a}
+	if a != nil {
+		a.OnLogin = func(ctx context.Context, id auth.Identity, name string) error {
+			return st.UpsertUser(ctx, id.Sub, id.Email, name)
+		}
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
@@ -69,20 +80,27 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth) *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
-// requireAuth resolves the caller's email (OIDC session, or the dev bypass) and
-// stashes it in the request context.
+// requireAuth resolves the caller's identity (OIDC session, trusted proxy
+// header, or the dev bypass) and stashes it in the request context.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var email string
+		var id auth.Identity
 		switch {
 		case s.cfg.TrustedUserHeader != "":
-			email = strings.TrimSpace(r.Header.Get(s.cfg.TrustedUserHeader))
+			// The header value is the subject. Proxies commonly send an email
+			// there, so use it as the email too when it looks like one.
+			id.Sub = strings.TrimSpace(r.Header.Get(s.cfg.TrustedUserHeader))
+			if strings.Contains(id.Sub, "@") {
+				id.Email = id.Sub
+			}
+			s.recordUser(r.Context(), id)
 		case s.auth != nil:
-			email = s.auth.Email(r)
+			id = s.auth.Identity(r)
 		default:
-			email = s.cfg.DevAuthEmail
+			id = auth.Identity{Sub: s.cfg.DevAuthEmail, Email: s.cfg.DevAuthEmail}
+			s.recordUser(r.Context(), id)
 		}
-		if email == "" {
+		if id.Sub == "" {
 			// Only our own OIDC flow can recover an anonymous browser request.
 			if s.auth != nil && !strings.HasPrefix(r.URL.Path, "/api") {
 				http.Redirect(w, r, "/auth/login", http.StatusFound)
@@ -91,17 +109,35 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), emailKey, email)))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 	})
 }
 
-func emailOf(ctx context.Context) string {
-	v, _ := ctx.Value(emailKey).(string)
+// recordUser upserts app_user the first time this process sees a sub. A failure
+// is logged and retried on the next request rather than failing this one.
+func (s *Server) recordUser(ctx context.Context, id auth.Identity) {
+	if id.Sub == "" {
+		return
+	}
+	if _, done := s.seen.Load(id.Sub); done {
+		return
+	}
+	if err := s.st.UpsertUser(ctx, id.Sub, id.Email, ""); err != nil {
+		slog.Warn("record user", "err", err)
+		return
+	}
+	s.seen.Store(id.Sub, struct{}{})
+}
+
+func identityOf(ctx context.Context) auth.Identity {
+	v, _ := ctx.Value(identityKey).(auth.Identity)
 	return v
 }
 
+func subOf(ctx context.Context) string { return identityOf(ctx).Sub }
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"email": emailOf(r.Context())})
+	writeJSON(w, http.StatusOK, identityOf(r.Context()))
 }
 
 func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +167,7 @@ func (s *Server) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	id, err := s.st.CreateFolder(r.Context(), req.ParentID, req.Name, emailOf(r.Context()))
+	id, err := s.st.CreateFolder(r.Context(), req.ParentID, req.Name, subOf(r.Context()))
 	if err != nil {
 		httpError(w, err)
 		return
@@ -154,7 +190,7 @@ func (s *Server) handleCreatePage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name and html are required", http.StatusBadRequest)
 		return
 	}
-	id, version, err := s.st.CreatePage(r.Context(), req.FolderID, req.Name, req.HTML, emailOf(r.Context()))
+	id, version, err := s.st.CreatePage(r.Context(), req.FolderID, req.Name, req.HTML, subOf(r.Context()))
 	if err != nil {
 		httpError(w, err)
 		return
@@ -175,7 +211,7 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "html is required", http.StatusBadRequest)
 		return
 	}
-	version, err := s.st.AddVersion(r.Context(), chi.URLParam(r, "id"), req.HTML, emailOf(r.Context()))
+	version, err := s.st.AddVersion(r.Context(), chi.URLParam(r, "id"), req.HTML, subOf(r.Context()))
 	if err != nil {
 		httpError(w, err)
 		return

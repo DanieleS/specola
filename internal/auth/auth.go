@@ -1,5 +1,5 @@
 // Package auth wires OIDC (Authorization Code flow) login against an external
-// identity provider and keeps the signed-in email in a signed session cookie.
+// identity provider and keeps the signed-in identity in a signed session cookie.
 package auth
 
 import (
@@ -28,9 +28,21 @@ type Auth struct {
 	sc       *securecookie.SecureCookie
 	// endSession is the provider's RP-initiated logout URL, if it advertises one.
 	endSession string
+
+	// OnLogin, when set, runs after a successful login and before the session
+	// cookie is issued; an error aborts the login.
+	OnLogin func(ctx context.Context, id Identity, name string) error
+}
+
+// Identity is who a request acts as. Sub is the stable OIDC subject and the key
+// everything is owned by; Email is informational and may be empty.
+type Identity struct {
+	Sub   string `json:"sub"`
+	Email string `json:"email"`
 }
 
 type session struct {
+	Sub   string
 	Email string
 }
 
@@ -49,7 +61,7 @@ func New(ctx context.Context, cfg *config.Config) (*Auth, error) {
 	sc.MaxAge(int(sessionTTL.Seconds()))
 	return &Auth{
 		endSession: meta.EndSession,
-		cfg: cfg,
+		cfg:        cfg,
 		oauth: oauth2.Config{
 			ClientID:     cfg.LogtoAppID,
 			ClientSecret: cfg.LogtoAppSecret,
@@ -73,7 +85,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 // Callback completes the flow: verify state, exchange the code, verify the ID
-// token, and persist the email.
+// token, and persist the subject and email.
 func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	st, err := r.Cookie(stateCookie)
 	if err != nil || r.URL.Query().Get("state") == "" || r.URL.Query().Get("state") != st.Value {
@@ -97,12 +109,20 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 	var claims struct {
 		Email string `json:"email"`
+		Name  string `json:"name"`
 	}
-	if err := idToken.Claims(&claims); err != nil || claims.Email == "" {
-		http.Error(w, "no email claim", http.StatusUnauthorized)
+	if err := idToken.Claims(&claims); err != nil || idToken.Subject == "" {
+		http.Error(w, "no subject in id_token", http.StatusUnauthorized)
 		return
 	}
-	if enc, err := a.sc.Encode(sessionCookie, session{Email: claims.Email}); err == nil {
+	id := Identity{Sub: idToken.Subject, Email: claims.Email}
+	if a.OnLogin != nil {
+		if err := a.OnLogin(r.Context(), id, claims.Name); err != nil {
+			http.Error(w, "could not record login", http.StatusInternalServerError)
+			return
+		}
+	}
+	if enc, err := a.sc.Encode(sessionCookie, session{Sub: id.Sub, Email: id.Email}); err == nil {
 		http.SetCookie(w, &http.Cookie{
 			Name: sessionCookie, Value: enc, Path: "/", HttpOnly: true,
 			Secure: a.cfg.Secure(), SameSite: http.SameSiteLaxMode,
@@ -127,15 +147,17 @@ func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, a.endSession+"?"+q.Encode(), http.StatusFound)
 }
 
-// Email returns the signed-in email, or "" when there is no valid session.
-func (a *Auth) Email(r *http.Request) string {
+// Identity returns the signed-in identity, or the zero value when there is no
+// valid session. Sessions issued before users were keyed by sub carry no Sub
+// and count as signed out.
+func (a *Auth) Identity(r *http.Request) Identity {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
-		return ""
+		return Identity{}
 	}
 	var s session
-	if err := a.sc.Decode(sessionCookie, c.Value, &s); err != nil {
-		return ""
+	if err := a.sc.Decode(sessionCookie, c.Value, &s); err != nil || s.Sub == "" {
+		return Identity{}
 	}
-	return s.Email
+	return Identity{Sub: s.Sub, Email: s.Email}
 }

@@ -44,7 +44,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
 }
 
 export const api = {
-  me: () => req<{ email: string }>("GET", "/api/me"),
+  me: () => req<{ sub: string; email: string }>("GET", "/api/me"),
   tree: (parent?: string | null) =>
     req<TreeItem[]>("GET", "/api/tree" + (parent ? `?parent=${encodeURIComponent(parent)}` : "")),
   createFolder: (name: string, parentId: string | null) =>

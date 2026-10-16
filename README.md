@@ -26,10 +26,15 @@ page viewer, and the built SPA.
 
 ## Data model
 
+Users are identified by their OIDC `sub` (stable, and present in API access
+tokens), not by email.
+
+- **app_user** — one row per `sub` seen at login, with the latest email and
+  name. Used to resolve an email to a `sub` when sharing.
 - **folder** — a tree; soft-delete + archive aware.
 - **asset** — a page. `current_version` points at the latest version.
 - **asset_version** — immutable history; the HTML lives inline in `content`.
-- **acl_entry** — one email, one role (`VIEWER` / `EDITOR`) on a folder *xor* an
+- **acl_entry** — one user (`sub`), one role (`VIEWER` / `EDITOR`) on a folder *xor* an
   asset. A folder grant is inherited by everything beneath it.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
   HTML body instead of inlining it in a request.
@@ -47,7 +52,8 @@ All via environment variables (see [`specola.env.example`](./specola.env.example
 | `SPECOLA_LOGTO_ENDPOINT` | prod | OIDC issuer URL, e.g. `https://auth.example.com/oidc` |
 | `SPECOLA_LOGTO_APP_ID` | prod | OIDC client id |
 | `SPECOLA_LOGTO_APP_SECRET` | prod | OIDC client secret |
-| `SPECOLA_DEV_AUTH_EMAIL` | dev | bypass OIDC; treat every request as this user |
+| `SPECOLA_TRUSTED_USER_HEADER` | no | trust this proxy header as the user's `sub` instead of running OIDC |
+| `SPECOLA_DEV_AUTH_EMAIL` | dev | bypass OIDC; treat every request as this user (used as both `sub` and email) |
 | `SPECOLA_LISTEN` | no | listen address (default `:8080`) |
 
 \* Not required when `SPECOLA_DEV_AUTH_EMAIL` is set.
