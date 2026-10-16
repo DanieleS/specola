@@ -239,7 +239,9 @@ func TestMCPPublishActsAsTheTokenUser(t *testing.T) {
 		t.Fatalf("list = %+v", list)
 	}
 
-	var found struct{ Results []struct{ ID, Snippet string } }
+	var found struct {
+		Results []struct{ ID, Snippet string }
+	}
 	callTool(t, cs, "search", map[string]any{"query": "agent"}, &found)
 	if len(found.Results) != 1 || found.Results[0].ID != pub.ID {
 		t.Fatalf("search = %+v", found)

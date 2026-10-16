@@ -1,6 +1,8 @@
 <script lang="ts">
   import { api } from "./api";
 
+  let { folderId = null }: { folderId?: string | null } = $props();
+
   let name = $state("");
   let html = $state("");
   let busy = $state(false);
@@ -11,7 +13,7 @@
     busy = true;
     error = "";
     try {
-      const r = await api.createPage(name.trim(), html, null);
+      const r = await api.createPage(name.trim(), html, folderId);
       location.hash = `#/p/${r.id}`;
     } catch (err) {
       error = String(err);
@@ -22,7 +24,10 @@
 </script>
 
 <div class="max-w-3xl mx-auto px-5 py-6">
-  <h1 class="text-xl font-semibold mb-5">New page</h1>
+  <h1 class="text-xl font-semibold mb-1">New page</h1>
+  <p class="text-sm text-white/40 mb-5">
+    {folderId ? "Publishing into the folder you were browsing." : "Publishing to your home folder."}
+  </p>
   <form onsubmit={submit} class="space-y-4">
     <div>
       <label for="name" class="block text-sm text-white/60 mb-1">Title</label>
@@ -54,7 +59,9 @@
       >
         {busy ? "Publishing…" : "Publish"}
       </button>
-      <a href="#/" class="px-4 py-2 rounded-md border border-white/15 hover:bg-white/5">Cancel</a>
+      <button type="button" onclick={() => history.back()} class="px-4 py-2 rounded-md border border-white/15 hover:bg-white/5"
+        >Cancel</button
+      >
     </div>
   </form>
 </div>

@@ -37,6 +37,14 @@ export type SearchResult = TreeItem & {
 
 export type ItemKind = "page" | "folder";
 
+export type VersionInfo = {
+  version: number;
+  sizeBytes: number;
+  createdAt: string;
+  editedBy?: string;
+  restoredFrom?: number;
+};
+
 const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
 
 export class Unauthorized extends Error {
@@ -76,6 +84,15 @@ export const api = {
     req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId }),
   pageMeta: (id: string) => req<PageMeta>("GET", `/api/pages/${id}`),
   shared: () => req<TreeItem[]>("GET", "/api/shared"),
+  archived: () => req<TreeItem[]>("GET", "/api/archived"),
+  versions: (id: string) => req<VersionInfo[]>("GET", `/api/pages/${id}/versions`),
+  restoreVersion: (id: string, from: number) =>
+    req<{ version: number }>("POST", `/api/pages/${id}/versions`, { restoreFrom: from }),
+  rename: (kind: ItemKind, id: string, name: string) => req<void>("PATCH", `/api/${kind}s/${id}`, { name }),
+  move: (kind: ItemKind, id: string, parentId: string | null) =>
+    req<void>("PATCH", `/api/${kind}s/${id}`, { parentId }),
+  archive: (kind: ItemKind, id: string) => req<void>("POST", `/api/${kind}s/${id}/archive`),
+  unarchive: (kind: ItemKind, id: string) => req<void>("POST", `/api/${kind}s/${id}/unarchive`),
   search: (q: string) => req<SearchResult[]>("GET", `/api/search?q=${encodeURIComponent(q)}`),
   shares: (kind: ItemKind, id: string) => req<Share[]>("GET", aclPath(kind, id)),
   share: (kind: ItemKind, id: string, email: string, role: Share["role"]) =>

@@ -35,6 +35,22 @@ func (k ItemKind) column() string {
 	return "asset_id"
 }
 
+// table is the table holding items of this kind.
+func (k ItemKind) table() string {
+	if k == KindFolder {
+		return "folder"
+	}
+	return "asset"
+}
+
+// parentColumn is the column naming an item's containing folder.
+func (k ItemKind) parentColumn() string {
+	if k == KindFolder {
+		return "parent_id"
+	}
+	return "folder_id"
+}
+
 func (k ItemKind) role(ctx context.Context, q querier, id, sub string) (Role, error) {
 	if k == KindFolder {
 		return folderRole(ctx, q, id, sub)

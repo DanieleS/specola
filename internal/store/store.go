@@ -154,7 +154,7 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, su
 // number.
 func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (version int, err error) {
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		version, err = addVersion(ctx, tx, assetID, html, sub)
+		version, err = addVersion(ctx, tx, assetID, html, sub, nil)
 		return err
 	})
 	return version, err
@@ -200,13 +200,15 @@ func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, su
 		return "", 0, errors.New("could not allocate a unique page slug")
 	}
 
-	if err = insertVersion(ctx, tx, id, 1, html, sub); err != nil {
+	if err = insertVersion(ctx, tx, id, 1, html, sub, nil); err != nil {
 		return "", 0, err
 	}
 	return id, 1, nil
 }
 
-func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string) (int, error) {
+// addVersion adds html as the next version of a page sub can edit.
+// restoredFrom records the version it was copied from, if any.
+func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string, restoredFrom *int) (int, error) {
 	if err := checkPage(ctx, tx, assetID, sub, RoleEditor); err != nil {
 		return 0, err
 	}
@@ -222,7 +224,7 @@ func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string) (int,
 	if err != nil {
 		return 0, err
 	}
-	if err := insertVersion(ctx, tx, assetID, next, html, sub); err != nil {
+	if err := insertVersion(ctx, tx, assetID, next, html, sub, restoredFrom); err != nil {
 		return 0, err
 	}
 	return next, nil
@@ -230,12 +232,12 @@ func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string) (int,
 
 // insertVersion stores a page version, which becomes current, and reindexes
 // the page for search.
-func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html, sub string) error {
+func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html, sub string, restoredFrom *int) error {
 	sum := sha256.Sum256([]byte(html))
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
-		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub); err != nil {
+		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub, restored_from_version)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)`,
+		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub, restoredFrom); err != nil {
 		return err
 	}
 	return reindex(ctx, tx, assetID, &html)

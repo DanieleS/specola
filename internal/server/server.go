@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,10 +80,15 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Post("/folders", s.handleCreateFolder)
 			r.Post("/pages", s.handleCreatePage)
 			r.Get("/pages/{id}", s.handlePageMeta)
+			r.Get("/pages/{id}/versions", s.handleVersions)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
 			r.Get("/shared", s.handleShared)
+			r.Get("/archived", s.handleArchived)
 			r.Get("/search", s.handleSearch)
 			for _, k := range []string{"pages", "folders"} {
+				r.Patch("/"+k+"/{id}", s.handleUpdateItem)
+				r.Post("/"+k+"/{id}/archive", s.handleArchive)
+				r.Post("/"+k+"/{id}/unarchive", s.handleUnarchive)
 				r.Get("/"+k+"/{id}/acl", s.handleListShares)
 				r.Put("/"+k+"/{id}/acl", s.handleShare)
 				r.Delete("/"+k+"/{id}/acl", s.handleUnshare)
@@ -258,8 +264,11 @@ func (s *Server) handleCreatePage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": version})
 }
 
+// addVersionReq carries either new HTML or the number of an earlier version to
+// restore as the new one.
 type addVersionReq struct {
-	HTML string `json:"html"`
+	HTML        string `json:"html"`
+	RestoreFrom int    `json:"restoreFrom"`
 }
 
 func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
@@ -267,11 +276,19 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.HTML == "" {
-		http.Error(w, "html is required", http.StatusBadRequest)
+	if (req.HTML == "") == (req.RestoreFrom == 0) {
+		http.Error(w, "send either html or restoreFrom", http.StatusBadRequest)
 		return
 	}
-	version, err := s.st.AddVersion(r.Context(), chi.URLParam(r, "id"), req.HTML, subOf(r.Context()))
+	var (
+		version int
+		err     error
+	)
+	if req.RestoreFrom != 0 {
+		version, err = s.st.RestoreVersion(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"), req.RestoreFrom)
+	} else {
+		version, err = s.st.AddVersion(r.Context(), chi.URLParam(r, "id"), req.HTML, subOf(r.Context()))
+	}
 	if err != nil {
 		httpError(w, err)
 		return
@@ -286,6 +303,73 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, meta)
+}
+
+func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
+	vs, err := s.st.Versions(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, vs)
+}
+
+// updateItemReq renames and/or moves an item. ParentID is raw so that an
+// explicit null (move to the root) differs from leaving it out (don't move).
+type updateItemReq struct {
+	Name     *string         `json:"name"`
+	ParentID json.RawMessage `json:"parentId"`
+}
+
+func (s *Server) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
+	var req updateItemReq
+	if !decode(w, r, &req) {
+		return
+	}
+	ctx, sub, kind, id := r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id")
+	if req.ParentID != nil {
+		var dest *string
+		if err := json.Unmarshal(req.ParentID, &dest); err != nil {
+			http.Error(w, "parentId must be a folder id or null", http.StatusBadRequest)
+			return
+		}
+		if err := s.st.Move(ctx, sub, kind, id, dest); err != nil {
+			httpError(w, err)
+			return
+		}
+	}
+	if req.Name != nil {
+		if err := s.st.Rename(ctx, sub, kind, id, *req.Name); err != nil {
+			httpError(w, err)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
+	if err := s.st.Archive(r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id")); err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUnarchive(w http.ResponseWriter, r *http.Request) {
+	if err := s.st.Unarchive(r.Context(), subOf(r.Context()), itemKind(r), chi.URLParam(r, "id")); err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleArchived(w http.ResponseWriter, r *http.Request) {
+	items, err := s.st.Archived(r.Context(), subOf(r.Context()))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (s *Server) handleShared(w http.ResponseWriter, r *http.Request) {
@@ -372,10 +456,25 @@ func (s *Server) handleUnshare(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleView serves a page's stored HTML. The CSP sandbox puts the page on an
-// opaque origin so its scripts cannot read Specola's cookies or call its API.
+// handleView serves a page's stored HTML: the current version, or ?v=N. The
+// CSP sandbox puts the page on an opaque origin so its scripts cannot read
+// Specola's cookies or call its API.
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
-	html, err := s.st.CurrentContent(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
+	ctx, sub, id := r.Context(), subOf(r.Context()), chi.URLParam(r, "id")
+	var (
+		html string
+		err  error
+	)
+	if v := r.URL.Query().Get("v"); v != "" {
+		n, convErr := strconv.Atoi(v)
+		if convErr != nil || n < 1 {
+			http.Error(w, "v must be a version number", http.StatusBadRequest)
+			return
+		}
+		html, err = s.st.VersionContent(ctx, sub, id, n)
+	} else {
+		html, err = s.st.CurrentContent(ctx, sub, id)
+	}
 	if err != nil {
 		httpError(w, err)
 		return
@@ -438,6 +537,11 @@ func httpError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, store.ErrGrantKind), errors.Is(err, store.ErrUnknownUser), errors.Is(err, store.ErrSelfShare):
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var invalid *store.ErrInvalid
+	if errors.As(err, &invalid) {
+		http.Error(w, invalid.Reason, http.StatusBadRequest)
 		return
 	}
 	slog.Error("request failed", "err", err)

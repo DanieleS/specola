@@ -45,6 +45,18 @@ tokens), not by email.
 - **search_document** — per page, the title and tag-stripped text of the
   current version with a `tsvector`, for full-text search.
 
+## Organising
+
+- **Folders** nest; publish into the folder you're browsing with **+ Page**.
+- **Rename**, **move** and **archive** from a card's ⋯ menu. Editors can
+  rename and move within folders they can edit; moving to Home and
+  archiving are for owners.
+- **Archiving** a folder hides everything in it, from you and from everyone
+  it's shared with, including in search. Restore it from **Archived**.
+- **History**: every publish is a new version. Open any version in the
+  viewer and restore it as a new version; nothing is ever overwritten.
+  `/view/{id}?v=N` serves a specific version.
+
 ## Sharing
 
 Share a folder or page with another user by email, as **viewer** (read) or

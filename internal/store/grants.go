@@ -113,7 +113,7 @@ func (s *Store) RedeemUpload(ctx context.Context, token, html string) (id string
 			id, version, err = createPage(ctx, tx, folderID, *name, html, sub)
 		case kind == GrantUploadVersion && assetID != nil:
 			id = *assetID
-			version, err = addVersion(ctx, tx, id, html, sub)
+			version, err = addVersion(ctx, tx, id, html, sub, nil)
 		default:
 			return ErrGrantKind
 		}
