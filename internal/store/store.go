@@ -41,8 +41,46 @@ type PageMeta struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// Tree lists active folders and pages directly under parentID (nil = root).
-func (s *Store) Tree(ctx context.Context, parentID *string) ([]TreeItem, error) {
+// Visibility: until sharing lands, folders and pages are private to the user
+// who created them. Every read and write below is scoped to the caller's sub,
+// and an item the caller can't see is reported as ErrNotFound so its existence
+// isn't leaked.
+
+// querier is the part of pgxpool.Pool and pgx.Tx the helpers below need.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// checkFolder returns ErrNotFound unless folderID is nil (the root) or names an
+// active folder owned by sub.
+func checkFolder(ctx context.Context, q querier, folderID *string, sub string) error {
+	if folderID == nil {
+		return nil
+	}
+	var ok bool
+	err := q.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM folder
+		  WHERE id = $1::uuid AND created_by_sub = $2
+		    AND deleted_at IS NULL AND archived_at IS NULL)`, *folderID, sub).Scan(&ok)
+	if err != nil {
+		if isInvalidText(err) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Tree lists sub's active folders and pages directly under parentID (nil =
+// root).
+func (s *Store) Tree(ctx context.Context, sub string, parentID *string) ([]TreeItem, error) {
+	if err := checkFolder(ctx, s.pool, parentID, sub); err != nil {
+		return nil, err
+	}
 	items := []TreeItem{}
 
 	fr, err := s.pool.Query(ctx, `
@@ -50,7 +88,8 @@ func (s *Store) Tree(ctx context.Context, parentID *string) ([]TreeItem, error) 
 		FROM folder
 		WHERE deleted_at IS NULL AND archived_at IS NULL
 		  AND parent_id IS NOT DISTINCT FROM $1::uuid
-		ORDER BY name`, parentID)
+		  AND created_by_sub = $2
+		ORDER BY name`, parentID, sub)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +111,8 @@ func (s *Store) Tree(ctx context.Context, parentID *string) ([]TreeItem, error) 
 		FROM asset
 		WHERE deleted_at IS NULL AND archived_at IS NULL
 		  AND folder_id IS NOT DISTINCT FROM $1::uuid
-		ORDER BY updated_at DESC`, parentID)
+		  AND created_by_sub = $2
+		ORDER BY updated_at DESC`, parentID, sub)
 	if err != nil {
 		return nil, err
 	}
@@ -88,8 +128,11 @@ func (s *Store) Tree(ctx context.Context, parentID *string) ([]TreeItem, error) 
 }
 
 // CreateFolder inserts a folder under parentID (nil = root), retrying the slug
-// on collision.
+// on collision. The parent must be visible to sub.
 func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub string) (string, error) {
+	if err := checkFolder(ctx, s.pool, parentID, sub); err != nil {
+		return "", err
+	}
 	base := slugify(name)
 	for i := 0; i < 25; i++ {
 		var id string
@@ -108,7 +151,8 @@ func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub st
 	return "", errors.New("could not allocate a unique folder slug")
 }
 
-// CreatePage creates an asset and its version 1 in one transaction.
+// CreatePage creates an asset and its version 1 in one transaction. The folder
+// must be visible to sub.
 func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, sub string) (id string, version int, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -116,18 +160,25 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, su
 	}
 	defer tx.Rollback(ctx)
 
+	if err = checkFolder(ctx, tx, folderID, sub); err != nil {
+		return "", 0, err
+	}
+
 	base := slugify(name)
 	created := false
 	for i := 0; i < 25; i++ {
 		err = tx.QueryRow(ctx, `
 			INSERT INTO asset (folder_id, name, slug, created_by_sub, updated_by_sub, current_version)
 			VALUES ($1::uuid, $2, $3, $4, $4, 1)
+			ON CONFLICT DO NOTHING
 			RETURNING id::text`, folderID, name, withSuffix(base, i), sub).Scan(&id)
+		// A unique violation would abort the transaction, so a slug collision
+		// is skipped by ON CONFLICT and shows up here as no row.
 		if err == nil {
 			created = true
 			break
 		}
-		if !isUniqueViolation(err) {
+		if !errors.Is(err, pgx.ErrNoRows) {
 			return "", 0, err
 		}
 	}
@@ -148,7 +199,8 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, su
 	return id, 1, nil
 }
 
-// AddVersion appends a new version to an existing page and returns its number.
+// AddVersion appends a new version to one of sub's pages and returns its
+// number.
 func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -160,9 +212,10 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (int,
 	err = tx.QueryRow(ctx, `
 		UPDATE asset
 		SET current_version = current_version + 1, updated_at = now(), updated_by_sub = $2
-		WHERE id = $1::uuid AND deleted_at IS NULL AND archived_at IS NULL
+		WHERE id = $1::uuid AND created_by_sub = $2
+		  AND deleted_at IS NULL AND archived_at IS NULL
 		RETURNING current_version`, assetID, sub).Scan(&next)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return 0, ErrNotFound
 	}
 	if err != nil {
@@ -182,15 +235,16 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (int,
 	return next, nil
 }
 
-// PageMeta returns a page's metadata.
-func (s *Store) PageMeta(ctx context.Context, id string) (*PageMeta, error) {
+// PageMeta returns the metadata of one of sub's pages.
+func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error) {
 	var m PageMeta
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, name, slug, folder_id::text, current_version, updated_at
 		FROM asset
-		WHERE id = $1::uuid AND deleted_at IS NULL AND archived_at IS NULL`, id).
+		WHERE id = $1::uuid AND created_by_sub = $2
+		  AND deleted_at IS NULL AND archived_at IS NULL`, id, sub).
 		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -199,15 +253,16 @@ func (s *Store) PageMeta(ctx context.Context, id string) (*PageMeta, error) {
 	return &m, nil
 }
 
-// CurrentContent returns the HTML of a page's current version.
-func (s *Store) CurrentContent(ctx context.Context, id string) (string, error) {
+// CurrentContent returns the HTML of the current version of one of sub's pages.
+func (s *Store) CurrentContent(ctx context.Context, sub, id string) (string, error) {
 	var html string
 	err := s.pool.QueryRow(ctx, `
 		SELECT av.content
 		FROM asset a
 		JOIN asset_version av ON av.asset_id = a.id AND av.version = a.current_version
-		WHERE a.id = $1::uuid AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id).Scan(&html)
-	if errors.Is(err, pgx.ErrNoRows) {
+		WHERE a.id = $1::uuid AND a.created_by_sub = $2
+		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).Scan(&html)
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return "", ErrNotFound
 	}
 	return html, err
@@ -216,6 +271,13 @@ func (s *Store) CurrentContent(ctx context.Context, id string) (string, error) {
 func isUniqueViolation(err error) bool {
 	var pg *pgconn.PgError
 	return errors.As(err, &pg) && pg.Code == "23505"
+}
+
+// isInvalidText reports a malformed input such as a non-UUID id, which can't
+// name any item and so is treated as not found.
+func isInvalidText(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "22P02"
 }
 
 // UpsertUser records a user seen at login, keyed by their OIDC subject. Empty

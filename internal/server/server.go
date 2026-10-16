@@ -145,7 +145,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 	if p := strings.TrimSpace(r.URL.Query().Get("parent")); p != "" {
 		parent = &p
 	}
-	items, err := s.st.Tree(r.Context(), parent)
+	items, err := s.st.Tree(r.Context(), subOf(r.Context()), parent)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -220,7 +220,7 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
-	meta, err := s.st.PageMeta(r.Context(), chi.URLParam(r, "id"))
+	meta, err := s.st.PageMeta(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
 	if err != nil {
 		httpError(w, err)
 		return
@@ -231,7 +231,7 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 // handleView serves a page's stored HTML. The CSP sandbox puts the page on an
 // opaque origin so its scripts cannot read Specola's cookies or call its API.
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
-	html, err := s.st.CurrentContent(r.Context(), chi.URLParam(r, "id"))
+	html, err := s.st.CurrentContent(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
 	if err != nil {
 		httpError(w, err)
 		return

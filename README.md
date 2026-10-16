@@ -5,6 +5,9 @@ self-contained HTML page (an explainer, a report, a small interactive app),
 organise pages in folders, keep a version history, and share them read-only or
 read-write with other people — all behind your own OIDC login.
 
+Until sharing lands, every folder and page is private to the user who created
+it; anything else answers 404.
+
 Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
@@ -74,6 +77,13 @@ cd web && npm install && npm run dev
 ```
 
 Migrations run automatically on boot.
+
+Tests that need a database create a throwaway one per test on the server named
+by `SPECOLA_TEST_DATABASE_URL`, and are skipped when it is unset:
+
+```sh
+SPECOLA_TEST_DATABASE_URL="postgres://postgres:dev@localhost:5432/postgres?sslmode=disable" go test ./...
+```
 
 ## Production (container)
 
