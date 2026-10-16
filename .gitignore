@@ -14,9 +14,8 @@ web/dist/
 
 # Built SPA embedded into the binary (generated at build time);
 # the committed placeholder index.html is kept.
-/internal/webui/dist/assets/
-/internal/webui/dist/*.js
-/internal/webui/dist/*.css
+/internal/webui/dist/*
+!/internal/webui/dist/index.html
 
 # OS / editor
 .DS_Store

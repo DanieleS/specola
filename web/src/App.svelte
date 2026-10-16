@@ -1,6 +1,7 @@
 <script lang="ts">
   import Gallery from "./lib/Gallery.svelte";
   import Login from "./lib/Login.svelte";
+  import Logo from "./lib/Logo.svelte";
   import PageViewer from "./lib/PageViewer.svelte";
   import PublishForm from "./lib/PublishForm.svelte";
   import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
@@ -40,7 +41,7 @@
   <div class="min-h-screen flex flex-col">
     <header class="flex items-center justify-between px-5 h-14 border-b border-white/10">
       <a href="#/" class="flex items-center gap-2 font-semibold tracking-tight text-lg">
-        <span class="inline-block w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+        <Logo class="w-5 h-5 text-amber-400" />
         Specola
       </a>
       <div class="flex items-center gap-4 text-sm">
