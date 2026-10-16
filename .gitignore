@@ -1,0 +1,23 @@
+# Secrets — only the .example is committed
+*.env
+.env
+!*.env.example
+
+# Go
+/specola
+*.test
+*.out
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Built SPA embedded into the binary (generated at build time);
+# the committed placeholder index.html is kept.
+/internal/webui/dist/assets/
+/internal/webui/dist/*.js
+/internal/webui/dist/*.css
+
+# OS / editor
+.DS_Store
+*.swp
