@@ -5,12 +5,12 @@
   import PublishForm from "./lib/PublishForm.svelte";
   import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
 
-  type Route = { name: "list" } | { name: "new" } | { name: "view"; id: string };
+  type Route = { name: "list" } | { name: "new"; folderId: string | null } | { name: "view"; id: string };
 
   function parseHash(): Route {
     const parts = location.hash.replace(/^#/, "").split("/").filter(Boolean);
     if (parts[0] === "p" && parts[1]) return { name: "view", id: parts[1] };
-    if (parts[0] === "new") return { name: "new" };
+    if (parts[0] === "new") return { name: "new", folderId: parts[1] ?? null };
     return { name: "list" };
   }
 
@@ -22,7 +22,7 @@
   api
     .me()
     .then((m) => {
-      email = m.email;
+      email = m.email || m.sub;
       auth = "in";
     })
     .catch((e) => {
@@ -56,7 +56,7 @@
       {#if route.name === "view"}
         <PageViewer id={route.id} />
       {:else if route.name === "new"}
-        <PublishForm />
+        <PublishForm folderId={route.folderId} />
       {:else}
         <Gallery />
       {/if}

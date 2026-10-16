@@ -9,7 +9,7 @@ COPY web/ ./
 RUN npm run build
 
 # 2. Build the Go binary with the SPA embedded.
-FROM golang:1.24-alpine AS build
+FROM golang:1.25-alpine AS build
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

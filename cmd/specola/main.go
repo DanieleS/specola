@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver for goose
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/pressly/goose/v3"
 )
 
@@ -55,9 +56,25 @@ func main() {
 		slog.Warn("auth: dev bypass — every request is one user", "dev_email", cfg.DevAuthEmail)
 	}
 
+	var tokens mcpauth.TokenVerifier
+	switch cfg.MCPMode() {
+	case "oauth":
+		if tokens, err = auth.NewAccessTokenVerifier(ctx, cfg.OIDCIssuer, cfg.MCPResource); err != nil {
+			fatal("oidc discovery for mcp", err)
+		}
+		slog.Info("mcp: bearer tokens", "issuer", cfg.OIDCIssuer, "resource", cfg.MCPResource)
+	case "dev":
+		slog.Warn("mcp: dev bypass — no token required", "dev_email", cfg.DevAuthEmail)
+	default:
+		slog.Info("mcp: disabled (set SPECOLA_OIDC_ISSUER to enable)")
+	}
+
+	st := store.New(pool)
+	go sweepGrants(ctx, st)
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           server.New(cfg, store.New(pool), authn),
+		Handler:           server.New(cfg, st, authn, tokens),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -76,6 +93,24 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	slog.Info("specola stopped")
+}
+
+// sweepGrants periodically deletes upload grants that expired over a day ago.
+func sweepGrants(ctx context.Context, st *store.Store) {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		if n, err := st.SweepGrants(ctx, 24*time.Hour); err != nil {
+			slog.Warn("sweep grants", "err", err)
+		} else if n > 0 {
+			slog.Info("swept expired grants", "count", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 func runMigrations(dbURL string) error {

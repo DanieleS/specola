@@ -29,6 +29,8 @@ type TreeItem struct {
 	Slug      string    `json:"slug"`
 	Version   int       `json:"version,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	Role      string    `json:"role"`   // the caller's Role on the item
+	Shared    bool      `json:"shared"` // the item itself has shares
 }
 
 // PageMeta is the metadata the viewer header needs.
@@ -39,64 +41,94 @@ type PageMeta struct {
 	FolderID  *string   `json:"folderId"`
 	Version   int       `json:"version"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	Role      string    `json:"role"`
+	Shared    bool      `json:"shared"`
 }
 
-// Tree lists active folders and pages directly under parentID (nil = root).
-func (s *Store) Tree(ctx context.Context, parentID *string) ([]TreeItem, error) {
+// querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// Tree lists the active folders and pages directly under parentID. At the root
+// (nil) that is the caller's own items; inside a folder they can see, it is
+// everything there, whoever created it.
+func (s *Store) Tree(ctx context.Context, sub string, parentID *string) ([]TreeItem, error) {
+	if err := checkFolder(ctx, s.pool, parentID, sub, RoleViewer); err != nil {
+		return nil, err
+	}
+	return listItems(ctx, s.pool, `
+		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($2, f.id),
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.folder_id = f.id)
+		FROM folder f
+		WHERE f.deleted_at IS NULL AND f.archived_at IS NULL
+		  AND f.parent_id IS NOT DISTINCT FROM $1::uuid
+		  AND ($1::uuid IS NOT NULL OR f.created_by_sub = $2)
+		ORDER BY f.name`, `
+		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($2, a.id),
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		FROM asset a
+		WHERE a.deleted_at IS NULL AND a.archived_at IS NULL
+		  AND a.folder_id IS NOT DISTINCT FROM $1::uuid
+		  AND ($1::uuid IS NOT NULL OR a.created_by_sub = $2)
+		ORDER BY a.updated_at DESC`, parentID, sub)
+}
+
+// SharedWithMe lists the active folders and pages shared directly with sub.
+func (s *Store) SharedWithMe(ctx context.Context, sub string) ([]TreeItem, error) {
+	return listItems(ctx, s.pool, `
+		SELECT 'folder', f.id::text, f.name, f.slug, 0, f.updated_at, folder_access($1, f.id), true
+		FROM acl_entry e JOIN folder f ON f.id = e.folder_id
+		WHERE e.subject_sub = $1 AND f.deleted_at IS NULL AND f.archived_at IS NULL
+		ORDER BY f.name`, `
+		SELECT 'page', a.id::text, a.name, a.slug, a.current_version, a.updated_at, asset_access($1, a.id), true
+		FROM acl_entry e JOIN asset a ON a.id = e.asset_id
+		WHERE e.subject_sub = $1 AND a.deleted_at IS NULL AND a.archived_at IS NULL
+		ORDER BY a.updated_at DESC`, sub)
+}
+
+// listItems runs a folder query then a page query with the same arguments,
+// each selecting kind, id, name, slug, version, updated_at, role, shared.
+func listItems(ctx context.Context, q querier, folders, pages string, args ...any) ([]TreeItem, error) {
 	items := []TreeItem{}
-
-	fr, err := s.pool.Query(ctx, `
-		SELECT id::text, name, slug, updated_at
-		FROM folder
-		WHERE deleted_at IS NULL AND archived_at IS NULL
-		  AND parent_id IS NOT DISTINCT FROM $1::uuid
-		ORDER BY name`, parentID)
-	if err != nil {
-		return nil, err
-	}
-	for fr.Next() {
-		it := TreeItem{Kind: "folder"}
-		if err := fr.Scan(&it.ID, &it.Name, &it.Slug, &it.UpdatedAt); err != nil {
-			fr.Close()
+	for _, sql := range []string{folders, pages} {
+		rows, err := q.Query(ctx, sql, args...)
+		if err != nil {
 			return nil, err
 		}
-		items = append(items, it)
-	}
-	fr.Close()
-	if err := fr.Err(); err != nil {
-		return nil, err
-	}
-
-	ar, err := s.pool.Query(ctx, `
-		SELECT id::text, name, slug, current_version, updated_at
-		FROM asset
-		WHERE deleted_at IS NULL AND archived_at IS NULL
-		  AND folder_id IS NOT DISTINCT FROM $1::uuid
-		ORDER BY updated_at DESC`, parentID)
-	if err != nil {
-		return nil, err
-	}
-	defer ar.Close()
-	for ar.Next() {
-		it := TreeItem{Kind: "page"}
-		if err := ar.Scan(&it.ID, &it.Name, &it.Slug, &it.Version, &it.UpdatedAt); err != nil {
+		for rows.Next() {
+			var it TreeItem
+			var r Role
+			if err := rows.Scan(&it.Kind, &it.ID, &it.Name, &it.Slug, &it.Version, &it.UpdatedAt, &r, &it.Shared); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			it.Role = r.String()
+			items = append(items, it)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		items = append(items, it)
 	}
-	return items, ar.Err()
+	return items, nil
 }
 
 // CreateFolder inserts a folder under parentID (nil = root), retrying the slug
-// on collision.
-func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, email string) (string, error) {
+// on collision. sub needs edit access to the parent.
+func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, sub string) (string, error) {
+	if err := checkFolder(ctx, s.pool, parentID, sub, RoleEditor); err != nil {
+		return "", err
+	}
 	base := slugify(name)
 	for i := 0; i < 25; i++ {
 		var id string
 		err := s.pool.QueryRow(ctx, `
-			INSERT INTO folder (parent_id, name, slug, created_by_email, updated_by_email)
+			INSERT INTO folder (parent_id, name, slug, created_by_sub, updated_by_sub)
 			VALUES ($1::uuid, $2, $3, $4, $4)
-			RETURNING id::text`, parentID, name, withSuffix(base, i), email).Scan(&id)
+			RETURNING id::text`, parentID, name, withSuffix(base, i), sub).Scan(&id)
 		if err == nil {
 			return id, nil
 		}
@@ -108,26 +140,59 @@ func (s *Store) CreateFolder(ctx context.Context, parentID *string, name, email 
 	return "", errors.New("could not allocate a unique folder slug")
 }
 
-// CreatePage creates an asset and its version 1 in one transaction.
-func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, email string) (id string, version int, err error) {
+// CreatePage creates an asset and its version 1 in one transaction. sub needs
+// edit access to the folder.
+func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, sub string) (id string, version int, err error) {
+	err = s.inTx(ctx, func(tx pgx.Tx) error {
+		id, version, err = createPage(ctx, tx, folderID, name, html, sub)
+		return err
+	})
+	return id, version, err
+}
+
+// AddVersion appends a new version to a page sub can edit and returns its
+// number.
+func (s *Store) AddVersion(ctx context.Context, assetID, html, sub string) (version int, err error) {
+	err = s.inTx(ctx, func(tx pgx.Tx) error {
+		version, err = addVersion(ctx, tx, assetID, html, sub, nil)
+		return err
+	})
+	return version, err
+}
+
+// inTx runs fn in a transaction, committing only if it returns nil.
+func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", 0, err
+		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func createPage(ctx context.Context, tx pgx.Tx, folderID *string, name, html, sub string) (id string, version int, err error) {
+	if err = checkFolder(ctx, tx, folderID, sub, RoleEditor); err != nil {
+		return "", 0, err
+	}
 
 	base := slugify(name)
 	created := false
 	for i := 0; i < 25; i++ {
 		err = tx.QueryRow(ctx, `
-			INSERT INTO asset (folder_id, name, slug, created_by_email, updated_by_email, current_version)
+			INSERT INTO asset (folder_id, name, slug, created_by_sub, updated_by_sub, current_version)
 			VALUES ($1::uuid, $2, $3, $4, $4, 1)
-			RETURNING id::text`, folderID, name, withSuffix(base, i), email).Scan(&id)
+			ON CONFLICT DO NOTHING
+			RETURNING id::text`, folderID, name, withSuffix(base, i), sub).Scan(&id)
+		// A unique violation would abort the transaction, so a slug collision
+		// is skipped by ON CONFLICT and shows up here as no row.
 		if err == nil {
 			created = true
 			break
 		}
-		if !isUniqueViolation(err) {
+		if !errors.Is(err, pgx.ErrNoRows) {
 			return "", 0, err
 		}
 	}
@@ -135,62 +200,62 @@ func (s *Store) CreatePage(ctx context.Context, folderID *string, name, html, em
 		return "", 0, errors.New("could not allocate a unique page slug")
 	}
 
-	sum := sha256.Sum256([]byte(html))
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_email)
-		VALUES ($1::uuid, 1, $2, $3, $4, $5)`,
-		id, html, hex.EncodeToString(sum[:]), len(html), email); err != nil {
-		return "", 0, err
-	}
-	if err = tx.Commit(ctx); err != nil {
+	if err = insertVersion(ctx, tx, id, 1, html, sub, nil); err != nil {
 		return "", 0, err
 	}
 	return id, 1, nil
 }
 
-// AddVersion appends a new version to an existing page and returns its number.
-func (s *Store) AddVersion(ctx context.Context, assetID, html, email string) (int, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
+// addVersion adds html as the next version of a page sub can edit.
+// restoredFrom records the version it was copied from, if any.
+func addVersion(ctx context.Context, tx pgx.Tx, assetID, html, sub string, restoredFrom *int) (int, error) {
+	if err := checkPage(ctx, tx, assetID, sub, RoleEditor); err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(ctx)
-
 	var next int
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		UPDATE asset
-		SET current_version = current_version + 1, updated_at = now(), updated_by_email = $2
+		SET current_version = current_version + 1, updated_at = now(), updated_by_sub = $2
 		WHERE id = $1::uuid AND deleted_at IS NULL AND archived_at IS NULL
-		RETURNING current_version`, assetID, email).Scan(&next)
+		RETURNING current_version`, assetID, sub).Scan(&next)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, ErrNotFound
 	}
 	if err != nil {
 		return 0, err
 	}
-
-	sum := sha256.Sum256([]byte(html))
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_email)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
-		assetID, next, html, hex.EncodeToString(sum[:]), len(html), email); err != nil {
-		return 0, err
-	}
-	if err = tx.Commit(ctx); err != nil {
+	if err := insertVersion(ctx, tx, assetID, next, html, sub, restoredFrom); err != nil {
 		return 0, err
 	}
 	return next, nil
 }
 
-// PageMeta returns a page's metadata.
-func (s *Store) PageMeta(ctx context.Context, id string) (*PageMeta, error) {
+// insertVersion stores a page version, which becomes current, and reindexes
+// the page for search.
+func insertVersion(ctx context.Context, tx pgx.Tx, assetID string, version int, html, sub string, restoredFrom *int) error {
+	sum := sha256.Sum256([]byte(html))
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO asset_version (asset_id, version, content, content_hash, size_bytes, edited_by_sub, restored_from_version)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)`,
+		assetID, version, html, hex.EncodeToString(sum[:]), len(html), sub, restoredFrom); err != nil {
+		return err
+	}
+	return reindex(ctx, tx, assetID, &html)
+}
+
+// PageMeta returns the metadata of a page sub can see.
+func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error) {
 	var m PageMeta
+	var r Role
 	err := s.pool.QueryRow(ctx, `
-		SELECT id::text, name, slug, folder_id::text, current_version, updated_at
-		FROM asset
-		WHERE id = $1::uuid AND deleted_at IS NULL AND archived_at IS NULL`, id).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id)
+		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
+		WHERE a.id = $1::uuid AND r.level > 0
+		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared)
+	m.Role = r.String()
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -199,15 +264,17 @@ func (s *Store) PageMeta(ctx context.Context, id string) (*PageMeta, error) {
 	return &m, nil
 }
 
-// CurrentContent returns the HTML of a page's current version.
-func (s *Store) CurrentContent(ctx context.Context, id string) (string, error) {
+// CurrentContent returns the HTML of the current version of a page sub can
+// see.
+func (s *Store) CurrentContent(ctx context.Context, sub, id string) (string, error) {
 	var html string
 	err := s.pool.QueryRow(ctx, `
 		SELECT av.content
 		FROM asset a
 		JOIN asset_version av ON av.asset_id = a.id AND av.version = a.current_version
-		WHERE a.id = $1::uuid AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id).Scan(&html)
-	if errors.Is(err, pgx.ErrNoRows) {
+		WHERE a.id = $1::uuid AND asset_access($2, a.id) > 0
+		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).Scan(&html)
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return "", ErrNotFound
 	}
 	return html, err
@@ -216,4 +283,24 @@ func (s *Store) CurrentContent(ctx context.Context, id string) (string, error) {
 func isUniqueViolation(err error) bool {
 	var pg *pgconn.PgError
 	return errors.As(err, &pg) && pg.Code == "23505"
+}
+
+// isInvalidText reports a malformed input such as a non-UUID id, which can't
+// name any item and so is treated as not found.
+func isInvalidText(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "22P02"
+}
+
+// UpsertUser records a user seen at login, keyed by their OIDC subject. Empty
+// email or name never overwrite a value already on file.
+func (s *Store) UpsertUser(ctx context.Context, sub, email, name string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO app_user (sub, email, name)
+		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
+		ON CONFLICT (sub) DO UPDATE SET
+		  email         = COALESCE(EXCLUDED.email, app_user.email),
+		  name          = COALESCE(EXCLUDED.name, app_user.name),
+		  last_login_at = now()`, sub, email, name)
+	return err
 }

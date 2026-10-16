@@ -1,4 +1,4 @@
-.PHONY: dev web build run tidy image
+.PHONY: dev web build run test tidy image
 
 # Run the backend with the dev auth bypass (no OIDC). Expects SPECOLA_DATABASE_URL.
 dev:
@@ -12,6 +12,11 @@ web:
 build:
 	cd web && npm install && npm run build
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o specola ./cmd/specola
+
+# Tests that need Postgres create throwaway databases on SPECOLA_TEST_DATABASE_URL
+# and are skipped when it is unset.
+test:
+	go test ./...
 
 tidy:
 	go mod tidy

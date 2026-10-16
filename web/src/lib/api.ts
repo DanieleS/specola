@@ -1,3 +1,5 @@
+export type Role = "owner" | "editor" | "viewer";
+
 export type TreeItem = {
   id: string;
   kind: "folder" | "page";
@@ -5,6 +7,8 @@ export type TreeItem = {
   slug: string;
   version?: number;
   updatedAt: string;
+  role: Role;
+  shared: boolean;
 };
 
 export type PageMeta = {
@@ -14,7 +18,36 @@ export type PageMeta = {
   folderId: string | null;
   version: number;
   updatedAt: string;
+  role: Role;
+  shared: boolean;
+  /** Where to load the rendered page from; may be on a separate origin. */
+  viewUrl: string;
 };
+
+export type Share = {
+  sub: string;
+  email?: string;
+  name?: string;
+  role: "viewer" | "editor";
+  createdAt: string;
+};
+
+export type SearchResult = TreeItem & {
+  /** Safe HTML from the server: escaped text, matches wrapped in <mark>. */
+  snippet: string;
+};
+
+export type ItemKind = "page" | "folder";
+
+export type VersionInfo = {
+  version: number;
+  sizeBytes: number;
+  createdAt: string;
+  editedBy?: string;
+  restoredFrom?: number;
+};
+
+const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
 
 export class Unauthorized extends Error {
   constructor() {
@@ -44,7 +77,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
 }
 
 export const api = {
-  me: () => req<{ email: string }>("GET", "/api/me"),
+  me: () => req<{ sub: string; email: string }>("GET", "/api/me"),
   tree: (parent?: string | null) =>
     req<TreeItem[]>("GET", "/api/tree" + (parent ? `?parent=${encodeURIComponent(parent)}` : "")),
   createFolder: (name: string, parentId: string | null) =>
@@ -52,4 +85,22 @@ export const api = {
   createPage: (name: string, html: string, folderId: string | null) =>
     req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId }),
   pageMeta: (id: string) => req<PageMeta>("GET", `/api/pages/${id}`),
+  shared: () => req<TreeItem[]>("GET", "/api/shared"),
+  archived: () => req<TreeItem[]>("GET", "/api/archived"),
+  versions: (id: string) => req<VersionInfo[]>("GET", `/api/pages/${id}/versions`),
+  restoreVersion: (id: string, from: number) =>
+    req<{ version: number }>("POST", `/api/pages/${id}/versions`, { restoreFrom: from }),
+  rename: (kind: ItemKind, id: string, name: string) => req<void>("PATCH", `/api/${kind}s/${id}`, { name }),
+  move: (kind: ItemKind, id: string, parentId: string | null) =>
+    req<void>("PATCH", `/api/${kind}s/${id}`, { parentId }),
+  archive: (kind: ItemKind, id: string) => req<void>("POST", `/api/${kind}s/${id}/archive`),
+  unarchive: (kind: ItemKind, id: string) => req<void>("POST", `/api/${kind}s/${id}/unarchive`),
+  search: (q: string) => req<SearchResult[]>("GET", `/api/search?q=${encodeURIComponent(q)}`),
+  shares: (kind: ItemKind, id: string) => req<Share[]>("GET", aclPath(kind, id)),
+  share: (kind: ItemKind, id: string, email: string, role: Share["role"]) =>
+    req<void>("PUT", aclPath(kind, id), { email, role }),
+  setShareRole: (kind: ItemKind, id: string, sub: string, role: Share["role"]) =>
+    req<void>("PUT", aclPath(kind, id), { sub, role }),
+  unshare: (kind: ItemKind, id: string, sub: string) =>
+    req<void>("DELETE", `${aclPath(kind, id)}?sub=${encodeURIComponent(sub)}`),
 };
