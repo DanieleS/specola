@@ -20,6 +20,8 @@ export type PageMeta = {
   updatedAt: string;
   role: Role;
   shared: boolean;
+  /** Where to load the rendered page from; may be on a separate origin. */
+  viewUrl: string;
 };
 
 export type Share = {

@@ -96,6 +96,7 @@ All via environment variables (see [`specola.env.example`](./specola.env.example
 | `SPECOLA_OIDC_CLIENT_SECRET` | prod | OIDC client secret |
 | `SPECOLA_MCP_RESOURCE` | no | audience required on MCP access tokens (default `<base>/mcp`) |
 | `SPECOLA_TRUSTED_USER_HEADER` | no | trust this proxy header as the user's `sub` instead of running OIDC |
+| `SPECOLA_VIEW_ORIGIN` | no | serve rendered pages from this separate origin, e.g. `https://view.example.com` (needs `SPECOLA_SESSION_SECRET`) |
 | `SPECOLA_DEV_AUTH_EMAIL` | dev | bypass OIDC; treat every request as this user (used as both `sub` and email) |
 | `SPECOLA_LISTEN` | no | listen address (default `:8080`) |
 
@@ -193,9 +194,17 @@ CIMD clients then connect without being registered in advance.
 
 ## Security notes
 
-- Rendered pages are served with `Content-Security-Policy: sandbox` so they run
-  on an opaque origin and cannot read Specola's cookies. For stronger isolation,
-  serve `/view/*` from a separate hostname.
+- Rendered pages are served with `Content-Security-Policy: sandbox` and shown
+  in a sandboxed iframe without `allow-same-origin`, so they run on an opaque
+  origin and cannot read Specola's cookies or call its API. `frame-ancestors`
+  stops other sites from framing them.
+- For defense in depth, set `SPECOLA_VIEW_ORIGIN` to a second hostname that
+  also reaches Specola (requests are routed by `Host`). Pages are then served
+  only from that origin, which serves nothing else, and the app origin refuses
+  `/view`. The view origin has no session: the SPA gets a signed view token
+  (one user, one page, valid for an hour) with the page metadata, and access
+  is still checked on every request, so removing a share takes effect at once.
+  Responses carry `Referrer-Policy: no-referrer` so the token doesn't leak.
 - No secrets are committed; only `*.env.example` placeholders.
 
 ## License

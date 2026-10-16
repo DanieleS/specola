@@ -39,6 +39,12 @@ type Server struct {
 	// seen holds the subs already recorded in app_user by this process, for the
 	// modes that have no login step to hook (trusted header, dev bypass).
 	seen sync.Map
+
+	// With a separate view origin: requests for viewHost go to viewMux, which
+	// serves only rendered pages, authorized by view tokens.
+	viewHost string
+	viewMux  http.Handler
+	tokens   *viewTokens
 }
 
 // New builds the server. a is nil unless Specola runs its own OIDC login.
@@ -71,9 +77,21 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	// The token is the credential: no session needed, so agents can curl it.
 	r.Put("/upload/{token}", s.handleUpload)
 
+	if cfg.ViewOrigin != "" {
+		s.viewHost = cfg.ViewHost()
+		s.tokens = newViewTokens(cfg.SessionSecret)
+		vr := chi.NewRouter()
+		vr.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+		vr.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+		vr.Get("/view/{id}", s.handleTokenView)
+		s.viewMux = vr
+	}
+
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAuth)
-		r.Get("/view/{id}", s.handleView)
+		if cfg.ViewOrigin == "" {
+			r.Get("/view/{id}", s.handleView)
+		}
 		r.Route("/api", func(r chi.Router) {
 			r.Get("/me", s.handleMe)
 			r.Get("/tree", s.handleTree)
@@ -96,6 +114,13 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		})
 	})
 
+	// With a separate view origin, the app origin never serves page HTML.
+	if cfg.ViewOrigin != "" {
+		r.Get("/view/*", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "pages are served from "+cfg.ViewOrigin, http.StatusNotFound)
+		})
+	}
+
 	// Everything else is the SPA (public shell; data endpoints above are gated).
 	r.Handle("/*", webui.Handler())
 
@@ -103,7 +128,13 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.viewMux != nil && strings.EqualFold(r.Host, s.viewHost) {
+		s.viewMux.ServeHTTP(w, r)
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
 
 // requireAuth resolves the caller's identity (OIDC session, trusted proxy
 // header, or the dev bypass) and stashes it in the request context.
@@ -296,13 +327,27 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]int{"version": version})
 }
 
+// pageMetaResp adds where to load the rendered page from: /view/{id} on the
+// app origin, or a token URL on the separate view origin.
+type pageMetaResp struct {
+	*store.PageMeta
+	ViewURL string `json:"viewUrl"`
+}
+
 func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 	meta, err := s.st.PageMeta(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
 	if err != nil {
 		httpError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, meta)
+	writeJSON(w, http.StatusOK, pageMetaResp{PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID)})
+}
+
+func (s *Server) viewURL(sub, id string) string {
+	if s.tokens == nil {
+		return "/view/" + id
+	}
+	return s.cfg.ViewOrigin + "/view/" + id + "?t=" + s.tokens.mint(sub, id, time.Now())
 }
 
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
@@ -456,11 +501,29 @@ func (s *Server) handleUnshare(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleView serves a page's stored HTML: the current version, or ?v=N. The
-// CSP sandbox puts the page on an opaque origin so its scripts cannot read
-// Specola's cookies or call its API.
+// handleView serves a page on the app origin, as the signed-in user.
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
-	ctx, sub, id := r.Context(), subOf(r.Context()), chi.URLParam(r, "id")
+	s.serveView(w, r, subOf(r.Context()), chi.URLParam(r, "id"))
+}
+
+// handleTokenView serves a page on the separate view origin, as the user named
+// by the ?t= view token.
+func (s *Server) handleTokenView(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	sub, err := s.tokens.verify(r.URL.Query().Get("t"), id, time.Now())
+	if err != nil {
+		http.Error(w, "this link has expired; open the page from Specola again", http.StatusForbidden)
+		return
+	}
+	s.serveView(w, r, sub, id)
+}
+
+// serveView serves a page's stored HTML: the current version, or ?v=N. The
+// CSP sandbox puts the page on an opaque origin so its scripts cannot read
+// Specola's cookies or call its API; frame-ancestors keeps other sites from
+// framing it, and no-referrer keeps a view token out of the page's requests.
+func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id string) {
+	ctx := r.Context()
 	var (
 		html string
 		err  error
@@ -479,9 +542,16 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
+	ancestors := "'self'"
+	if s.tokens != nil {
+		ancestors = s.cfg.AppBaseURL
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "sandbox allow-scripts allow-popups allow-forms allow-modals")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "private, no-cache")
+	w.Header().Set("Content-Security-Policy",
+		"sandbox allow-scripts allow-popups allow-forms allow-modals; frame-ancestors "+ancestors)
 	_, _ = io.WriteString(w, html)
 }
 

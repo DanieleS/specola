@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -33,6 +34,12 @@ type Config struct {
 	// client-settable.
 	TrustedUserHeader string
 
+	// ViewOrigin, when set, serves rendered pages from this separate origin
+	// (e.g. https://view.example.com) instead of the app's own, for defense in
+	// depth. Both hostnames must reach this server; requests are routed by
+	// Host. Viewing is authorized by short-lived signed tokens.
+	ViewOrigin string
+
 	// DevAuthEmail bypasses auth entirely and treats every request as this
 	// user. For local development only; never set in production.
 	DevAuthEmail string
@@ -49,6 +56,7 @@ func Load() (*Config, error) {
 		OIDCClientSecret:  env("SPECOLA_OIDC_CLIENT_SECRET", os.Getenv("SPECOLA_LOGTO_APP_SECRET")),
 		TrustedUserHeader: os.Getenv("SPECOLA_TRUSTED_USER_HEADER"),
 		DevAuthEmail:      os.Getenv("SPECOLA_DEV_AUTH_EMAIL"),
+		ViewOrigin:        strings.TrimRight(os.Getenv("SPECOLA_VIEW_ORIGIN"), "/"),
 	}
 	c.AppBaseURL = strings.TrimRight(c.AppBaseURL, "/")
 	c.MCPResource = env("SPECOLA_MCP_RESOURCE", c.AppBaseURL+"/mcp")
@@ -61,6 +69,18 @@ func Load() (*Config, error) {
 	// Own OIDC login needs a secret to sign the session cookie.
 	if c.UsesOwnOIDC() && c.SessionSecret == "" {
 		return nil, fmt.Errorf("SPECOLA_SESSION_SECRET is required for OIDC login")
+	}
+	if c.ViewOrigin != "" {
+		if c.SessionSecret == "" {
+			return nil, fmt.Errorf("SPECOLA_SESSION_SECRET is required with SPECOLA_VIEW_ORIGIN, to sign view tokens")
+		}
+		vh, err := hostOf(c.ViewOrigin)
+		if err != nil {
+			return nil, fmt.Errorf("SPECOLA_VIEW_ORIGIN: %w", err)
+		}
+		if ah, _ := hostOf(c.AppBaseURL); strings.EqualFold(vh, ah) {
+			return nil, fmt.Errorf("SPECOLA_VIEW_ORIGIN must be a different host than SPECOLA_BASE_URL")
+		}
 	}
 	return c, nil
 }
@@ -87,6 +107,23 @@ func (c *Config) MCPMode() string {
 	default:
 		return ""
 	}
+}
+
+// ViewHost is the host[:port] of ViewOrigin, or "" when it is unset.
+func (c *Config) ViewHost() string {
+	h, _ := hostOf(c.ViewOrigin)
+	return h
+}
+
+func hostOf(origin string) (string, error) {
+	if origin == "" {
+		return "", nil
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("%q is not an http(s) origin", origin)
+	}
+	return u.Host, nil
 }
 
 func (c *Config) Secure() bool { return strings.HasPrefix(c.AppBaseURL, "https") }

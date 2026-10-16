@@ -14,6 +14,14 @@
   let copied = $state(false);
 
   let shown = $derived(viewing ?? meta?.version);
+  let src = $derived(meta && shown ? withVersion(meta.viewUrl, shown) : "");
+
+  // viewUrl may already carry a query (a view token), so add v properly.
+  function withVersion(viewUrl: string, v: number) {
+    const u = new URL(viewUrl, location.href);
+    u.searchParams.set("v", String(v));
+    return u.toString();
+  }
   let canEdit = $derived(meta?.role === "owner" || meta?.role === "editor");
 
   function load() {
@@ -91,8 +99,8 @@
       {#if meta?.role === "owner"}
         <button class={action} onclick={() => (sharing = true)}>{meta.shared ? "Shared" : "Share"}</button>
       {/if}
-      {#if shown}
-        <a href={`/view/${id}?v=${shown}`} target="_blank" rel="noopener" class={action}>Open raw ↗</a>
+      {#if src}
+        <a href={src} target="_blank" rel="noopener noreferrer" class={action}>Open raw ↗</a>
       {/if}
     </div>
   </div>
@@ -118,12 +126,13 @@
     <p class="p-5 text-red-400">{error}</p>
   {:else}
     <div class="flex flex-1 min-h-0">
-      {#if shown}
+      {#if src}
         <!-- No allow-same-origin: the page runs on an opaque origin, matching the
              server's CSP sandbox, so it cannot touch Specola's session or API. -->
         <iframe
           title={meta?.name ?? "page"}
-          src={`/view/${id}?v=${shown}`}
+          {src}
+          referrerpolicy="no-referrer"
           sandbox="allow-scripts allow-popups allow-forms allow-modals"
           class="flex-1 w-full bg-white border-0"
         ></iframe>
