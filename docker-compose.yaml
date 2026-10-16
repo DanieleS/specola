@@ -1,0 +1,33 @@
+# Example deployment for a Traefik + Docker Swarm setup. Adjust the host rule,
+# networks and placement to your environment. Secrets live in specola.env
+# (gitignored); only specola.env.example is committed.
+services:
+  specola:
+    image: ghcr.io/danieles/specola:latest
+    env_file: ./specola.env
+    networks:
+      - database_network
+      - traefik_public
+    deploy:
+      placement:
+        constraints: [node.labels.name==nucworker]
+      resources:
+        limits:
+          memory: 96M
+          cpus: "0.5"
+      restart_policy:
+        condition: any
+        delay: 10s
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=traefik_public
+        - traefik.http.routers.specola.rule=Host(`specola.example.com`)
+        - traefik.http.routers.specola.entrypoints=https
+        - traefik.http.routers.specola.service=specola
+        - traefik.http.services.specola.loadbalancer.server.port=8080
+
+networks:
+  database_network:
+    external: true
+  traefik_public:
+    external: true
