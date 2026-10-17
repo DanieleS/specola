@@ -26,7 +26,7 @@ func TestVersionHistory(t *testing.T) {
 		t.Fatalf("versions: %d %s", code, body)
 	}
 
-	if _, got := call(t, ts, alice, "GET", "/view/"+id+"?v=1", ""); got != "<p>one</p>" {
+	if _, got := call(t, ts, alice, "GET", "/view/"+id+"?v=1", ""); got != withSDK("<p>one</p>") {
 		t.Fatalf("view v1 = %q", got)
 	}
 	for _, v := range []string{"0", "x", "9"} {
@@ -39,7 +39,7 @@ func TestVersionHistory(t *testing.T) {
 	if code != http.StatusCreated || !strings.Contains(body, `"version":3`) {
 		t.Fatalf("restore: %d %s", code, body)
 	}
-	if _, got := call(t, ts, alice, "GET", "/view/"+id, ""); got != "<p>one</p>" {
+	if _, got := call(t, ts, alice, "GET", "/view/"+id, ""); got != withSDK("<p>one</p>") {
 		t.Fatalf("after restore = %q", got)
 	}
 	_, body = call(t, ts, alice, "GET", "/api/pages/"+id+"/versions", "")

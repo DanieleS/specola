@@ -44,6 +44,7 @@ tokens), not by email.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
   HTML body instead of inlining it in a request.
 - **favorite** — personal stars.
+- **page_data** — per page and user, the page's `localStorage`.
 - **search_document** — per page, the title and tag-stripped text of the
   current version with a `tsvector`, for full-text search.
 
@@ -122,6 +123,40 @@ Share a folder or page with another user by email, as **viewer** (read) or
 
 API: `GET/PUT/DELETE /api/{pages|folders}/{id}/acl` (`PUT` takes
 `{"email" | "sub", "role"}`, `DELETE` takes `?sub=`), and `GET /api/shared`.
+
+## Page storage
+
+A page runs on an opaque origin, where `localStorage`, `sessionStorage` and
+cookies throw `SecurityError`. Specola adds a small script to every page it
+serves, ahead of the page's own, that puts working ones in their place, so
+pages (and libraries) use the standard APIs unchanged:
+
+- **`localStorage` is kept on the server, per user.** Everyone who can see the
+  page has their own data, private to them; the owner doesn't see viewers'
+  data. It is the same on every version of the page, and follows the page's
+  visibility: archived or unshared, it is kept but out of reach.
+- Reads are synchronous from the first script: the viewer loads the data
+  before loading the page and passes it in the frame's `name`. Writes are
+  batched and saved by the viewer, which retries while offline, even after
+  the page is gone, and folds unsaved writes into the data it passes next.
+- Up to 1000 keys and 1 MB per user and page; past that `setItem` throws
+  `QuotaExceededError`, as the real one does.
+- `sessionStorage` and `document.cookie` work in memory, for that load only.
+  IndexedDB stays unavailable.
+- Only in the viewer: opened raw, or after the page reloads itself or
+  navigates its frame, `localStorage` works in memory only and never writes
+  to the server, so a page that finds nothing can't overwrite what is saved.
+  `window.specola.persistent` tells which; `await specola.flush()` resolves
+  once every write so far is saved.
+- The page itself still never reaches Specola: the viewer hands it a
+  `MessagePort` on its first request after loading it, answers only that
+  document, and saves through the API as the signed-in user.
+- The script is added when the page is served (after the doctype), not
+  stored: the history, search and MCP keep the HTML as published.
+
+API: `GET /api/pages/{id}/data`; `PATCH` with
+`{"clear": bool, "set": {...}, "remove": [...]}`, applied at once;
+`DELETE` to clear.
 
 ## Search
 
@@ -256,7 +291,8 @@ CIMD clients then connect without being registered in advance.
 - Rendered pages are served with `Content-Security-Policy: sandbox` and shown
   in a sandboxed iframe without `allow-same-origin`, so they run on an opaque
   origin and cannot read Specola's cookies or call its API. `frame-ancestors`
-  stops other sites from framing them.
+  stops other sites from framing them. Their only way to Specola is their
+  `localStorage`, saved by the viewer and scoped to that page and user.
 - For defense in depth, set `SPECOLA_VIEW_ORIGIN` to a second hostname that
   also reaches Specola (requests are routed by `Host`). Pages are then served
   only from that origin, which serves nothing else, and the app origin refuses

@@ -250,7 +250,7 @@ func TestMCPPublishActsAsTheTokenUser(t *testing.T) {
 	}
 
 	// The page is in alice's web gallery, and nobody else's.
-	if _, body := call(t, ts, "alice", "GET", "/view/"+pub.ID, ""); body != "<p>v2</p>" {
+	if _, body := call(t, ts, "alice", "GET", "/view/"+pub.ID, ""); body != withSDK("<p>v2</p>") {
 		t.Fatalf("alice /view = %q", body)
 	}
 	if code, _ := call(t, ts, "bob", "GET", "/view/"+pub.ID, ""); code != http.StatusNotFound {
@@ -307,7 +307,7 @@ func TestMCPUploadGrant(t *testing.T) {
 	if up.Version != 1 || up.URL != "http://specola.test/#/p/"+up.ID {
 		t.Fatalf("upload = %+v", up)
 	}
-	if _, got := call(t, ts, "alice", "GET", "/view/"+up.ID, ""); got != html {
+	if _, got := call(t, ts, "alice", "GET", "/view/"+up.ID, ""); got != withSDK(html) {
 		t.Fatalf("alice /view: %d bytes, want %d", len(got), len(html))
 	}
 

@@ -103,6 +103,9 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Get("/pages/{id}", s.handlePageMeta)
 			r.Get("/pages/{id}/versions", s.handleVersions)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
+			r.Get("/pages/{id}/data", s.handlePageData)
+			r.Patch("/pages/{id}/data", s.handleUpdatePageData)
+			r.Delete("/pages/{id}/data", s.handleClearPageData)
 			r.Get("/shared", s.handleShared)
 			r.Get("/archived", s.handleArchived)
 			r.Get("/favorites", s.handleFavorites)
@@ -363,6 +366,46 @@ func (s *Server) viewURL(sub, id string) string {
 	return s.cfg.ViewOrigin + "/view/" + id + "?t=" + s.tokens.mint(sub, id, time.Now())
 }
 
+func (s *Server) handlePageData(w http.ResponseWriter, r *http.Request) {
+	data, err := s.st.PageData(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	writeJSON(w, http.StatusOK, data)
+}
+
+// pageDataReq changes a user's page data at once: clear drops everything
+// first, then the keys in remove are dropped and those in set written.
+type pageDataReq struct {
+	Clear  bool              `json:"clear"`
+	Set    map[string]string `json:"set"`
+	Remove []string          `json:"remove"`
+}
+
+func (s *Server) handleUpdatePageData(w http.ResponseWriter, r *http.Request) {
+	var req pageDataReq
+	if !decode(w, r, &req) {
+		return
+	}
+	err := s.st.UpdatePageData(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"),
+		store.PageDataChange{Clear: req.Clear, Set: req.Set, Remove: req.Remove})
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleClearPageData(w http.ResponseWriter, r *http.Request) {
+	if err := s.st.UpdatePageData(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"), store.PageDataChange{Clear: true}); err != nil {
+		httpError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 	vs, err := s.st.Versions(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"))
 	if err != nil {
@@ -550,10 +593,11 @@ func (s *Server) handleTokenView(w http.ResponseWriter, r *http.Request) {
 	s.serveView(w, r, sub, id)
 }
 
-// serveView serves a page's stored HTML: the current version, or ?v=N. The
-// CSP sandbox puts the page on an opaque origin so its scripts cannot read
-// Specola's cookies or call its API; frame-ancestors keeps other sites from
-// framing it, and no-referrer keeps a view token out of the page's requests.
+// serveView serves a page's stored HTML, with the page SDK added: the current
+// version, or ?v=N. The CSP sandbox puts the page on an opaque origin so its
+// scripts cannot read Specola's cookies or call its API; frame-ancestors keeps
+// other sites from framing it, and no-referrer keeps a view token out of the
+// page's requests.
 //
 // Caching is private, since access is per user. A numbered version never
 // changes, so the browser keeps it for good; the viewer always asks for one.
@@ -578,7 +622,8 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 			return
 		}
 		// Weak: the same version is sent gzipped or not, depending on the client.
-		etag := `W/"` + hash + `"`
+		// The SDK's version is in it too, since it is part of what is sent.
+		etag := `W/"` + hash + "." + sdkVersion + `"`
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Cache-Control", "private, no-cache")
 		if etagMatches(r.Header.Get("If-None-Match"), etag) {
@@ -605,7 +650,7 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy",
 		"sandbox allow-scripts allow-popups allow-forms allow-modals; frame-ancestors "+ancestors)
-	_, _ = io.WriteString(w, html)
+	_, _ = io.WriteString(w, withSDK(html))
 }
 
 // etagMatches reports whether an If-None-Match header names etag. Comparison

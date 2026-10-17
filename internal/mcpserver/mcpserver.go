@@ -76,9 +76,10 @@ Publish a page with publish_page, update it with new_version (each call adds a v
 Give every version a short note saying what changed; it is what the user reads in the history.
 Organise with create_folder, move, rename and archive; nothing is ever deleted, and archive can be undone with unarchive.
 Pages must be self-contained HTML: inline CSS and JS; imports from public CDNs are fine. Pages run in a sandbox without access to Specola itself.
+localStorage works as usual and is saved by Specola for each user who views the page (their own, private, the same on every version; up to 1 MB). sessionStorage and cookies last for one load only; IndexedDB is unavailable.
 For HTML over ~100 KB, don't inline it in a tool argument: call create_upload_grant and PUT the file to the returned URL with curl.`
 
-const htmlNote = ` The HTML must be a complete, self-contained document: inline CSS and JS (CDN imports are fine). It is rendered in a sandboxed iframe. For HTML over ~100 KB use create_upload_grant instead, so the content isn't truncated.`
+const htmlNote = ` The HTML must be a complete, self-contained document: inline CSS and JS (CDN imports are fine). It is rendered in a sandboxed iframe; localStorage works and is saved per user, IndexedDB is unavailable. For HTML over ~100 KB use create_upload_grant instead, so the content isn't truncated.`
 
 const (
 	publishDesc    = `Publish a new HTML page to the user's Specola gallery and return its id and link.` + htmlNote

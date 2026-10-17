@@ -79,7 +79,7 @@ func TestSeparateViewOrigin(t *testing.T) {
 
 	// The view origin serves it with the token, no session needed.
 	res := get(t, ts, viewHost, u.RequestURI(), nil)
-	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != "<p>v2</p>" {
+	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != withSDK("<p>v2</p>") {
 		t.Fatalf("view origin: %d %q", res.StatusCode, b)
 	}
 	// The app may read it too, to keep it for offline viewing.
@@ -91,7 +91,7 @@ func TestSeparateViewOrigin(t *testing.T) {
 	}
 	q := u.Query()
 	q.Set("v", "1")
-	if b := readBody(t, get(t, ts, viewHost, u.Path+"?"+q.Encode(), nil)); b != "<p>v1</p>" {
+	if b := readBody(t, get(t, ts, viewHost, u.Path+"?"+q.Encode(), nil)); b != withSDK("<p>v1</p>") {
 		t.Fatalf("v=1: %q", b)
 	}
 
