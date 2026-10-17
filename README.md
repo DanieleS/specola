@@ -11,7 +11,8 @@ Pages are private to their author until shared. An item you can't see answers
 Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
-> Status: early. Publish, browse, version with notes, view, share, favorites,
+> Status: early. Publish, browse, version with notes, view, share, public
+> links, favorites,
 > full-text search, offline viewing as an installable PWA, and an
 > OAuth-protected MCP endpoint for agents.
 
@@ -45,6 +46,8 @@ tokens), not by email.
   HTML body instead of inlining it in a request.
 - **favorite** — personal stars.
 - **page_data** — per page and user, the page's `localStorage`.
+- **public_link** — a page's public links: the sha256 of the token, an
+  optional pinned version, label and expiry, and a view count.
 - **search_document** — per page, the title and tag-stripped text of the
   current version with a `tsvector`, for full-text search.
 
@@ -123,6 +126,32 @@ Share a folder or page with another user by email, as **viewer** (read) or
 
 API: `GET/PUT/DELETE /api/{pages|folders}/{id}/acl` (`PUT` takes
 `{"email" | "sub", "role"}`, `DELETE` takes `?sub=`), and `GET /api/shared`.
+
+## Public links
+
+To show a page to someone without a Specola account, its owner makes a
+**public link** from the Share dialog: a secret URL that shows the page,
+read-only, to anyone who has it, without signing in. Nothing else in Specola
+is reachable from it.
+
+- A link follows the current version, or is **pinned** to one. It can expire
+  after a number of days (at most 366) or never, and carries an optional
+  label saying who it is for.
+- Only the token's sha256 is stored, so the URL is shown once, when the link
+  is made. The owner sees each link's label, expiry, views and last use, and
+  can **revoke** it; it stops working at once (nothing is cached).
+- A link works only while the page is active and its creator still owns it:
+  archiving the page or a folder above it takes its links down, and
+  restoring it brings them back.
+- The page is served at `/s/{token}` (on `SPECOLA_VIEW_ORIGIN` when set) as
+  the whole document, with the same CSP sandbox, `frame-ancestors 'none'`,
+  `Referrer-Policy: no-referrer` and `X-Robots-Tag: noindex`. Its
+  `localStorage` works in memory only, for that load. An expired link
+  answers 410; an unknown or revoked one 404.
+
+API (owner only): `GET/POST /api/pages/{id}/links` (`POST` takes
+`{"label", "version", "expiresInDays"}`, all optional, and answers with the
+`url`), `DELETE /api/pages/{id}/links/{linkId}`.
 
 ## Page storage
 
@@ -240,11 +269,14 @@ user**, so they land in that user's gallery.
 | `move` | `kind`, `id`, `folder_id?` (the root when omitted) | `{ok}` |
 | `archive` / `unarchive` | `kind`, `id` | `{ok}` |
 | `share` | `kind`, `id`, `email`, `role` (`viewer` / `editor` / `none`) | the item's shares |
+| `create_public_link` | `id`, `label?`, `version?`, `expires_in_days?` | the link and its `url` (shown only now) |
+| `list_public_links` | `id` | the page's public links, with expiry and views |
+| `revoke_public_link` | `id`, `link_id` | `{ok}` |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
 
 The same access rules as the UI apply to every tool. Tools carry MCP
-annotations: the reading ones (`list`, `get_page`, `list_versions`, `search`)
-are `readOnlyHint`, which clients such as Hermes use to retry them safely and
+annotations: the reading ones (`list`, `get_page`, `list_versions`, `search`,
+`list_public_links`) are `readOnlyHint`, which clients such as Hermes use to retry them safely and
 to skip confirmation; the organising ones are `idempotentHint`.
 
 Large pages shouldn't travel as tool arguments (models truncate long outputs),

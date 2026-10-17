@@ -80,6 +80,11 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	// The token is the credential: no session needed, so agents can curl it.
 	r.Put("/upload/{token}", s.handleUpload)
 
+	// Public links: the token is the credential, and no session is involved.
+	if cfg.ViewOrigin == "" {
+		r.Get("/s/{token}", s.handlePublicLink)
+	}
+
 	if cfg.ViewOrigin != "" {
 		s.viewHost = cfg.ViewHost()
 		s.tokens = newViewTokens(cfg.SessionSecret)
@@ -87,6 +92,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		vr.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, middleware.Compress(5))
 		vr.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 		vr.Get("/view/{id}", s.handleTokenView)
+		vr.Get("/s/{token}", s.handlePublicLink)
 		s.viewMux = vr
 	}
 
@@ -106,6 +112,9 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Get("/pages/{id}/data", s.handlePageData)
 			r.Patch("/pages/{id}/data", s.handleUpdatePageData)
 			r.Delete("/pages/{id}/data", s.handleClearPageData)
+			r.Get("/pages/{id}/links", s.handleListLinks)
+			r.Post("/pages/{id}/links", s.handleCreateLink)
+			r.Delete("/pages/{id}/links/{link}", s.handleRevokeLink)
 			r.Get("/shared", s.handleShared)
 			r.Get("/archived", s.handleArchived)
 			r.Get("/favorites", s.handleFavorites)
@@ -127,6 +136,9 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	if cfg.ViewOrigin != "" {
 		r.Get("/view/*", func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "pages are served from "+cfg.ViewOrigin, http.StatusNotFound)
+		})
+		r.Get("/s/*", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "public links are served from "+cfg.ViewOrigin, http.StatusNotFound)
 		})
 	}
 
@@ -181,8 +193,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 // mountMCP serves the MCP endpoint at /mcp according to cfg.MCPMode().
 func (s *Server) mountMCP(r chi.Router, tokens mcpauth.TokenVerifier) {
 	opts := mcpserver.Options{
-		BaseURL: s.cfg.AppBaseURL,
-		OnUser:  s.recordUser,
+		BaseURL:       s.cfg.AppBaseURL,
+		PublicLinkURL: s.publicLinkURL,
+		OnUser:        s.recordUser,
 	}
 	switch s.cfg.MCPMode() {
 	case "oauth":
@@ -645,12 +658,7 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 		// in the URL is the credential, so no cookies are involved.
 		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AppBaseURL)
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Content-Security-Policy",
-		"sandbox allow-scripts allow-popups allow-forms allow-modals; frame-ancestors "+ancestors)
-	_, _ = io.WriteString(w, withSDK(html))
+	writePage(w, html, ancestors)
 }
 
 // etagMatches reports whether an If-None-Match header names etag. Comparison
@@ -713,7 +721,7 @@ func httpError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
 		return
-	case errors.Is(err, store.ErrGrantGone):
+	case errors.Is(err, store.ErrGrantGone), errors.Is(err, store.ErrLinkExpired):
 		http.Error(w, err.Error(), http.StatusGone)
 		return
 	case errors.Is(err, store.ErrForbidden):

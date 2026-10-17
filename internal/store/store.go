@@ -49,6 +49,9 @@ type PageMeta struct {
 	Role      string    `json:"role"`
 	Shared    bool      `json:"shared"`
 	Favorite  bool      `json:"favorite"`
+	// Public: the page has a public link that hasn't expired. Only told to
+	// the owner.
+	Public bool `json:"public"`
 }
 
 // querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
@@ -290,11 +293,12 @@ func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error)
 	var r Role
 	err := s.pool.QueryRow(ctx, `
 		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
-		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`
+		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`,
+		       r.level = 3 AND `+hasPublicLinks+`
 		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
 		WHERE a.id = $1::uuid AND r.level > 0
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite)
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public)
 	m.Role = r.String()
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound

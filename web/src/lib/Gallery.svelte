@@ -48,7 +48,7 @@
   let items = $state<TreeItem[]>([]);
   let loading = $state(true);
   let error = $state("");
-  let sharing = $state<{ kind: "folder" | "page"; id: string; name: string } | null>(null);
+  let sharing = $state<{ kind: "folder" | "page"; id: string; name: string; version?: number } | null>(null);
   let moving = $state<TreeItem | null>(null);
   let menuFor = $state<string | null>(null);
 
@@ -381,7 +381,7 @@
                       class={menuItem}
                       onclick={() => {
                         menuFor = null;
-                        sharing = { kind: it.kind, id: it.id, name: it.name };
+                        sharing = { kind: it.kind, id: it.id, name: it.name, version: it.version };
                       }}>Share…</button
                     >
                     <button role="menuitem" class={menuItem + " text-red-300"} onclick={() => archive(it)}>Archive</button>
@@ -401,6 +401,7 @@
     kind={sharing.kind}
     id={sharing.id}
     name={sharing.name}
+    version={sharing.version}
     onclose={(changed) => {
       sharing = null;
       if (changed) reload();

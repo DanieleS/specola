@@ -62,6 +62,7 @@
       role: k.role,
       shared: false,
       favorite: false,
+      public: false,
       viewUrl: "",
       offline: true,
     };
@@ -243,7 +244,7 @@
       <button class={action} onclick={copyLink}>{copied ? "Copied" : "Copy link"}</button>
       <button class={action} aria-pressed={historyOpen} onclick={toggleHistory}>History</button>
       {#if meta?.role === "owner" && !readOffline}
-        <button class={action} onclick={() => (sharing = true)}>{meta.shared ? "Shared" : "Share"}</button>
+        <button class={action} onclick={() => (sharing = true)}>{meta.shared || meta.public ? "Shared" : "Share"}</button>
       {/if}
       {#if src}
         <a href={src} target="_blank" rel="noopener noreferrer" class={action}>Open raw ↗</a>
@@ -320,6 +321,7 @@
     kind="page"
     {id}
     name={meta.name}
+    version={meta.version}
     onclose={(changed) => {
       sharing = false;
       if (changed) load();

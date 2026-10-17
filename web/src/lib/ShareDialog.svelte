@@ -1,12 +1,21 @@
 <script lang="ts">
   import { api, type ItemKind, type Share } from "./api";
+  import PublicLinks from "./PublicLinks.svelte";
 
   let {
     kind,
     id,
     name,
+    version,
     onclose,
-  }: { kind: ItemKind; id: string; name: string; onclose: (changed: boolean) => void } = $props();
+  }: {
+    kind: ItemKind;
+    id: string;
+    name: string;
+    /** The page's current version, offered for pinning a public link. */
+    version?: number;
+    onclose: (changed: boolean) => void;
+  } = $props();
 
   let shares = $state<Share[]>([]);
   let loading = $state(true);
@@ -60,7 +69,7 @@
   onclick={(e) => e.target === e.currentTarget && onclose(changed)}
 >
   <div
-    class="w-full max-w-md rounded-lg border border-white/10 bg-[#12151c] p-5 shadow-xl"
+    class="w-full max-w-md max-h-full overflow-y-auto rounded-lg border border-white/10 bg-[#12151c] p-5 shadow-xl"
     role="dialog"
     aria-modal="true"
     aria-labelledby="share-title"
@@ -128,6 +137,10 @@
           </li>
         {/each}
       </ul>
+    {/if}
+
+    {#if kind === "page"}
+      <PublicLinks {id} {version} onchange={() => (changed = true)} />
     {/if}
   </div>
 </div>
