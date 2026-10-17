@@ -5,6 +5,7 @@
   import PageViewer from "./lib/PageViewer.svelte";
   import PublishForm from "./lib/PublishForm.svelte";
   import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
+  import * as offline from "./lib/offline.svelte";
 
   type Route = { name: "list" } | { name: "new"; folderId: string | null } | { name: "view"; id: string };
 
@@ -22,9 +23,11 @@
 
   api
     .me()
-    .then((m) => {
+    .then(async (m) => {
       email = m.email || m.sub;
+      await offline.claim(m.sub);
       auth = "in";
+      if (!m.offline) offline.sync().catch((e) => console.warn("offline sync:", e));
     })
     .catch((e) => {
       auth = "out";
@@ -33,6 +36,13 @@
 
   addEventListener("hashchange", () => (route = parseHash()));
   addEventListener(UNAUTHORIZED_EVENT, () => (auth = "out"));
+
+  // What is kept offline belongs to this user: drop it before signing out.
+  async function logout(e: MouseEvent) {
+    e.preventDefault();
+    await offline.clear().catch(() => {});
+    location.href = "/auth/logout";
+  }
 </script>
 
 {#if auth === "out"}
@@ -45,11 +55,18 @@
         Specola
       </a>
       <div class="flex items-center gap-4 text-sm">
-        <a href="#/new" class="px-3 py-1.5 rounded-md bg-amber-500 text-black font-medium hover:bg-amber-400">
-          New page
-        </a>
+        {#if offline.net.online}
+          <a href="#/new" class="px-3 py-1.5 rounded-md bg-amber-500 text-black font-medium hover:bg-amber-400">
+            New page
+          </a>
+        {:else}
+          <span
+            class="text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
+            title="Showing what this device keeps for offline">offline</span
+          >
+        {/if}
         {#if email}<span class="text-white/50 hidden sm:inline">{email}</span>{/if}
-        <a href="/auth/logout" class="text-white/50 hover:text-white/80">Logout</a>
+        <a href="/auth/logout" onclick={logout} class="text-white/50 hover:text-white/80">Logout</a>
       </div>
     </header>
 

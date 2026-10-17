@@ -1,13 +1,14 @@
 <script lang="ts" module>
   import type { Role } from "./api";
 
-  type Tab = "mine" | "favorites" | "shared" | "archived";
+  type Tab = "mine" | "favorites" | "shared" | "offline" | "archived";
   type Crumb = { id: string | null; name: string; role: Role };
 
   const homes: Record<Tab, Crumb> = {
     mine: { id: null, name: "Home", role: "owner" },
     favorites: { id: null, name: "Favorites", role: "viewer" },
     shared: { id: null, name: "Shared with me", role: "viewer" },
+    offline: { id: null, name: "Offline", role: "viewer" },
     archived: { id: null, name: "Archived", role: "owner" },
   };
 
@@ -38,6 +39,7 @@
 <script lang="ts">
   import { api, type SearchResult, type TreeItem } from "./api";
   import MoveDialog from "./MoveDialog.svelte";
+  import * as offline from "./offline.svelte";
   import ShareDialog from "./ShareDialog.svelte";
 
   const initial = loadSaved();
@@ -52,7 +54,7 @@
 
   let here = $derived(stack[stack.length - 1]);
   // Top-level lists (favorites, shared, archived) aren't folders you can add to.
-  let canEdit = $derived(here.id !== null ? here.role !== "viewer" : tab === "mine");
+  let canEdit = $derived(offline.net.online && (here.id !== null ? here.role !== "viewer" : tab === "mine"));
 
   $effect(() => save({ tab, stack }));
 
@@ -60,8 +62,32 @@
     stack = [...stack];
   }
 
+  // What this device keeps, newest first; read without the network.
+  let keptItems = $derived(
+    Object.values(offline.index.pages)
+      .sort((a, b) => b.usedAt.localeCompare(a.usedAt))
+      .map(
+        (p): TreeItem => ({
+          id: p.id,
+          kind: "page",
+          name: p.name,
+          slug: "",
+          version: p.versions.at(-1),
+          updatedAt: p.updatedAt,
+          role: p.role,
+          shared: false,
+        }),
+      ),
+  );
+
   $effect(() => {
     const crumb = stack[stack.length - 1];
+    if (tab === "offline") {
+      items = keptItems;
+      loading = false;
+      error = "";
+      return;
+    }
     loading = true;
     error = "";
     const load =
@@ -76,7 +102,11 @@
               : api.tree(null);
     load
       .then((d) => (items = d))
-      .catch((e) => (error = String(e)))
+      .catch((e) =>
+        (error = offline.net.online
+          ? String(e)
+          : "This list isn't kept on this device. Pages you saved or opened recently are under Offline."),
+      )
       .finally(() => (loading = false));
   });
 
@@ -159,7 +189,12 @@
 
   const fmt = (s: string) => new Date(s).toLocaleDateString();
   const subtitle = (it: TreeItem) =>
-    [tab === "archived" && "archived", it.kind === "page" && `v${it.version}`, fmt(it.updatedAt)]
+    [
+      tab === "archived" && "archived",
+      tab === "offline" && (offline.index.pages[it.id]?.pinned ? "saved" : "recent"),
+      it.kind === "page" && `v${it.version}`,
+      fmt(it.updatedAt),
+    ]
       .filter(Boolean)
       .join(" · ");
   const tabClass = (t: Tab) =>
@@ -176,6 +211,9 @@
       <button class={tabClass("mine")} onclick={() => switchTab("mine")}>My pages</button>
       <button class={tabClass("favorites")} onclick={() => switchTab("favorites")}>Favorites</button>
       <button class={tabClass("shared")} onclick={() => switchTab("shared")}>Shared with me</button>
+      {#if offline.supported}
+        <button class={tabClass("offline")} onclick={() => switchTab("offline")}>Offline</button>
+      {/if}
       <button class={tabClass("archived")} onclick={() => switchTab("archived")}>Archived</button>
     </div>
     <input
@@ -253,6 +291,8 @@
           <p>Nothing has been shared with you yet.</p>
         {:else if tab === "archived"}
           <p>Nothing archived.</p>
+        {:else if tab === "offline"}
+          <p>Nothing kept on this device yet. Pages you open are kept here, and pages you save for offline stay.</p>
         {:else}
           <p>Nothing here yet.</p>
           {#if canEdit}
@@ -286,7 +326,13 @@
               <div class="text-xs text-white/40 mt-1 pr-16">{subtitle(it)}</div>
             </button>
 
-            {#if tab !== "archived"}
+            {#if tab === "offline"}
+              <button
+                class="absolute bottom-3 right-3 text-xs px-2 py-1 rounded border border-white/15 hover:bg-white/10"
+                title="Remove the copy kept on this device"
+                onclick={() => offline.remove(it.id)}>Remove</button
+              >
+            {:else if tab !== "archived"}
               <button
                 class="absolute bottom-3 {it.role === 'viewer' ? 'right-3' : 'right-10'} w-7 h-7 rounded hover:bg-white/10 {it.favorite
                   ? 'text-amber-400'
@@ -301,7 +347,7 @@
                 class="absolute bottom-3 right-3 text-xs px-2 py-1 rounded border border-white/15 hover:bg-white/10"
                 onclick={() => act(() => api.unarchive(it.kind, it.id))}>Restore</button
               >
-            {:else if it.role !== "viewer"}
+            {:else if it.role !== "viewer" && tab !== "offline"}
               <button
                 class="absolute bottom-3 right-3 w-7 h-7 rounded text-white/50 hover:text-white hover:bg-white/10"
                 aria-label={`Actions for ${it.name}`}

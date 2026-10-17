@@ -25,6 +25,8 @@ export type PageMeta = {
   favorite: boolean;
   /** Where to load the rendered page from; may be on a separate origin. */
   viewUrl: string;
+  /** Set when this is a copy kept by the service worker, read offline. */
+  offline?: boolean;
 };
 
 export type Share = {
@@ -60,6 +62,18 @@ export class Unauthorized extends Error {
   }
 }
 
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Set by the service worker on an API response served from its cache. */
+export const OFFLINE_HEADER = "X-Specola-Offline";
+
 // Fired on any 401 so the app can swap to the login screen. We never redirect
 // automatically: the user starts the login from an explicit button, so a
 // failing login cannot turn into a redirect loop.
@@ -76,13 +90,16 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
     throw new Unauthorized();
   }
-  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  if (!res.ok) throw new HttpError(res.status, (await res.text()) || res.statusText);
   const ct = res.headers.get("content-type") ?? "";
-  return (ct.includes("application/json") ? res.json() : (res.text() as unknown)) as Promise<T>;
+  if (!ct.includes("application/json")) return (await res.text()) as T;
+  const data = await res.json();
+  if (res.headers.has(OFFLINE_HEADER) && data && typeof data === "object" && !Array.isArray(data)) data.offline = true;
+  return data as T;
 }
 
 export const api = {
-  me: () => req<{ sub: string; email: string }>("GET", "/api/me"),
+  me: () => req<{ sub: string; email: string; offline?: boolean }>("GET", "/api/me"),
   tree: (parent?: string | null) =>
     req<TreeItem[]>("GET", "/api/tree" + (parent ? `?parent=${encodeURIComponent(parent)}` : "")),
   createFolder: (name: string, parentId: string | null) =>
