@@ -37,7 +37,7 @@ func TestViewCaching(t *testing.T) {
 	if res.StatusCode != http.StatusOK || res.Header.Get("ETag") == etag {
 		t.Fatalf("after v2: %d, ETag %q (was %q)", res.StatusCode, res.Header.Get("ETag"), etag)
 	}
-	if got := readBody(t, res); got != "<p>v2</p>" {
+	if got := readBody(t, res); got != withSDK("<p>v2</p>") {
 		t.Fatalf("after v2: body %q", got)
 	}
 
@@ -92,7 +92,7 @@ func TestPagesAreCompressed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(plain) != html {
+	if string(plain) != withSDK(html) {
 		t.Fatalf("decompressed body differs: %d bytes, want %d", len(plain), len(html))
 	}
 	// The sandbox must survive compression.

@@ -44,6 +44,8 @@ tokens), not by email.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
   HTML body instead of inlining it in a request.
 - **favorite** — personal stars.
+- **page_data** — per page and user, the key-value data the page keeps through
+  `specola.storage`.
 - **search_document** — per page, the title and tag-stripped text of the
   current version with a `tsvector`, for full-text search.
 
@@ -122,6 +124,40 @@ Share a folder or page with another user by email, as **viewer** (read) or
 
 API: `GET/PUT/DELETE /api/{pages|folders}/{id}/acl` (`PUT` takes
 `{"email" | "sub", "role"}`, `DELETE` takes `?sub=`), and `GET /api/shared`.
+
+## Page storage
+
+A page runs on an opaque origin, so `localStorage`, `sessionStorage`, cookies
+and IndexedDB all throw `SecurityError`. Instead, Specola adds
+`window.specola.storage` to every page it serves: an async `localStorage`
+kept on the server.
+
+```js
+const s = specola.storage;
+await s.setItem("done", JSON.stringify([1, 2]));
+JSON.parse((await s.getItem("done")) ?? "[]");
+await s.removeItem("done");
+await s.keys();
+await s.clear();
+```
+
+- Data is **per user**: everyone who can see the page has their own, private
+  to them; the owner doesn't see viewers' data. It is the same on every
+  version of the page, and follows the page's visibility: archived or
+  unshared, it is kept but out of reach.
+- Values are strings, up to 1000 keys and 1 MB per user and page. Writes
+  apply locally at once and are rolled back, with the promise rejected, if
+  the server refuses them (over quota, offline).
+- Offline, the last copy the device fetched can be read; writes fail.
+- Only inside the viewer: opened raw, or after the page navigates its frame
+  elsewhere, the calls reject. The viewer hands the page a `MessagePort` on
+  its first request after loading it and answers through the API as the
+  signed-in user, so the page itself still never reaches Specola.
+- The script is added when the page is served (after the doctype), not
+  stored: the history, search and MCP keep the HTML as published.
+
+API: `GET /api/pages/{id}/data`, `PATCH` with `{"set": {...}, "remove": [...]}`,
+`DELETE` to clear.
 
 ## Search
 
@@ -256,7 +292,8 @@ CIMD clients then connect without being registered in advance.
 - Rendered pages are served with `Content-Security-Policy: sandbox` and shown
   in a sandboxed iframe without `allow-same-origin`, so they run on an opaque
   origin and cannot read Specola's cookies or call its API. `frame-ancestors`
-  stops other sites from framing them.
+  stops other sites from framing them. Their only way to Specola is
+  `specola.storage`, through the viewer, scoped to that page and user.
 - For defense in depth, set `SPECOLA_VIEW_ORIGIN` to a second hostname that
   also reaches Specola (requests are routed by `Host`). Pages are then served
   only from that origin, which serves nothing else, and the app origin refuses

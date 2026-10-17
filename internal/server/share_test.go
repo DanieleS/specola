@@ -90,7 +90,7 @@ func TestSharing(t *testing.T) {
 		if tree := expect(alice, "GET", "/api/tree?parent="+folder, "", http.StatusOK); roleIn(tree, bobsPage) != "owner" {
 			t.Fatalf("alice's view of bob's page: %s", tree)
 		}
-		if got := expect(alice, "GET", "/view/"+bobsPage, "", http.StatusOK); got != "<p>bob</p>" {
+		if got := expect(alice, "GET", "/view/"+bobsPage, "", http.StatusOK); got != withSDK("<p>bob</p>") {
 			t.Fatalf("alice /view of bob's page = %q", got)
 		}
 

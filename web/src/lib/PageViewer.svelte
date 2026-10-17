@@ -2,6 +2,7 @@
   import { untrack } from "svelte";
   import { api, Unauthorized, type PageMeta, type VersionInfo } from "./api";
   import * as offline from "./offline.svelte";
+  import { serveStorage } from "./pagedata";
   import ShareDialog from "./ShareDialog.svelte";
 
   let { id }: { id: string } = $props();
@@ -27,6 +28,7 @@
   let offlineSrc = $state("");
   let missing = $state(false);
   let saving = $state(false);
+  let frame = $state<HTMLIFrameElement>();
 
   // viewUrl may already carry a query (a view token), so add v properly.
   function withVersion(viewUrl: string, v: number) {
@@ -109,6 +111,13 @@
       live = false;
       if (url) URL.revokeObjectURL(url);
     };
+  });
+
+  // Serve specola.storage afresh to each document the frame is pointed at.
+  $effect(() => {
+    const f = frame;
+    if (!f || !(src || offlineSrc)) return;
+    return serveStorage(f, id);
   });
 
   async function togglePinned() {
@@ -244,8 +253,10 @@
         <p class="flex-1 p-5 text-white/50">Version {shown} isn't kept on this device. It can be opened when you're back online.</p>
       {:else if src || offlineSrc}
         <!-- No allow-same-origin: the page runs on an opaque origin, matching the
-             server's CSP sandbox, so it cannot touch Specola's session or API. -->
+             server's CSP sandbox, so it cannot touch Specola's session or API.
+             It keeps data only through specola.storage, served above. -->
         <iframe
+          bind:this={frame}
           title={meta?.name ?? "page"}
           src={src || offlineSrc}
           referrerpolicy="no-referrer"
