@@ -20,7 +20,7 @@ func TestMCPToolAnnotations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readOnly := map[string]bool{"list": true, "get_page": true, "list_versions": true, "search": true}
+	readOnly := map[string]bool{"list": true, "get_page": true, "list_versions": true, "search": true, "list_public_links": true}
 	seen := map[string]bool{}
 	for _, tool := range tools.Tools {
 		seen[tool.Name] = true
@@ -29,7 +29,7 @@ func TestMCPToolAnnotations(t *testing.T) {
 			t.Errorf("%s: readOnlyHint = %v, want %v", tool.Name, got, readOnly[tool.Name])
 		}
 	}
-	for _, want := range []string{"create_folder", "rename", "move", "archive", "unarchive", "list_versions"} {
+	for _, want := range []string{"create_folder", "rename", "move", "archive", "unarchive", "list_versions", "create_public_link", "list_public_links", "revoke_public_link"} {
 		if !seen[want] {
 			t.Errorf("tool %s missing", want)
 		}
@@ -175,5 +175,49 @@ func TestMCPUploadGrantNote(t *testing.T) {
 	callTool(t, cs, "list_versions", map[string]any{"id": up.ID}, &vs)
 	if len(vs.Versions) != 1 || vs.Versions[0].Note != "uploaded" {
 		t.Fatalf("versions = %+v", vs)
+	}
+}
+
+func TestMCPPublicLinks(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ts := newMCPTestServer(t, fi)
+	cs, err := connect(t, ts, fi.token(t, "alice", testResource))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer cs.Close()
+
+	var pub struct{ ID string }
+	callTool(t, cs, "publish_page", map[string]any{"title": "Deck", "html": "<p>deck</p>"}, &pub)
+
+	var link struct{ ID, URL, Label string }
+	callTool(t, cs, "create_public_link", map[string]any{"id": pub.ID, "label": "client", "expires_in_days": 3}, &link)
+	if link.ID == "" || link.Label != "client" || !strings.HasPrefix(link.URL, "http://specola.test/s/") {
+		t.Fatalf("create_public_link = %+v", link)
+	}
+	path := strings.TrimPrefix(link.URL, "http://specola.test")
+	if res := get(t, ts, "", path, nil); res.StatusCode != http.StatusOK || readBody(t, res) != withSDK("<p>deck</p>") {
+		t.Fatalf("open: %d", res.StatusCode)
+	}
+
+	var listed struct {
+		Links []struct {
+			ID    string
+			Views int
+		}
+	}
+	callTool(t, cs, "list_public_links", map[string]any{"id": pub.ID}, &listed)
+	if len(listed.Links) != 1 || listed.Links[0].ID != link.ID || listed.Links[0].Views != 1 {
+		t.Fatalf("list_public_links = %+v", listed)
+	}
+	if res := callTool(t, cs, "create_public_link", map[string]any{"id": pub.ID, "version": 5}, nil); !res.IsError {
+		t.Fatal("pinning a missing version succeeded")
+	}
+
+	if res := callTool(t, cs, "revoke_public_link", map[string]any{"id": pub.ID, "link_id": link.ID}, nil); res.IsError {
+		t.Fatalf("revoke: %v", res.Content)
+	}
+	if res := get(t, ts, "", path, nil); res.StatusCode != http.StatusNotFound {
+		t.Fatalf("revoked: %d, want 404", res.StatusCode)
 	}
 }

@@ -25,6 +25,8 @@ const MaxBodyBytes = 32 << 20
 type Options struct {
 	// BaseURL is Specola's public origin, used to build page links.
 	BaseURL string
+	// PublicLinkURL builds the URL of a public link from its token.
+	PublicLinkURL func(token string) string
 	// OnUser, when set, is called with the caller's identity on every tool
 	// call, e.g. to record the user.
 	OnUser func(ctx context.Context, id auth.Identity)
@@ -62,6 +64,9 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "unarchive", Description: unarchiveDesc, Annotations: idempotent}, t.unarchive)
 	mcp.AddTool(srv, &mcp.Tool{Name: "share", Description: shareDesc, Annotations: idempotent}, t.share)
 	mcp.AddTool(srv, &mcp.Tool{Name: "search", Description: searchDesc, Annotations: readOnly}, t.search)
+	mcp.AddTool(srv, &mcp.Tool{Name: "create_public_link", Description: createLinkDesc, Annotations: additive}, t.createPublicLink)
+	mcp.AddTool(srv, &mcp.Tool{Name: "list_public_links", Description: listLinksDesc, Annotations: readOnly}, t.listPublicLinks)
+	mcp.AddTool(srv, &mcp.Tool{Name: "revoke_public_link", Description: revokeLinkDesc, Annotations: &mcp.ToolAnnotations{IdempotentHint: true}}, t.revokePublicLink)
 
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
 		Stateless:                  true,
@@ -75,6 +80,7 @@ const instructions = `Specola stores versioned, interactive HTML pages in the us
 Publish a page with publish_page, update it with new_version (each call adds a version; history is kept), and find existing pages with search or list.
 Give every version a short note saying what changed; it is what the user reads in the history.
 Organise with create_folder, move, rename and archive; nothing is ever deleted, and archive can be undone with unarchive.
+Share with other Specola users with share; to show a page to someone without an account, make a public link with create_public_link.
 Pages must be self-contained HTML: inline CSS and JS; imports from public CDNs are fine. Pages run in a sandbox without access to Specola itself.
 localStorage works as usual and is saved by Specola for each user who views the page (their own, private, the same on every version; up to 1 MB). sessionStorage and cookies last for one load only; IndexedDB is unavailable.
 For HTML over ~100 KB, don't inline it in a tool argument: call create_upload_grant and PUT the file to the returned URL with curl.`

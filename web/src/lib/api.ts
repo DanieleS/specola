@@ -23,6 +23,8 @@ export type PageMeta = {
   role: Role;
   shared: boolean;
   favorite: boolean;
+  /** Has a public link that hasn't expired. Only ever set for the owner. */
+  public: boolean;
   /** Where to load the rendered page from; may be on a separate origin. */
   viewUrl: string;
   /** Set when this is a copy kept by the service worker, read offline. */
@@ -35,6 +37,20 @@ export type Share = {
   name?: string;
   role: "viewer" | "editor";
   createdAt: string;
+};
+
+/** A link that shows a page to anyone holding it, without signing in. */
+export type PublicLink = {
+  id: string;
+  /** Pinned to this version; follows the current one when absent. */
+  version?: number;
+  label?: string;
+  createdBy?: string;
+  createdAt: string;
+  expiresAt?: string;
+  expired: boolean;
+  lastUsedAt?: string;
+  views: number;
 };
 
 export type SearchResult = TreeItem & {
@@ -130,4 +146,9 @@ export const api = {
     req<void>("PUT", aclPath(kind, id), { sub, role }),
   unshare: (kind: ItemKind, id: string, sub: string) =>
     req<void>("DELETE", `${aclPath(kind, id)}?sub=${encodeURIComponent(sub)}`),
+  publicLinks: (id: string) => req<PublicLink[]>("GET", `/api/pages/${id}/links`),
+  /** The returned url is the only time the link can be had. */
+  createPublicLink: (id: string, opts: { label?: string; version?: number; expiresInDays?: number }) =>
+    req<PublicLink & { url: string }>("POST", `/api/pages/${id}/links`, opts),
+  revokePublicLink: (id: string, link: string) => req<void>("DELETE", `/api/pages/${id}/links/${link}`),
 };

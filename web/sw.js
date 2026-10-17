@@ -6,7 +6,7 @@
 // - /assets/ files carry a content hash: cache-first.
 // - GET /api reads are network-first and kept for offline use; a copy served
 //   from the cache is marked with OFFLINE_HEADER so the app can tell.
-// - Rendered pages (/view) are left alone: the app stores the pages it keeps
+// - Rendered pages (/view, and public links at /s) are left alone: the app stores the pages it keeps
 //   for offline itself (src/lib/offline.svelte.ts), since they may come from
 //   another origin and are shown in a sandboxed frame.
 
@@ -52,7 +52,7 @@ self.addEventListener("fetch", (e) => {
     return;
   }
   if (req.mode === "navigate") {
-    if (/^\/(view|auth|mcp|upload|healthz|\.well-known)(\/|$)/.test(p)) return;
+    if (/^\/(view|s|auth|mcp|upload|healthz|\.well-known)(\/|$)/.test(p)) return;
     e.respondWith(shell(req));
     return;
   }
