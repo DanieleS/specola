@@ -7,12 +7,16 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Page data is a small key-value store a page keeps for each user who views it,
-// in place of the localStorage its sandbox denies it. Each user's data is
-// private to them; anyone who can see the page has their own. It follows the
-// page's visibility: archived or unshared, it is kept but out of reach.
+// Page data is a small key-value store a page keeps for each user who views it:
+// the localStorage Specola gives it in place of the one its sandbox denies it.
+// Each user's data is private to them; anyone who can see the page has their
+// own. It follows the page's visibility: archived or unshared, it is kept but
+// out of reach.
 
 const (
+	// The page runtime (internal/server/pagesdk.js) enforces the same limits,
+	// so a page sees QuotaExceededError at once instead of a refused write.
+
 	// MaxPageDataBytes bounds one user's data on one page, keys and values.
 	MaxPageDataBytes = 1 << 20
 	// MaxPageDataKeys bounds how many keys one user keeps on one page.
@@ -53,8 +57,8 @@ type PageDataChange struct {
 // nothing. Viewing the page is enough: the data is sub's own.
 func (s *Store) UpdatePageData(ctx context.Context, sub, id string, c PageDataChange) error {
 	for k := range c.Set {
-		if k == "" || len(k) > MaxPageDataKeyBytes {
-			return &ErrInvalid{fmt.Sprintf("keys must be 1 to %d bytes", MaxPageDataKeyBytes)}
+		if len(k) > MaxPageDataKeyBytes {
+			return &ErrInvalid{fmt.Sprintf("keys must be at most %d bytes", MaxPageDataKeyBytes)}
 		}
 	}
 	return s.inTx(ctx, func(tx pgx.Tx) error {

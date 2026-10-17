@@ -70,14 +70,20 @@ func TestPageData(t *testing.T) {
 		t.Fatalf("after unarchive = %v", d)
 	}
 
+	// A change applies at once: clear, then remove, then set. The empty key is
+	// a key like any other, as in localStorage.
+	expect(alice, "PATCH", `{"clear":true,"set":{"":"empty","a":"1"},"remove":["a"]}`, http.StatusNoContent)
+	if d := data(alice); len(d) != 2 || d[""] != "empty" || d["a"] != "1" {
+		t.Fatalf("after clear and set = %v", d)
+	}
+
 	// Clearing drops only the caller's data.
 	expect(bob, "DELETE", "", http.StatusNoContent)
-	if a, b := data(alice), data(bob); len(a) != 1 || len(b) != 0 {
+	if a, b := data(alice), data(bob); len(a) != 2 || len(b) != 0 {
 		t.Fatalf("after bob's clear: alice %v, bob %v", a, b)
 	}
 
 	// Bad requests.
-	expect(alice, "PATCH", `{"set":{"":"x"}}`, http.StatusBadRequest)
 	expect(alice, "PATCH", `{"set":{"`+strings.Repeat("k", store.MaxPageDataKeyBytes+1)+`":"x"}}`, http.StatusBadRequest)
 	expect(alice, "PATCH", `{"set":{"n":1}}`, http.StatusBadRequest)
 	expect(carol, "GET", "", http.StatusNotFound)

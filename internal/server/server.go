@@ -376,8 +376,10 @@ func (s *Server) handlePageData(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, data)
 }
 
-// pageDataReq writes the keys in set and drops those in remove.
+// pageDataReq changes a user's page data at once: clear drops everything
+// first, then the keys in remove are dropped and those in set written.
 type pageDataReq struct {
+	Clear  bool              `json:"clear"`
 	Set    map[string]string `json:"set"`
 	Remove []string          `json:"remove"`
 }
@@ -388,7 +390,7 @@ func (s *Server) handleUpdatePageData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := s.st.UpdatePageData(r.Context(), subOf(r.Context()), chi.URLParam(r, "id"),
-		store.PageDataChange{Set: req.Set, Remove: req.Remove})
+		store.PageDataChange{Clear: req.Clear, Set: req.Set, Remove: req.Remove})
 	if err != nil {
 		httpError(w, err)
 		return

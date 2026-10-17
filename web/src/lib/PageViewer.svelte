@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { api, Unauthorized, type PageMeta, type VersionInfo } from "./api";
   import * as offline from "./offline.svelte";
-  import { serveStorage } from "./pagedata";
+  import { serveStorage, storageName } from "./pagedata";
   import ShareDialog from "./ShareDialog.svelte";
 
   let { id }: { id: string } = $props();
@@ -28,7 +28,7 @@
   let offlineSrc = $state("");
   let missing = $state(false);
   let saving = $state(false);
-  let frame = $state<HTMLIFrameElement>();
+  let host = $state<HTMLDivElement>();
 
   // viewUrl may already carry a query (a view token), so add v properly.
   function withVersion(viewUrl: string, v: number) {
@@ -113,11 +113,34 @@
     };
   });
 
-  // Serve specola.storage afresh to each document the frame is pointed at.
+  // A frame per load, made here: the page's localStorage data must be in the
+  // frame's name before the frame is in the document (browsers ignore a later
+  // change), and only the page first loaded in it gets to save its writes.
   $effect(() => {
-    const f = frame;
-    if (!f || !(src || offlineSrc)) return;
-    return serveStorage(f, id);
+    const h = host;
+    const url = src || offlineSrc;
+    if (!h || !url) return;
+    const title = untrack(() => meta?.name ?? "page");
+    let live = true;
+    let stop = () => {};
+    storageName(id).then((name) => {
+      if (!live) return;
+      // No allow-same-origin: the page runs on an opaque origin, matching the
+      // server's CSP sandbox, so it cannot touch Specola's session or API.
+      const f = document.createElement("iframe");
+      f.title = title;
+      f.referrerPolicy = "no-referrer";
+      f.setAttribute("sandbox", "allow-scripts allow-popups allow-forms allow-modals");
+      f.className = "flex-1 w-full bg-white border-0";
+      if (name) f.name = name;
+      f.src = url;
+      h.replaceChildren(f);
+      if (name) stop = serveStorage(f, id);
+    });
+    return () => {
+      live = false;
+      stop();
+    };
   });
 
   async function togglePinned() {
@@ -252,17 +275,8 @@
       {#if missing}
         <p class="flex-1 p-5 text-white/50">Version {shown} isn't kept on this device. It can be opened when you're back online.</p>
       {:else if src || offlineSrc}
-        <!-- No allow-same-origin: the page runs on an opaque origin, matching the
-             server's CSP sandbox, so it cannot touch Specola's session or API.
-             It keeps data only through specola.storage, served above. -->
-        <iframe
-          bind:this={frame}
-          title={meta?.name ?? "page"}
-          src={src || offlineSrc}
-          referrerpolicy="no-referrer"
-          sandbox="allow-scripts allow-popups allow-forms allow-modals"
-          class="flex-1 w-full bg-white border-0"
-        ></iframe>
+        <!-- The sandboxed frame showing the page goes here; see above. -->
+        <div bind:this={host} class="flex flex-1 min-w-0"></div>
       {/if}
 
       {#if historyOpen}

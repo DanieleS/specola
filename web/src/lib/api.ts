@@ -115,10 +115,8 @@ export const api = {
   versions: (id: string) => req<VersionInfo[]>("GET", `/api/pages/${id}/versions`),
   restoreVersion: (id: string, from: number) =>
     req<{ version: number }>("POST", `/api/pages/${id}/versions`, { restoreFrom: from }),
+  /** The user's localStorage for page id; written by pagedata.ts. */
   pageData: (id: string) => req<Record<string, string>>("GET", `/api/pages/${id}/data`),
-  updatePageData: (id: string, change: { set?: Record<string, string>; remove?: string[] }) =>
-    req<void>("PATCH", `/api/pages/${id}/data`, change),
-  clearPageData: (id: string) => req<void>("DELETE", `/api/pages/${id}/data`),
   rename: (kind: ItemKind, id: string, name: string) => req<void>("PATCH", `/api/${kind}s/${id}`, { name }),
   move: (kind: ItemKind, id: string, parentId: string | null) =>
     req<void>("PATCH", `/api/${kind}s/${id}`, { parentId }),

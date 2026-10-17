@@ -1,6 +1,6 @@
--- Key-value data a page keeps for each user who views it, in place of the
--- localStorage its sandbox denies it. Private to that user; the page reaches it
--- through the viewer (window.specola.storage), never directly.
+-- Key-value data a page keeps for each user who views it: the localStorage
+-- Specola gives it in place of the one its sandbox denies it. Private to that
+-- user; the page reaches it through the viewer, never directly.
 
 -- +goose Up
 -- +goose StatementBegin
