@@ -12,7 +12,8 @@ Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
 
 > Status: early. Publish, browse, version with notes, view, share, favorites,
-> full-text search, and an OAuth-protected MCP endpoint for agents.
+> full-text search, offline viewing as an installable PWA, and an
+> OAuth-protected MCP endpoint for agents.
 
 ## Stack
 
@@ -80,6 +81,30 @@ accept it; pages with their data inlined shrink several times over.
   `If-None-Match` answers 304 without reading the HTML out of the database.
 - The SPA shell is `no-cache`, so a deploy reaches the browser at once; the
   bundle under `/assets/` has hashed names and is cached for a year.
+
+## Offline and install (PWA)
+
+Specola is an installable Progressive Web App (manifest, icons, service
+worker), and pages can be read without a connection.
+
+- **Kept pages**: every page you open is kept on the device (the last 30).
+  **Save offline** in the viewer pins a page: it is never evicted and is
+  brought up to its current version each time Specola opens online; pages
+  you've lost access to are dropped then. The **Offline** tab lists what the
+  device keeps, readable with no network.
+- **Lists and metadata** you've browsed (folders, favorites, shared, history)
+  are read from the service worker's copy when the server can't be reached.
+  Search, publishing and every change need a connection.
+- Offline, a kept page is shown from a `blob:` URL in the same sandboxed
+  iframe (no `allow-same-origin`), so its scripts still run on an opaque
+  origin.
+- What the device keeps belongs to the signed-in user: **Logout** wipes it,
+  and so does signing in as someone else on the same browser.
+
+The service worker (`web/sw.js`) is built with the list of the build's files
+to precache. The shell is network-first, so a deploy still reaches the
+browser at once; `sw.js` and the manifest are served `no-cache`. It only runs
+over HTTPS (or on `localhost`) and isn't registered by the Vite dev server.
 
 ## Sharing
 
@@ -239,6 +264,9 @@ CIMD clients then connect without being registered in advance.
   (one user, one page, valid for an hour) with the page metadata, and access
   is still checked on every request, so removing a share takes effect at once.
   Responses carry `Referrer-Policy: no-referrer` so the token doesn't leak.
+  They also allow CORS reads from the app origin, which is how the app keeps
+  pages for offline viewing; offline, a kept page is rendered from the app
+  origin in the sandboxed iframe, without the separate origin.
 - No secrets are committed; only `*.env.example` placeholders.
 
 ## License

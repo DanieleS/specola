@@ -31,10 +31,18 @@ func Handler() http.Handler {
 			serveIndex(w, index)
 			return
 		}
-		if strings.HasPrefix(p, "assets/") {
+		switch {
+		case strings.HasPrefix(p, "assets/"):
 			// Vite puts a content hash in these names: a new build is a new URL.
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		} else {
+		case p == "sw.js" || p == "manifest.webmanifest":
+			// The service worker names the files of the running build, like the
+			// shell, so each deploy must reach the browser.
+			w.Header().Set("Cache-Control", "no-cache")
+			if p == "manifest.webmanifest" {
+				w.Header().Set("Content-Type", "application/manifest+json")
+			}
+		default:
 			// Fixed names (the favicon): reuse for a day.
 			w.Header().Set("Cache-Control", "public, max-age=86400")
 		}

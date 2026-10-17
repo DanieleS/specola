@@ -36,6 +36,9 @@ func TestViewOnAppOrigin(t *testing.T) {
 	if res.Header.Get("Referrer-Policy") != "no-referrer" {
 		t.Fatalf("Referrer-Policy = %q", res.Header.Get("Referrer-Policy"))
 	}
+	if acao := res.Header.Get("Access-Control-Allow-Origin"); acao != "" {
+		t.Fatalf("same-origin view allows CORS from %q", acao)
+	}
 }
 
 func TestSeparateViewOrigin(t *testing.T) {
@@ -78,6 +81,10 @@ func TestSeparateViewOrigin(t *testing.T) {
 	res := get(t, ts, viewHost, u.RequestURI(), nil)
 	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != "<p>v2</p>" {
 		t.Fatalf("view origin: %d %q", res.StatusCode, b)
+	}
+	// The app may read it too, to keep it for offline viewing.
+	if acao := res.Header.Get("Access-Control-Allow-Origin"); acao != cfg.AppBaseURL {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want the app origin", acao)
 	}
 	if csp := res.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors https://specola.test") {
 		t.Fatalf("CSP = %q", csp)

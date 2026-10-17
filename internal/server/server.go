@@ -596,6 +596,9 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 	ancestors := "'self'"
 	if s.tokens != nil {
 		ancestors = s.cfg.AppBaseURL
+		// The app keeps pages for offline viewing by fetching them; the token
+		// in the URL is the credential, so no cookies are involved.
+		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AppBaseURL)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")

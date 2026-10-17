@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { api, type PageMeta, type VersionInfo } from "./api";
+  import { untrack } from "svelte";
+  import { api, Unauthorized, type PageMeta, type VersionInfo } from "./api";
+  import * as offline from "./offline.svelte";
   import ShareDialog from "./ShareDialog.svelte";
 
   let { id }: { id: string } = $props();
@@ -13,8 +15,18 @@
   let busy = $state(false);
   let copied = $state(false);
 
-  let shown = $derived(viewing ?? meta?.version);
-  let src = $derived(meta && shown ? withVersion(meta.viewUrl, shown) : "");
+  let kept = $derived(offline.index.pages[id]);
+  // Without the server, show the copy this device keeps: the version asked
+  // for, else the current one if kept, else the latest kept.
+  let readOffline = $derived(!!meta && (meta.offline || !offline.net.online));
+  let shown = $derived(
+    viewing ??
+      (readOffline && kept && meta && !kept.versions.includes(meta.version) ? kept.versions.at(-1) : meta?.version),
+  );
+  let src = $derived(meta && shown && !readOffline ? withVersion(meta.viewUrl, shown) : "");
+  let offlineSrc = $state("");
+  let missing = $state(false);
+  let saving = $state(false);
 
   // viewUrl may already carry a query (a view token), so add v properly.
   function withVersion(viewUrl: string, v: number) {
@@ -28,15 +40,40 @@
     api
       .pageMeta(id)
       .then((m) => (meta = m))
-      .catch((e) => (error = String(e)));
+      .catch((e) => {
+        // Never read online, but kept: enough to show it.
+        const k = offline.index.pages[id];
+        if (k && !(e instanceof Unauthorized)) meta = keptMeta(k);
+        else error = String(e);
+      });
     if (historyOpen) loadVersions();
+  }
+
+  function keptMeta(k: offline.OfflinePage): PageMeta {
+    return {
+      id: k.id,
+      name: k.name,
+      slug: "",
+      folderId: null,
+      version: k.versions.at(-1)!,
+      updatedAt: k.updatedAt,
+      role: k.role,
+      shared: false,
+      favorite: false,
+      viewUrl: "",
+      offline: true,
+    };
   }
 
   function loadVersions() {
     api
       .versions(id)
       .then((v) => (versions = v))
-      .catch((e) => (error = String(e)));
+      .catch((e) => {
+        if (!readOffline) error = String(e);
+        // Offline with no copy of the history: list what is kept.
+        else versions = (kept?.versions ?? []).slice().reverse().map((v) => ({ version: v, sizeBytes: 0, createdAt: "" }));
+      });
   }
 
   $effect(() => {
@@ -45,6 +82,46 @@
     viewing = null;
     load();
   });
+
+  // Online, keep what is shown for offline. Untracked: keeping updates the
+  // index, which must not start this again.
+  $effect(() => {
+    const m = meta;
+    const v = shown;
+    if (!m || !v || readOffline) return;
+    untrack(() => offline.keep(m, v)).catch((e) => console.warn("keep offline:", e));
+  });
+
+  // Offline, show the kept copy from a blob URL in the same sandbox.
+  $effect(() => {
+    const v = shown;
+    offlineSrc = "";
+    missing = false;
+    if (!readOffline || !v) return;
+    let url = "";
+    let live = true;
+    offline.html(id, v).then((h) => {
+      if (!live) return;
+      if (h === null) missing = true;
+      else offlineSrc = url = URL.createObjectURL(new Blob([h], { type: "text/html" }));
+    });
+    return () => {
+      live = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  });
+
+  async function togglePinned() {
+    if (!meta) return;
+    saving = true;
+    try {
+      await offline.setPinned(meta, !kept?.pinned);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      saving = false;
+    }
+  }
 
   function toggleHistory() {
     historyOpen = !historyOpen;
@@ -98,7 +175,7 @@
     <div class="flex items-center gap-3 min-w-0">
       <a href="#/" class="text-white/50 hover:text-white/90" aria-label="Back to gallery">←</a>
       <span class="font-medium truncate">{meta?.name ?? "…"}</span>
-      {#if meta}
+      {#if meta && !readOffline}
         <button
           class={meta.favorite ? "text-amber-400" : "text-white/30 hover:text-amber-300"}
           aria-label={meta.favorite ? "Remove from favorites" : "Add to favorites"}
@@ -107,6 +184,12 @@
         >
       {/if}
       {#if meta}<span class="text-xs text-white/40">v{shown}</span>{/if}
+      {#if readOffline}
+        <span
+          class="text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
+          title="The copy kept on this device">offline copy</span
+        >
+      {/if}
       {#if meta && meta.role !== "owner"}
         <span class="text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
           >{meta.role}</span
@@ -114,9 +197,20 @@
       {/if}
     </div>
     <div class="flex items-center gap-4 shrink-0">
+      {#if offline.supported && meta && (!readOffline || kept?.pinned)}
+        <button
+          class={action}
+          disabled={saving || readOffline}
+          aria-pressed={!!kept?.pinned}
+          title={kept?.pinned
+            ? "Kept on this device and updated when Specola opens online"
+            : "Keep the current version on this device"}
+          onclick={togglePinned}>{saving ? "Saving…" : kept?.pinned ? "Saved offline ✓" : "Save offline"}</button
+        >
+      {/if}
       <button class={action} onclick={copyLink}>{copied ? "Copied" : "Copy link"}</button>
       <button class={action} aria-pressed={historyOpen} onclick={toggleHistory}>History</button>
-      {#if meta?.role === "owner"}
+      {#if meta?.role === "owner" && !readOffline}
         <button class={action} onclick={() => (sharing = true)}>{meta.shared ? "Shared" : "Share"}</button>
       {/if}
       {#if src}
@@ -129,7 +223,7 @@
     <div class="flex items-center justify-between gap-3 px-5 py-2 text-sm bg-amber-500/10 border-b border-amber-500/20">
       <span>Viewing version {viewing}. The current version is {meta.version}.</span>
       <div class="flex gap-3">
-        {#if canEdit}
+        {#if canEdit && !readOffline}
           <button
             disabled={busy}
             onclick={restore}
@@ -146,12 +240,14 @@
     <p class="p-5 text-red-400">{error}</p>
   {:else}
     <div class="flex flex-1 min-h-0">
-      {#if src}
+      {#if missing}
+        <p class="flex-1 p-5 text-white/50">Version {shown} isn't kept on this device. It can be opened when you're back online.</p>
+      {:else if src || offlineSrc}
         <!-- No allow-same-origin: the page runs on an opaque origin, matching the
              server's CSP sandbox, so it cannot touch Specola's session or API. -->
         <iframe
           title={meta?.name ?? "page"}
-          {src}
+          src={src || offlineSrc}
           referrerpolicy="no-referrer"
           sandbox="allow-scripts allow-popups allow-forms allow-modals"
           class="flex-1 w-full bg-white border-0"
@@ -174,10 +270,13 @@
                   <div class="flex items-center gap-2">
                     <span class="font-medium">v{v.version}</span>
                     {#if current}<span class="text-[10px] uppercase text-amber-400/80">current</span>{/if}
-                    <span class="ml-auto text-xs text-white/40">{kb(v.sizeBytes)}</span>
+                    {#if readOffline && kept?.versions.includes(v.version)}
+                      <span class="text-[10px] uppercase text-white/40" title="Kept on this device">offline</span>
+                    {/if}
+                    {#if v.sizeBytes}<span class="ml-auto text-xs text-white/40">{kb(v.sizeBytes)}</span>{/if}
                   </div>
                   {#if v.note}<div class="text-white/80 mt-0.5 break-words">{v.note}</div>{/if}
-                  <div class="text-xs text-white/40">{fmt(v.createdAt)}</div>
+                  {#if v.createdAt}<div class="text-xs text-white/40">{fmt(v.createdAt)}</div>{/if}
                   <div class="text-xs text-white/40 truncate">
                     {v.editedBy ?? ""}{#if v.restoredFrom} · restored v{v.restoredFrom}{/if}
                   </div>
