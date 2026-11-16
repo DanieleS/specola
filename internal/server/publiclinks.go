@@ -102,7 +102,9 @@ func writePage(w http.ResponseWriter, html, ancestors string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	// External tabs must not inherit the page's opaque-origin sandbox. This
+	// does not grant same-origin access or top-level navigation to the page.
 	w.Header().Set("Content-Security-Policy",
-		"sandbox allow-scripts allow-popups allow-forms allow-modals; frame-ancestors "+ancestors)
+		"sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals; frame-ancestors "+ancestors)
 	_, _ = io.WriteString(w, withSDK(html))
 }

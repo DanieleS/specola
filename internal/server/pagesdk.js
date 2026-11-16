@@ -18,6 +18,38 @@
 // (waiting out the viewer being offline), and rejects if one was refused.
 (() => {
   if (window.specola) return;
+  // Keep document links out of the preview frame. Delegation also covers links
+  // created later by page scripts, and leaves native click/keyboard/modifier
+  // behavior (and page handlers that preventDefault) intact.
+  function externalLink(e) {
+    if (e.defaultPrevented) return;
+    const link = e.composedPath().find((n) => n instanceof Element && n.matches("a[href], area[href]"));
+    if (!link || link.hasAttribute("download")) return;
+    const href = link.getAttribute("href").trim();
+    if (!href || href.startsWith("#")) return;
+    let url;
+    try {
+      url = new URL(href, document.baseURI);
+    } catch {
+      return;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return;
+    const here = new URL(location.href);
+    here.hash = "";
+    const destination = new URL(url);
+    destination.hash = "";
+    if (destination.href === here.href) return;
+    // Override explicit _self/_parent/_top/named targets too: none should
+    // replace the published document or navigate the surrounding application.
+    link.setAttribute("target", "_blank");
+    const rel = new Set((link.getAttribute("rel") || "").split(/\s+/).filter(Boolean));
+    rel.add("noopener");
+    rel.add("noreferrer");
+    link.setAttribute("rel", [...rel].join(" "));
+  }
+  document.addEventListener("click", externalLink, true);
+  document.addEventListener("auxclick", externalLink, true);
+
   const MAX_BYTES = 1 << 20;
   const MAX_KEYS = 1000;
   const MAX_KEY_BYTES = 512;

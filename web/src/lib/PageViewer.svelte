@@ -131,7 +131,9 @@
       const f = document.createElement("iframe");
       f.title = title;
       f.referrerPolicy = "no-referrer";
-      f.setAttribute("sandbox", "allow-scripts allow-popups allow-forms allow-modals");
+      // Popups are separate, ordinary tabs; the preview itself stays opaque
+      // and cannot navigate the top-level app.
+      f.setAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals");
       f.className = "flex-1 w-full bg-white border-0";
       if (name) f.name = name;
       f.src = url;
