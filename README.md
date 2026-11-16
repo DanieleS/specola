@@ -10,6 +10,11 @@ Pages are private to their author until shared. An item you can't see answers
 
 Pages are rendered in a sandboxed iframe with an opaque origin, so a page's
 scripts can run without being able to touch Specola's session or API.
+HTTP(S) document links open in a separate tab with `noopener noreferrer`,
+including explicit targets and links created by page scripts. Local `#anchors`
+(and absolute same-document fragments), downloads and non-HTTP links keep
+native behavior. Popup tabs do not inherit the preview sandbox; the published
+page itself remains on an opaque origin and cannot navigate the surrounding app.
 
 > Status: early. Publish, browse, version with notes, view, share, public
 > links, favorites,
@@ -238,6 +243,25 @@ by `SPECOLA_TEST_DATABASE_URL`, and are skipped when it is unset:
 ```sh
 SPECOLA_TEST_DATABASE_URL="postgres://postgres:dev@localhost:5432/postgres?sslmode=disable" go test ./...
 ```
+
+## Browser regression tests
+
+With Go, Node 22+ and a **disposable local** PostgreSQL database available:
+
+```sh
+cd web
+npm ci
+npx playwright install --with-deps chromium
+SPECOLA_E2E_DATABASE_URL="postgres://postgres:***@127.0.0.1:5432/specola_e2e?sslmode=disable" npm run test:e2e
+```
+
+This builds the SPA and starts two local backends on ports 4177/4178 (same and
+separate view origins). Migrations run automatically. Tests publish and archive
+fixture pages; never point them at production. Chromium checks private iframe,
+raw and public-link navigation, dynamic/explicit-target links, keyboard and
+middle-click activation, fragment navigation, offline blob previews, opener and
+referrer isolation, and popup storage without relaxing the page's opaque origin.
+`test.yml` runs these checks and the Go tests on pull requests without deploying.
 
 ## Production (container)
 

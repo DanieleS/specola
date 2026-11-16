@@ -1,0 +1,55 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: specola
+          POSTGRES_PASSWORD: specola
+          POSTGRES_DB: specola_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U specola -d specola_e2e"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SPECOLA_TEST_DATABASE_URL: postgres://specola:specola@127.0.0.1:5432/postgres?sslmode=disable
+      SPECOLA_E2E_DATABASE_URL: postgres://specola:specola@127.0.0.1:5432/specola_e2e?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - run: npm run check
+        working-directory: web
+      - run: go test ./...
+      - run: npm run test:e2e
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          path: web/test-results/
+          retention-days: 7

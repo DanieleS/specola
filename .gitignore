@@ -11,6 +11,8 @@
 # Frontend
 web/node_modules/
 web/dist/
+web/test-results/
+web/playwright-report/
 
 # Built SPA embedded into the binary (generated at build time);
 # the committed placeholder index.html is kept.
