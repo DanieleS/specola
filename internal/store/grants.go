@@ -41,6 +41,9 @@ type GrantRequest struct {
 	AssetID string
 	// Optional note for the version the upload creates (see CleanNote).
 	Note string
+	// Bundle makes it a bundle upload grant, used through the multi-step
+	// bundle upload (see bundles.go) instead of RedeemUpload.
+	Bundle bool
 }
 
 // MintGrant checks that req.Sub may perform the upload now, then stores a new
@@ -74,10 +77,10 @@ func (s *Store) MintGrant(ctx context.Context, req GrantRequest, ttl time.Durati
 	}
 	token = base64.RawURLEncoding.EncodeToString(b)
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO asset_grant (kind, secret_hash, asset_id, folder_id, name, created_by_sub, expires_at, note)
-		VALUES ($1, $2, $3::uuid, $4::uuid, NULLIF($5, ''), $6, now() + make_interval(secs => $7), $8)
+		INSERT INTO asset_grant (kind, secret_hash, asset_id, folder_id, name, created_by_sub, expires_at, note, bundle)
+		VALUES ($1, $2, $3::uuid, $4::uuid, NULLIF($5, ''), $6, now() + make_interval(secs => $7), $8, $9)
 		RETURNING expires_at`,
-		req.Kind, hashToken(token), assetID, req.FolderID, req.Name, req.Sub, ttl.Seconds(), note).Scan(&expires)
+		req.Kind, hashToken(token), assetID, req.FolderID, req.Name, req.Sub, ttl.Seconds(), note, req.Bundle).Scan(&expires)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -87,46 +90,32 @@ func (s *Store) MintGrant(ctx context.Context, req GrantRequest, ttl time.Durati
 // RedeemUpload uses an upload grant: it creates the page or adds the version
 // as the minting user, and marks the grant consumed, all in one transaction.
 // It returns ErrNotFound for an unknown token or when the user has lost access
-// to the target (ErrForbidden if they can still see it but no longer edit), ErrGrantGone for a used or expired grant, and ErrGrantKind
-// for a grant that isn't an upload.
+// to the target (ErrForbidden if they can still see it but no longer edit),
+// ErrGrantGone for a used or expired grant, and ErrGrantKind for a grant that
+// isn't a plain upload.
 func (s *Store) RedeemUpload(ctx context.Context, token, html string) (id string, version int, err error) {
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		var (
-			grantID, kind, sub string
-			assetID, folderID  *string
-			name, note         *string
-			gone               bool
-		)
-		err := tx.QueryRow(ctx, `
-			SELECT id::text, kind::text, asset_id::text, folder_id::text, name, created_by_sub, note,
-			       consumed_at IS NOT NULL OR expires_at <= now()
-			FROM asset_grant
-			WHERE secret_hash = $1
-			FOR UPDATE`, hashToken(token)).
-			Scan(&grantID, &kind, &assetID, &folderID, &name, &sub, &note, &gone)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
+		g, err := openGrant(ctx, tx, token, true)
 		if err != nil {
 			return err
 		}
-		if gone {
-			return ErrGrantGone
+		// A bundle grant is redeemed through the bundle upload steps.
+		if g.bundle {
+			return ErrGrantKind
 		}
-
 		switch {
-		case kind == GrantUploadNew && name != nil:
-			id, version, err = createPage(ctx, tx, folderID, *name, html, note, sub)
-		case kind == GrantUploadVersion && assetID != nil:
-			id = *assetID
-			version, err = addVersion(ctx, tx, id, html, note, sub, nil)
+		case g.kind == GrantUploadNew && g.name != nil:
+			id, version, err = createPage(ctx, tx, g.folderID, *g.name, html, g.note, g.sub)
+		case g.kind == GrantUploadVersion && g.assetID != nil:
+			id = *g.assetID
+			version, err = addVersion(ctx, tx, id, html, g.note, g.sub, nil)
 		default:
 			return ErrGrantKind
 		}
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE asset_grant SET consumed_at = now() WHERE id = $1::uuid`, grantID)
+		_, err = tx.Exec(ctx, `UPDATE asset_grant SET consumed_at = now() WHERE id = $1::uuid`, g.id)
 		return err
 	})
 	if err != nil {

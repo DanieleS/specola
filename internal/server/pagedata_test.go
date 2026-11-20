@@ -118,19 +118,33 @@ func TestPageDataQuota(t *testing.T) {
 }
 
 func TestWithSDK(t *testing.T) {
+	boot := bootData{Base: "https://v.test/b/k/", Basename: "/view/x"}
+	tag := sdkTag(boot)
 	for in, want := range map[string]string{
-		"<p>hi</p>":                       sdkTag + "<p>hi</p>",
-		"<!DOCTYPE html><html>":           "<!DOCTYPE html>" + sdkTag + "<html>",
-		"\n  <!doctype html>\n<html>":     "\n  <!doctype html>" + sdkTag + "\n<html>",
-		"\uFEFF<!doctype html><p>x</p>":   "\uFEFF<!doctype html>" + sdkTag + "<p>x</p>",
-		"<html><!doctype html>":           sdkTag + "<html><!doctype html>",
-		"<!-- c --><!doctype html><html>": "<!-- c --><!doctype html>" + sdkTag + "<html>",
+		"<p>hi</p>":                       tag + "<p>hi</p>",
+		"<!DOCTYPE html><html>":           "<!DOCTYPE html>" + tag + "<html>",
+		"\n  <!doctype html>\n<html>":     "\n  <!doctype html>" + tag + "\n<html>",
+		"\uFEFF<!doctype html><p>x</p>":   "\uFEFF<!doctype html>" + tag + "<p>x</p>",
+		"<html><!doctype html>":           tag + "<html><!doctype html>",
+		"<!-- c --><!doctype html><html>": "<!-- c --><!doctype html>" + tag + "<html>",
 	} {
-		if got := withSDK(in); got != want {
+		if got := withSDK(in, boot); got != want {
 			t.Errorf("withSDK(%q) = %q", in, got)
 		}
 	}
-	if strings.Contains(sdkTag, "\n//") || !strings.HasPrefix(sdkTag, "<script>(() => {") {
-		t.Fatalf("sdkTag not stripped of comments: %.80q", sdkTag)
+	if strings.Contains(tag, "\n//") || !strings.HasPrefix(tag, "<script>((boot) => {") {
+		t.Fatalf("sdkTag not stripped of comments: %.80q", tag)
 	}
+	if !strings.HasSuffix(tag, `})({"base":"https://v.test/b/k/","basename":"/view/x"});`+"\n</script>") {
+		t.Fatalf("sdkTag doesn't end with the boot data: %q", tag[len(tag)-120:])
+	}
+	// Boot data can't close the script.
+	if tag := sdkTag(bootData{Basename: "/s/</script><b>"}); strings.Count(tag, "</script>") != 1 {
+		t.Fatalf("boot data closes the script: %q", tag[len(tag)-80:])
+	}
+}
+
+// served is html as a page is served under basename, plain (not a bundle).
+func served(html, basename string) string {
+	return withSDK(html, bootData{Basename: basename})
 }

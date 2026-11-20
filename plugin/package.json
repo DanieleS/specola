@@ -1,0 +1,40 @@
+{
+  "name": "@specola/vite-plugin",
+  "version": "1.0.0",
+  "description": "Build a Vite app as a Specola bundle and publish it with specola-publish",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./client": {
+      "types": "./client.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./index.d.ts",
+  "bin": {
+    "specola-publish": "bin/specola-publish.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "client.d.ts",
+    "lib/",
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "vite": ">=5"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "vite": "^8.3.8"
+  }
+}

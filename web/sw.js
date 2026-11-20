@@ -8,7 +8,8 @@
 //   from the cache is marked with OFFLINE_HEADER so the app can tell.
 // - Rendered pages (/view, and public links at /s) are left alone: the app stores the pages it keeps
 //   for offline itself (src/lib/offline.svelte.ts), since they may come from
-//   another origin and are shown in a sandboxed frame.
+//   another origin and are shown in a sandboxed frame. So are bundle files
+//   (/b) and the Vite plugin's package (/tools), which aren't the shell.
 
 /* global VERSION, PRECACHE */
 const SHELL = `specola-shell-${VERSION}`;
@@ -52,7 +53,7 @@ self.addEventListener("fetch", (e) => {
     return;
   }
   if (req.mode === "navigate") {
-    if (/^\/(view|s|auth|mcp|upload|healthz|\.well-known)(\/|$)/.test(p)) return;
+    if (/^\/(view|s|b|tools|auth|mcp|upload|healthz|\.well-known)(\/|$)/.test(p)) return;
     e.respondWith(shell(req));
     return;
   }
@@ -63,7 +64,8 @@ self.addEventListener("fetch", (e) => {
 async function shell(req) {
   try {
     const res = await fetch(req);
-    if (res.ok) {
+    // Only the shell itself, never another document a navigation reached.
+    if (res.ok && (res.headers.get("Content-Type") ?? "").startsWith("text/html")) {
       const c = await caches.open(SHELL);
       await c.put("/", res.clone());
     }

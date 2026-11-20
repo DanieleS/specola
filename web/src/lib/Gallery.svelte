@@ -38,6 +38,7 @@
 
 <script lang="ts">
   import { api, type SearchResult, type TreeItem } from "./api";
+  import ConventionsDialog from "./ConventionsDialog.svelte";
   import MoveDialog from "./MoveDialog.svelte";
   import * as offline from "./offline.svelte";
   import ShareDialog from "./ShareDialog.svelte";
@@ -50,6 +51,7 @@
   let error = $state("");
   let sharing = $state<{ kind: "folder" | "page"; id: string; name: string; version?: number } | null>(null);
   let moving = $state<TreeItem | null>(null);
+  let conventionsFor = $state<{ id: string; name: string } | null>(null);
   let menuFor = $state<string | null>(null);
 
   let here = $derived(stack[stack.length - 1]);
@@ -198,7 +200,7 @@
       .filter(Boolean)
       .join(" · ");
   const tabClass = (t: Tab) =>
-    "px-3 py-1.5 rounded-md " + (tab === t ? "bg-white/10 text-white" : "text-white/50 hover:text-white/80");
+    "px-3 py-1.5 rounded-md whitespace-nowrap " + (tab === t ? "bg-white/10 text-white" : "text-white/50 hover:text-white/80");
   const btn = "text-sm px-3 py-1.5 rounded-md border border-white/15 hover:bg-white/5";
   const menuItem = "block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10";
 </script>
@@ -207,7 +209,7 @@
 
 <div class="max-w-5xl mx-auto px-5 py-6">
   <div class="flex flex-wrap items-center justify-between gap-3 text-sm mb-4">
-    <div class="flex gap-1">
+    <div class="flex gap-1 max-w-full overflow-x-auto">
       <button class={tabClass("mine")} onclick={() => switchTab("mine")}>My pages</button>
       <button class={tabClass("favorites")} onclick={() => switchTab("favorites")}>Favorites</button>
       <button class={tabClass("shared")} onclick={() => switchTab("shared")}>Shared with me</button>
@@ -259,17 +261,22 @@
       </ul>
     {/if}
   {:else}
-    <div class="flex items-center justify-between gap-3 mb-5">
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-5">
       <nav class="flex items-center gap-1 text-sm text-white/60 min-w-0">
         {#each stack as c, i}
           {#if i > 0}<span class="text-white/25">/</span>{/if}
           <button class="hover:text-white/90 truncate" onclick={() => goTo(i)}>{c.name}</button>
         {/each}
       </nav>
-      <div class="flex gap-2 shrink-0">
-        {#if here.id !== null && here.role === "owner"}
+      <div class="flex flex-wrap gap-2">
+        {#if here.id !== null && here.role === "owner" && offline.net.online}
           <button class={btn} onclick={() => here.id && (sharing = { kind: "folder", id: here.id, name: here.name })}
             >Share</button
+          >
+          <button
+            class={btn}
+            title="What agents should use when they publish in this folder"
+            onclick={() => here.id && (conventionsFor = { id: here.id, name: here.name })}>Conventions</button
           >
         {/if}
         {#if canEdit}
@@ -309,7 +316,28 @@
               onclick={() => open(it)}
             >
               <div class="flex items-start justify-between mb-2">
-                <span class="text-2xl">{it.kind === "folder" ? "📁" : "📄"}</span>
+                <span class="flex items-center gap-1.5">
+                  <span class="text-2xl">{it.kind === "folder" ? "📁" : "📄"}</span>
+                  {#if it.conventions}
+                    <span class="text-amber-400/80" title="Has conventions for agents">
+                      <svg
+                        class="w-3.5 h-3.5"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        role="img"
+                        aria-label="Has conventions for agents"
+                        ><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12" /><circle cx="16" cy="6" r="2" /><circle
+                          cx="10"
+                          cy="12"
+                          r="2"
+                        /><circle cx="18" cy="18" r="2" /></svg
+                      >
+                    </span>
+                  {/if}
+                </span>
                 {#if it.role !== "owner"}
                   <span class="text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
                     >{it.role}</span
@@ -384,6 +412,16 @@
                         sharing = { kind: it.kind, id: it.id, name: it.name, version: it.version };
                       }}>Share…</button
                     >
+                    {#if it.kind === "folder"}
+                      <button
+                        role="menuitem"
+                        class={menuItem}
+                        onclick={() => {
+                          menuFor = null;
+                          conventionsFor = { id: it.id, name: it.name };
+                        }}>Conventions…</button
+                      >
+                    {/if}
                     <button role="menuitem" class={menuItem + " text-red-300"} onclick={() => archive(it)}>Archive</button>
                   {/if}
                 </div>
@@ -404,6 +442,17 @@
     version={sharing.version}
     onclose={(changed) => {
       sharing = null;
+      if (changed) reload();
+    }}
+  />
+{/if}
+
+{#if conventionsFor}
+  <ConventionsDialog
+    id={conventionsFor.id}
+    name={conventionsFor.name}
+    onclose={(changed) => {
+      conventionsFor = null;
       if (changed) reload();
     }}
   />

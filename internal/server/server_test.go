@@ -125,7 +125,7 @@ func TestPagesArePrivateToTheirAuthor(t *testing.T) {
 	}
 
 	// Bob's attempt left the page untouched.
-	if _, body := call(t, ts, alice, "GET", "/view/"+page.ID, ""); body != withSDK("<p>secret</p>") {
+	if _, body := call(t, ts, alice, "GET", "/view/"+page.ID, ""); body != served("<p>secret</p>", "/view/"+page.ID) {
 		t.Fatalf("page content changed: %q", body)
 	}
 }

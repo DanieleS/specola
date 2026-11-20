@@ -146,43 +146,44 @@ func (s *Store) RevokePublicLink(ctx context.Context, sub, assetID, linkID strin
 	return err
 }
 
-// OpenPublicLink returns the HTML a public link shows, and counts the view.
+// OpenPublicLink returns the HTML a public link shows, with its bundle key
+// ("" for a plain page), and counts the view.
 // It returns ErrNotFound for an unknown or revoked token, or when the page is
 // archived or its creator no longer owns it, and ErrLinkExpired for an
 // expired link.
-func (s *Store) OpenPublicLink(ctx context.Context, token string) (string, error) {
+func (s *Store) OpenPublicLink(ctx context.Context, token string) (html, bundleKey string, err error) {
 	var (
 		linkID, assetID string
 		version         int
 		expired, owner  bool
 	)
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		SELECT l.id::text, l.asset_id::text, COALESCE(l.version, a.current_version),
 		       l.expires_at IS NOT NULL AND l.expires_at <= now(),
 		       asset_access(l.created_by_sub, a.id) = 3
 		FROM public_link l JOIN asset a ON a.id = l.asset_id
 		WHERE l.secret_hash = $1`, hashToken(token)).Scan(&linkID, &assetID, &version, &expired, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound
+		return "", "", ErrNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if !owner {
-		return "", ErrNotFound
+		return "", "", ErrNotFound
 	}
 	if expired {
-		return "", ErrLinkExpired
+		return "", "", ErrLinkExpired
 	}
-	html, err := versionContent(ctx, s.pool, assetID, version)
+	html, bundleKey, err = versionContent(ctx, s.pool, assetID, version)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE public_link SET views = views + 1, last_used_at = now() WHERE id = $1::uuid`, linkID); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return html, nil
+	return html, bundleKey, nil
 }
 
 // hasPublicLinks is the SQL for "page a has a public link that hasn't

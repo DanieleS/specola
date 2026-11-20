@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api } from "./api";
+  import { api, type BundleUpload } from "./api";
 
   let { folderId = null }: { folderId?: string | null } = $props();
 
@@ -8,6 +8,43 @@
   let note = $state("");
   let busy = $state(false);
   let error = $state("");
+
+  // An app with a build step is published as a bundle from its project,
+  // with the Vite plugin: this gets the commands to run there.
+  // The link is made for the title, folder and note given when it was asked
+  // for: once they change, its commands are no longer shown.
+  let upload = $state<(BundleUpload & { for: string }) | null>(null);
+  let uploadFor = $derived(JSON.stringify([name.trim(), folderId, note]));
+  let shownUpload = $derived(upload?.for === uploadFor ? upload : null);
+  let uploading = $state(false);
+  let copied = $state("");
+
+  async function bundleUpload() {
+    error = "";
+    if (!name.trim()) {
+      error = "Give the page a title first.";
+      return;
+    }
+    uploading = true;
+    try {
+      const what = uploadFor;
+      upload = { ...(await api.bundleUpload({ kind: "new", title: name.trim(), folderId, note })), for: what };
+    } catch (err) {
+      error = String(err);
+    } finally {
+      uploading = false;
+    }
+  }
+
+  async function copy(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = text;
+      setTimeout(() => (copied = ""), 1500);
+    } catch {
+      prompt("Copy this command", text);
+    }
+  }
 
   async function submit(e: Event) {
     e.preventDefault();
@@ -24,6 +61,15 @@
   }
 </script>
 
+{#snippet command(text: string)}
+  <div class="flex items-start gap-2 mt-1">
+    <code class="flex-1 min-w-0 break-all font-mono text-xs text-white/80 bg-black/30 rounded px-2 py-1.5">{text}</code>
+    <button type="button" class="text-xs text-white/50 hover:text-white/90 py-1.5" onclick={() => copy(text)}
+      >{copied === text ? "Copied" : "Copy"}</button
+    >
+  </div>
+{/snippet}
+
 <div class="max-w-3xl mx-auto px-5 py-6">
   <h1 class="text-xl font-semibold mb-1">New page</h1>
   <p class="text-sm text-white/40 mb-5">
@@ -39,6 +85,24 @@
         placeholder="How attention works"
         class="w-full px-3 py-2 rounded-md bg-white/5 border border-white/15 focus:border-amber-400 outline-none"
       />
+    </div>
+    <div class="text-sm text-white/50 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2.5">
+      <p>
+        An app with a build step (React, Svelte, Vue, several files) is published from its project with the
+        Specola Vite plugin, as a bundle.
+        <button type="button" disabled={uploading} onclick={bundleUpload} class="text-amber-400 hover:text-amber-300 disabled:opacity-50"
+          >{uploading ? "Getting a link…" : "Get the commands"}</button
+        >
+      </p>
+      {#if shownUpload}
+        <p class="mt-2">In the project, once:</p>
+        {@render command(shownUpload.pluginInstall)}
+        <p class="mt-2">
+          then add <code class="text-white/70">specola()</code> to the plugins in vite.config and publish (the link works for 30 minutes,
+          once):
+        </p>
+        {@render command(shownUpload.command)}
+      {/if}
     </div>
     <div>
       <label for="html" class="block text-sm text-white/60 mb-1">HTML</label>

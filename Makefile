@@ -1,4 +1,4 @@
-.PHONY: dev web build run test tidy image
+.PHONY: dev web build run test e2e tidy image
 
 # Run the backend with the dev auth bypass (no OIDC). Expects SPECOLA_DATABASE_URL.
 dev:
@@ -17,6 +17,10 @@ build:
 # and are skipped when it is unset.
 test:
 	go test ./...
+
+# Publishes a real SPA bundle and checks it in Chromium (see e2e/README.md).
+e2e:
+	node e2e/bundles.mjs
 
 tidy:
 	go mod tidy

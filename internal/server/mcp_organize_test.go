@@ -29,7 +29,7 @@ func TestMCPToolAnnotations(t *testing.T) {
 			t.Errorf("%s: readOnlyHint = %v, want %v", tool.Name, got, readOnly[tool.Name])
 		}
 	}
-	for _, want := range []string{"create_folder", "rename", "move", "archive", "unarchive", "list_versions", "create_public_link", "list_public_links", "revoke_public_link"} {
+	for _, want := range []string{"create_folder", "rename", "move", "archive", "unarchive", "list_versions", "create_public_link", "list_public_links", "revoke_public_link", "create_bundle_upload"} {
 		if !seen[want] {
 			t.Errorf("tool %s missing", want)
 		}
@@ -196,7 +196,7 @@ func TestMCPPublicLinks(t *testing.T) {
 		t.Fatalf("create_public_link = %+v", link)
 	}
 	path := strings.TrimPrefix(link.URL, "http://specola.test")
-	if res := get(t, ts, "", path, nil); res.StatusCode != http.StatusOK || readBody(t, res) != withSDK("<p>deck</p>") {
+	if res := get(t, ts, "", path, nil); res.StatusCode != http.StatusOK || readBody(t, res) != served("<p>deck</p>", path) {
 		t.Fatalf("open: %d", res.StatusCode)
 	}
 

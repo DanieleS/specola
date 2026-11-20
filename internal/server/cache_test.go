@@ -31,13 +31,22 @@ func TestViewCaching(t *testing.T) {
 		t.Fatalf("revalidate unchanged: %d, want 304", res.StatusCode)
 	}
 
+	// A path below the page is served the same page, revalidated the same way.
+	deep := get(t, ts, "", "/view/"+id+"/a/b", alice)
+	if deep.StatusCode != http.StatusOK || deep.Header.Get("ETag") != etag || readBody(t, deep) != served("<p>v1</p>", "/view/"+id) {
+		t.Fatalf("deep path: %d, ETag %q (want %q)", deep.StatusCode, deep.Header.Get("ETag"), etag)
+	}
+	if res := get(t, ts, "", "/view/"+id+"/a/b", revalidate); res.StatusCode != http.StatusNotModified {
+		t.Fatalf("revalidate deep path: %d, want 304", res.StatusCode)
+	}
+
 	// A new version changes the tag, so the same request now gets the page.
 	call(t, ts, "alice", "POST", "/api/pages/"+id+"/versions", `{"html":"<p>v2</p>"}`)
 	res = get(t, ts, "", "/view/"+id, revalidate)
 	if res.StatusCode != http.StatusOK || res.Header.Get("ETag") == etag {
 		t.Fatalf("after v2: %d, ETag %q (was %q)", res.StatusCode, res.Header.Get("ETag"), etag)
 	}
-	if got := readBody(t, res); got != withSDK("<p>v2</p>") {
+	if got := readBody(t, res); got != served("<p>v2</p>", "/view/"+id) {
 		t.Fatalf("after v2: body %q", got)
 	}
 
@@ -92,7 +101,7 @@ func TestPagesAreCompressed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(plain) != withSDK(html) {
+	if string(plain) != served(html, "/view/"+id) {
 		t.Fatalf("decompressed body differs: %d bytes, want %d", len(plain), len(html))
 	}
 	// The sandbox must survive compression.

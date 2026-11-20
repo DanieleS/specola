@@ -52,7 +52,7 @@ func TestPublicLinks(t *testing.T) {
 
 	t.Run("anyone with the link sees the page, sandboxed", func(t *testing.T) {
 		code, body, h := open(currentPath)
-		if code != http.StatusOK || body != withSDK("<p>v2</p>") {
+		if code != http.StatusOK || body != served("<p>v2</p>", currentPath) {
 			t.Fatalf("open: %d %q", code, body)
 		}
 		csp := h.Get("Content-Security-Policy")
@@ -64,14 +64,14 @@ func TestPublicLinks(t *testing.T) {
 				t.Fatalf("%s = %q, want %q", k, h.Get(k), want)
 			}
 		}
-		if _, body, _ := open(pinnedPath); body != withSDK("<p>v1</p>") {
+		if _, body, _ := open(pinnedPath); body != served("<p>v1</p>", pinnedPath) {
 			t.Fatalf("pinned: %q", body)
 		}
 		expect(alice, "POST", "/api/pages/"+id+"/versions", `{"html":"<p>v3</p>"}`, http.StatusCreated)
-		if _, body, _ := open(currentPath); body != withSDK("<p>v3</p>") {
+		if _, body, _ := open(currentPath); body != served("<p>v3</p>", currentPath) {
 			t.Fatalf("after a new version: %q", body)
 		}
-		if _, body, _ := open(pinnedPath); body != withSDK("<p>v1</p>") {
+		if _, body, _ := open(pinnedPath); body != served("<p>v1</p>", pinnedPath) {
 			t.Fatalf("pinned after a new version: %q", body)
 		}
 		for _, p := range []string{"/s/nope", "/s/" + strings.Repeat("A", 43)} {
@@ -171,7 +171,7 @@ func TestPublicLinksOnViewOrigin(t *testing.T) {
 	}
 
 	res := get(t, ts, "view.specola.test", u.Path, nil)
-	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != withSDK("<p>hi</p>") {
+	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != served("<p>hi</p>", u.Path) {
 		t.Fatalf("view origin: %d %q", res.StatusCode, b)
 	}
 	if acao := res.Header.Get("Access-Control-Allow-Origin"); acao != "" {

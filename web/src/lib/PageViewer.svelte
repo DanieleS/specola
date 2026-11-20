@@ -26,6 +26,8 @@
   );
   let src = $derived(meta && shown && !readOffline ? withVersion(meta.viewUrl, shown) : "");
   let offlineSrc = $state("");
+  // The kept bundle's files for the page in offlineSrc, if it is one.
+  let offlineFiles: offline.BundleFile[] | undefined;
   let missing = $state(false);
   let saving = $state(false);
   let host = $state<HTMLDivElement>();
@@ -37,6 +39,10 @@
     return u.toString();
   }
   let canEdit = $derived(meta?.role === "owner" || meta?.role === "editor");
+  let shownBundle = $derived(
+    versions.find((x) => x.version === shown)?.bundle ??
+      (shown === meta?.version ? !!meta?.bundle : !!shown && offline.isBundle(id, shown)),
+  );
 
   function load() {
     api
@@ -60,6 +66,7 @@
       version: k.versions.at(-1)!,
       updatedAt: k.updatedAt,
       role: k.role,
+      bundle: offline.isBundle(k.id, k.versions.at(-1)!),
       shared: false,
       favorite: false,
       public: false,
@@ -95,7 +102,9 @@
     untrack(() => offline.keep(m, v)).catch((e) => console.warn("keep offline:", e));
   });
 
-  // Offline, show the kept copy from a blob URL in the same sandbox.
+  // Offline, show the kept copy from a blob URL in the same sandbox. A
+  // bundle runs from its kept files, which the frame's SDK gets over the
+  // port; one not kept whole is reported missing rather than shown broken.
   $effect(() => {
     const v = shown;
     offlineSrc = "";
@@ -103,10 +112,16 @@
     if (!readOffline || !v) return;
     let url = "";
     let live = true;
-    offline.html(id, v).then((h) => {
+    const bundle = offline.isBundle(id, v) ? offline.bundle(id, v) : Promise.resolve(null);
+    Promise.all([offline.html(id, v), bundle]).then(([h, b]) => {
       if (!live) return;
-      if (h === null) missing = true;
-      else offlineSrc = url = URL.createObjectURL(new Blob([h], { type: "text/html" }));
+      if (h === null || (offline.isBundle(id, v) && !b)) {
+        missing = true;
+        return;
+      }
+      offlineFiles = b?.files;
+      if (b) h = offline.offlineBundleHTML(h, b.base);
+      offlineSrc = url = URL.createObjectURL(new Blob([h], { type: "text/html" }));
     });
     return () => {
       live = false;
@@ -122,6 +137,7 @@
     const url = src || offlineSrc;
     if (!h || !url) return;
     const title = untrack(() => meta?.name ?? "page");
+    const files = src ? undefined : offlineFiles;
     let live = true;
     let stop = () => {};
     storageName(id).then((name) => {
@@ -136,7 +152,7 @@
       if (name) f.name = name;
       f.src = url;
       h.replaceChildren(f);
-      if (name) stop = serveStorage(f, id);
+      if (name || files) stop = serveStorage(f, id, !!name, files);
     });
     return () => {
       live = false;
@@ -204,32 +220,43 @@
 </script>
 
 <div class="flex flex-col h-[calc(100vh-3.5rem)]">
-  <div class="flex items-center justify-between gap-3 px-5 h-12 border-b border-white/10 shrink-0">
-    <div class="flex items-center gap-3 min-w-0">
-      <a href="#/" class="text-white/50 hover:text-white/90" aria-label="Back to gallery">←</a>
-      <span class="font-medium truncate">{meta?.name ?? "…"}</span>
+  <!-- One row from sm up; below it, the title row and the actions wrap, so
+       nothing sticks out or overlaps at phone width. -->
+  <div
+    data-viewer-header
+    class="flex flex-wrap sm:flex-nowrap items-center justify-between gap-x-3 gap-y-1 px-3 sm:px-5 py-2 sm:py-0 sm:h-12 border-b border-white/10 shrink-0"
+  >
+    <div class="flex items-center gap-2 sm:gap-3 min-w-0 w-full sm:w-auto">
+      <a href="#/" class="shrink-0 text-white/50 hover:text-white/90" aria-label="Back to gallery">←</a>
+      <span class="font-medium truncate min-w-0">{meta?.name ?? "…"}</span>
       {#if meta && !readOffline}
         <button
-          class={meta.favorite ? "text-amber-400" : "text-white/30 hover:text-amber-300"}
+          class="shrink-0 {meta.favorite ? 'text-amber-400' : 'text-white/30 hover:text-amber-300'}"
           aria-label={meta.favorite ? "Remove from favorites" : "Add to favorites"}
           aria-pressed={meta.favorite}
           onclick={toggleFavorite}>{meta.favorite ? "★" : "☆"}</button
         >
       {/if}
-      {#if meta}<span class="text-xs text-white/40">v{shown}</span>{/if}
+      {#if meta}<span class="shrink-0 text-xs text-white/40">v{shown}</span>{/if}
+      {#if shownBundle}
+        <span
+          class="shrink-0 text-[10px] uppercase tracking-wide text-sky-300/80 border border-sky-300/30 rounded px-1.5 py-0.5"
+          title="An app published with the Specola Vite plugin, made of several files">bundle</span
+        >
+      {/if}
       {#if readOffline}
         <span
-          class="text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
+          class="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
           title="The copy kept on this device">offline copy</span
         >
       {/if}
       {#if meta && meta.role !== "owner"}
-        <span class="text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
+        <span class="shrink-0 text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
           >{meta.role}</span
         >
       {/if}
     </div>
-    <div class="flex items-center gap-4 shrink-0">
+    <div class="flex flex-wrap items-center gap-x-3 sm:gap-x-4 gap-y-1 sm:shrink-0">
       {#if offline.supported && meta && (!readOffline || kept?.pinned)}
         <button
           class={action}
@@ -272,16 +299,23 @@
   {#if error}
     <p class="p-5 text-red-400">{error}</p>
   {:else}
-    <div class="flex flex-1 min-h-0">
+    <div class="relative flex flex-1 min-h-0">
       {#if missing}
-        <p class="flex-1 p-5 text-white/50">Version {shown} isn't kept on this device. It can be opened when you're back online.</p>
+        <p class="flex-1 p-5 text-white/50">
+          Version {shown} isn't {shownBundle ? "available offline" : "kept on this device"}. It can be opened when you're back
+          online.
+        </p>
       {:else if src || offlineSrc}
         <!-- The sandboxed frame showing the page goes here; see above. -->
         <div bind:this={host} class="flex flex-1 min-w-0"></div>
       {/if}
 
       {#if historyOpen}
-        <aside class="w-72 shrink-0 border-l border-white/10 overflow-y-auto" aria-label="Version history">
+        <!-- Beside the page from sm up; over it, at the right, below. -->
+        <aside
+          class="absolute inset-y-0 right-0 z-10 w-72 max-w-full bg-[#0b0d12] shadow-xl sm:static sm:shadow-none shrink-0 border-l border-white/10 overflow-y-auto"
+          aria-label="Version history"
+        >
           <h2 class="px-4 pt-4 pb-2 text-sm font-semibold">History</h2>
           <ul>
             {#each versions as v (v.version)}
@@ -296,6 +330,7 @@
                   <div class="flex items-center gap-2">
                     <span class="font-medium">v{v.version}</span>
                     {#if current}<span class="text-[10px] uppercase text-amber-400/80">current</span>{/if}
+                    {#if v.bundle}<span class="text-[10px] uppercase text-sky-300/70">bundle</span>{/if}
                     {#if readOffline && kept?.versions.includes(v.version)}
                       <span class="text-[10px] uppercase text-white/40" title="Kept on this device">offline</span>
                     {/if}
