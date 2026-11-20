@@ -1,8 +1,8 @@
 # SPA bundles — design and contract
 
 Status: being implemented on branch `ccr-c6bf3320-7faeji`. Server, plugin,
-CLI, MCP, routing and the SDK are done and checked end to end in Chromium
-(`e2e/bundles.mjs`); offline viewing of bundles in the SPA is not done yet.
+CLI, MCP, routing, the SDK, the SPA (badges, publish hint) and offline
+viewing are done and checked end to end in Chromium (`e2e/bundles.mjs`).
 
 A **bundle** is a page whose current (or any) version is a multi-file build of a
 single-page app (typically Vite), instead of one self-contained HTML document.
@@ -158,8 +158,13 @@ can still see the page but no longer edit it).
 - `POST /api/bundle-uploads` (signed in) with
   `{"kind":"new"|"version","title","folderId","id","note"}` (`title` required
   for `new`, `id` for `version`) mints a bundle upload grant, valid 30 minutes,
-  and answers `201 {"uploadUrl","expiresAt","command"}` where `command` is
-  `npx specola-publish --upload '<uploadUrl>'`.
+  and answers `201 {"uploadUrl","expiresAt","command","pluginInstall"}` where `command` is
+  `npx specola-publish --upload '<uploadUrl>'` and `pluginInstall` the
+  `npm i -D <tarball URL>` of this instance. The new-page form uses it: a
+  short hint says apps with a build step are published with the plugin, and a
+  button mints a link for the title and folder being filled in and shows both
+  commands to copy. (The viewer has no "new version" action, so there is none
+  for bundles either.)
 - `GET /api/pages/{id}/versions/{v}/files` (viewer access) →
   `{"bundle":bool,"base":"{assetOrigin}/b/{key}/","files":[{"path","size","contentType","sha256"}]}`,
   files sorted by path, **excluding `index.html`** (which is the version's
@@ -339,19 +344,66 @@ print the JSON result on stdout (progress on stderr). Clear errors.
 ## Offline
 
 Pinning or opening a bundle version keeps `index.html` and **all** its files
-in Cache Storage (list from `GET /api/pages/{id}/versions/{v}/files`). Offline,
-the viewer renders the kept index from a `blob:` URL and hands the files to the
-SDK over the existing `MessagePort`; the SDK, inside the page's origin:
+in Cache Storage (list from `GET /api/pages/{id}/versions/{v}/files`, files
+fetched from their `/b/` URLs, 6 at a time; a file another kept version of
+the page has, by sha256, is copied instead). Keys are per version, under its
+HTML's key: `/__offline/pages/{id}/{v}` (HTML), `…/{v}/files` (the list),
+`…/{v}/file/{path}`. The HTML is stored last, and only then is the version
+recorded as kept (`bundles` in the localStorage index lists the versions kept
+as bundles), so a half-kept bundle is never taken for a kept one; a failed
+download deletes what it stored. Removing a page or a stale version deletes
+its files too. Each kept version's size, files included, is recorded, and
+recent (unpinned) pages are evicted beyond 30 pages **or** 256 MiB together,
+oldest first, but never the most recent one.
 
-1. makes `blob:` URLs for leaf files (non-JS);
-2. rewrites CSS `url(...)` and relative JS module specifiers (`"./x.js"`,
-   `"../x.js"` to known bundle files) to absolute `{base}path` URLs (a module
-   from `blob:` can't resolve relative specifiers), then makes `blob:` URLs for
-   them;
+A bundle's HTML is fetched for keeping with `cache: "no-cache"`: a numbered
+version is cached by the browser for a year with the SDK it was first served
+with, and running offline needs the current SDK.
+
+Offline, the viewer renders the kept index from a `blob:` URL and hands the
+files to the SDK over the existing `MessagePort`:
+
+- the viewer first makes the index's module scripts inert (`type="specola-module"`)
+  and moves every `src`/`href` that starts with the bundle's base to
+  `data-specola-src`/`data-specola-href` (so nothing is fetched, and no module
+  starts before the import map);
+- the SDK knows it is offline when it has a base and its document is a
+  `blob:` URL; its hello then carries `files: true` (sent whether or not
+  localStorage is persistent), and the viewer answers with the port, then
+  `{op:"files", files:[{path, type, blob}]}` on it.
+
+The SDK, inside the page's origin:
+
+1. makes `blob:` URLs for leaf files (non-JS, non-CSS);
+2. rewrites CSS `url(...)` to those `blob:` URLs, and in JS every quoted
+   path-like string that resolves, against the module's own `{base}path`, to a
+   bundle file: to the absolute `{base}path` for a JS file (a module from
+   `blob:` can't resolve relative specifiers; this covers static and dynamic
+   imports and `new URL("x.js", import.meta.url)` for workers), to the file's
+   `blob:` URL otherwise; `import.meta.url` becomes the module's `{base}path`.
+   Then it makes `blob:` URLs for them (leaves, then CSS, then JS);
 3. installs an import map from every `{base}path.js` to its `blob:` URL (this
-   handles import cycles), maps `specola.base` lookups, and patches `fetch` /
-   `XMLHttpRequest` for known bundle URLs;
-4. then loads the entry module(s) that the viewer removed from the index.
+   handles import cycles), and maps the files' absolute URLs (`specola.base`
+   lookups included) in `fetch` and `XMLHttpRequest` (to the file as
+   published, GET/HEAD only), the `src`/`href` setters of `img`, `script`,
+   `link`, `source`, `audio`/`video` and `setAttribute`, and the Worker
+   wrapper (a bundle worker runs its rewritten script, behind a prelude that
+   maps `fetch` and `importScripts` in the worker the same way);
+4. then restores the `data-specola-*` references and loads the entry module(s)
+   in order.
 
-If any of this proves impossible in a browser, a bundle that isn't fully
-available is reported as "not available offline" rather than shown broken.
+A bundle that isn't kept whole (a file missing from the cache) is reported as
+"not available offline" rather than shown broken. A plain page offline works
+exactly as before.
+
+Known limits offline:
+
+- The document is a `blob:` URL: `history.pushState` to a path throws a
+  `SecurityError` (verified in Chromium) and `location.pathname` is not under
+  `specola.basename`, so an app routing by path (`<BrowserRouter>`) doesn't
+  route offline; a hash router works.
+- References the rewriting can't see stay as they are and fail: a path built
+  at run time other than from `specola.base` (or `import.meta.url`), or given
+  to something other than the APIs above (say, CSS `@import` of another CSS
+  file, or `srcset`).
+- Range requests aren't emulated.

@@ -15,6 +15,8 @@
 //
 // - new Worker(url) works for http(s) URLs, which an opaque origin can't start
 //   a worker from: see the Worker wrapper below.
+// - Offline, a bundle the viewer kept runs from the files it hands over: see
+//   "Offline bundles" below.
 //
 // window.specola.persistent says whether localStorage reaches the server;
 // await window.specola.flush() resolves once every write so far is saved
@@ -165,11 +167,18 @@
     ws.forEach((w) => (err ? w.reject(err) : w.resolve()));
   }
 
-  if (persistent) {
+  // Offline, the viewer shows a kept bundle from a blob: URL and hands its
+  // files over the port (see "Offline bundles" below), so the page asks for
+  // them in its hello whether or not localStorage reaches the server.
+  const offline = !!boot.base && location.protocol === "blob:";
+
+  if (persistent || offline) {
     addEventListener("message", function hello(e) {
       if (e.source !== window.parent || !e.data || typeof e.data.specola !== "string") return;
       removeEventListener("message", hello);
       if (e.data.specola !== "port" || !e.ports[0]) {
+        if (offline) console.error("specola: this bundle's files weren't handed over:", e.data.error);
+        if (!persistent) return;
         persistent = false;
         pending = null;
         console.warn("specola: localStorage is kept in memory only:", e.data.error);
@@ -177,10 +186,10 @@
         return;
       }
       port = e.ports[0];
-      port.onmessage = (m) => reply(m.data);
+      port.onmessage = (m) => (m.data && m.data.op === "files" ? loadOffline(m.data.files) : reply(m.data));
       schedule(0);
     });
-    window.parent.postMessage({ specola: "hello", v: 1 }, "*");
+    window.parent.postMessage({ specola: "hello", v: 1, files: offline }, "*");
     // A write made while leaving (say, in beforeunload) can't wait for a timer.
     addEventListener("pagehide", () => {
       if (port && pending) {
@@ -228,18 +237,24 @@
   if (typeof NativeWorker === "function") {
     const shims = new Map();
     const shim = (href) => {
-      if (!shims.has(href)) {
-        const src = `importScripts(${JSON.stringify(href)});`;
-        shims.set(href, URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+      // Offline, a worker from the bundle runs from the kept copy.
+      const file = offline && files.has(strip(href)) ? strip(href) : "";
+      const key = file || href;
+      if (!shims.has(key)) {
+        const src = file ? offlineWorker(file) : `importScripts(${JSON.stringify(href)});`;
+        shims.set(key, URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
       }
-      return shims.get(href);
+      return shims.get(key);
     };
     class Worker extends NativeWorker {
       constructor(url, options) {
         let u = null;
         try {
           u = new URL(url, document.baseURI);
-        } catch {}
+        } catch {
+          // Offline the document is a blob: URL, which nothing resolves against.
+          u = offline ? bundleURL(url) : null;
+        }
         if (u && (u.protocol === "http:" || u.protocol === "https:")) {
           if (options && options.type === "module") {
             console.warn("specola: module workers can't run on a page's opaque origin; starting", u.href, "as a classic worker");
@@ -251,6 +266,142 @@
       }
     }
     Object.defineProperty(window, "Worker", { value: Worker, writable: true, configurable: true });
+  }
+
+  // Offline bundles (docs/spa-bundles.md, "Offline"). The page is a blob:
+  // document, and the network is gone: the viewer hands over every file of
+  // the bundle, and this serves them from blob: URLs made here, in the page's
+  // own origin. A module loaded from a blob: URL can't resolve a relative
+  // specifier, so JS gets its references to bundle files made absolute
+  // ({base}path), and an import map sends those to the blob: URLs (cycles
+  // included). CSS url()s and other files' references from JS point at the
+  // blob: URLs directly. fetch, XMLHttpRequest, workers and the src/href of
+  // elements map the files' absolute URLs (say, built from specola.base) too.
+  // The viewer left the index's module scripts inert (type
+  // "specola-module") and its references to the bundle in data-specola-src
+  // and data-specola-href; they are brought to life once all is in place.
+  const files = new Map(); // absolute URL -> the file's Blob
+  const raw = new Map(); // absolute URL -> blob: URL of the file as published
+  const loaded = new Map(); // absolute URL -> blob: URL to load it from
+  const isJS = (u) => /\.[mc]?js$/i.test(u);
+  const strip = (u) => {
+    const x = new URL(u);
+    x.hash = x.search = "";
+    return x.href;
+  };
+  // The absolute URL of the bundle file url names (relative to ref), or null.
+  function bundleURL(url, ref = boot.base) {
+    try {
+      const u = strip(new URL(String(url), ref));
+      return files.has(u) ? new URL(u) : null;
+    } catch {
+      return null;
+    }
+  }
+  const mapped = (url, ref) => {
+    const u = files.size && bundleURL(url, ref);
+    return u ? loaded.get(u.href) : url;
+  };
+  // A quoted string that may be a path. Narrow on purpose, so a quote in a
+  // regex literal or a comment can't swallow the real strings after it.
+  const QUOTED = /(["'`])([\w\-.~/@+%\u0080-\uffff]+)\1/g;
+  function rewriteJS(text, self) {
+    return text
+      .replace(QUOTED, (m, q, s) => {
+        const u = bundleURL(s, self);
+        return u ? q + (isJS(u.href) ? u.href : loaded.get(u.href)) + q : m;
+      })
+      .replace(/\bimport\.meta\.url\b/g, JSON.stringify(self));
+  }
+  function rewriteCSS(text, self) {
+    return text.replace(/url\(\s*(["']?)([^"')\s]+)\1\s*\)/g, (m, q, s) => {
+      const u = bundleURL(s, self);
+      return u && loaded.has(u.href) ? `url(${JSON.stringify(loaded.get(u.href))})` : m;
+    });
+  }
+  const blobURL = (text, type) => URL.createObjectURL(new Blob([text], { type }));
+
+  async function loadOffline(list) {
+    if (files.size || !Array.isArray(list)) return;
+    for (const f of list) {
+      const u = new URL(f.path, boot.base).href;
+      files.set(u, f.blob);
+      raw.set(u, URL.createObjectURL(f.blob));
+    }
+    const kind = (u) => (isJS(u) ? 2 : /\.css$/i.test(u) ? 1 : 0);
+    const all = [...files.keys()].sort((a, b) => kind(a) - kind(b));
+    for (const u of all) {
+      const k = kind(u);
+      if (k === 0) loaded.set(u, raw.get(u));
+      else {
+        const text = await files.get(u).text();
+        loaded.set(u, blobURL(k === 2 ? rewriteJS(text, u) : rewriteCSS(text, u), files.get(u).type));
+      }
+    }
+    const map = document.createElement("script");
+    map.type = "importmap";
+    map.textContent = JSON.stringify({ imports: Object.fromEntries(all.filter(isJS).map((u) => [u, loaded.get(u)])) });
+    document.head.append(map);
+    for (const a of ["src", "href"]) {
+      for (const el of document.querySelectorAll(`[data-specola-${a}]`)) {
+        el.setAttribute(a, mapped(el.getAttribute(`data-specola-${a}`)));
+        el.removeAttribute(`data-specola-${a}`);
+      }
+    }
+    for (const old of document.querySelectorAll('script[type="specola-module"]')) {
+      const s = document.createElement("script");
+      s.type = "module";
+      s.async = false;
+      if (old.hasAttribute("src")) s.src = old.getAttribute("src");
+      else s.textContent = rewriteJS(old.textContent, new URL("index.html", boot.base).href);
+      old.replaceWith(s);
+    }
+  }
+
+  // A worker's script, rewritten, behind a prelude giving it the same view of
+  // the bundle's files for fetch and importScripts.
+  function offlineWorker(href) {
+    const maps = JSON.stringify({ raw: Object.fromEntries(raw), loaded: Object.fromEntries(loaded) });
+    return `(() => {
+  const m = ${maps};
+  const k = (u, map) => { try { const x = new URL(String(u)); x.hash = x.search = ""; return map[x.href]; } catch {} };
+  const f = self.fetch;
+  self.fetch = function (i, o) { return f.call(this, (!o || !o.method || /^(GET|HEAD)$/i.test(o.method)) && k(i instanceof Request ? i.url : i, m.raw) || i, o); };
+  const s = self.importScripts;
+  self.importScripts = (...a) => s.apply(self, a.map((u) => k(u, m.loaded) || u));
+})();
+importScripts(${JSON.stringify(loaded.get(href))});`;
+  }
+
+  if (offline) {
+    const nativeFetch = window.fetch;
+    window.fetch = function (input, init) {
+      const req = input instanceof Request;
+      const method = (init && init.method) || (req ? input.method : "GET");
+      const u = files.size && /^(GET|HEAD)$/i.test(method) && bundleURL(req ? input.url : input, document.baseURI);
+      return nativeFetch.call(this, u ? raw.get(u.href) : input, init);
+    };
+    const open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      const u = files.size && bundleURL(url, document.baseURI);
+      return open.call(this, method, u ? raw.get(u.href) : url, ...rest);
+    };
+    for (const [C, a] of [
+      [window.HTMLImageElement, "src"],
+      [window.HTMLScriptElement, "src"],
+      [window.HTMLLinkElement, "href"],
+      [window.HTMLSourceElement, "src"],
+      [window.HTMLMediaElement, "src"],
+    ]) {
+      const d = C && Object.getOwnPropertyDescriptor(C.prototype, a);
+      if (!d || !d.set) continue;
+      Object.defineProperty(C.prototype, a, { ...d, set(v) { d.set.call(this, mapped(v, document.baseURI)); } });
+    }
+    const setAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+      const n = String(name).toLowerCase();
+      return setAttribute.call(this, name, n === "src" || n === "href" ? mapped(value, document.baseURI) : value);
+    };
   }
 
   define(

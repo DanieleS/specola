@@ -26,6 +26,8 @@
   );
   let src = $derived(meta && shown && !readOffline ? withVersion(meta.viewUrl, shown) : "");
   let offlineSrc = $state("");
+  // The kept bundle's files for the page in offlineSrc, if it is one.
+  let offlineFiles: offline.BundleFile[] | undefined;
   let missing = $state(false);
   let saving = $state(false);
   let host = $state<HTMLDivElement>();
@@ -37,6 +39,10 @@
     return u.toString();
   }
   let canEdit = $derived(meta?.role === "owner" || meta?.role === "editor");
+  let shownBundle = $derived(
+    versions.find((x) => x.version === shown)?.bundle ??
+      (shown === meta?.version ? !!meta?.bundle : !!shown && offline.isBundle(id, shown)),
+  );
 
   function load() {
     api
@@ -60,6 +66,7 @@
       version: k.versions.at(-1)!,
       updatedAt: k.updatedAt,
       role: k.role,
+      bundle: offline.isBundle(k.id, k.versions.at(-1)!),
       shared: false,
       favorite: false,
       public: false,
@@ -95,7 +102,9 @@
     untrack(() => offline.keep(m, v)).catch((e) => console.warn("keep offline:", e));
   });
 
-  // Offline, show the kept copy from a blob URL in the same sandbox.
+  // Offline, show the kept copy from a blob URL in the same sandbox. A
+  // bundle runs from its kept files, which the frame's SDK gets over the
+  // port; one not kept whole is reported missing rather than shown broken.
   $effect(() => {
     const v = shown;
     offlineSrc = "";
@@ -103,10 +112,16 @@
     if (!readOffline || !v) return;
     let url = "";
     let live = true;
-    offline.html(id, v).then((h) => {
+    const bundle = offline.isBundle(id, v) ? offline.bundle(id, v) : Promise.resolve(null);
+    Promise.all([offline.html(id, v), bundle]).then(([h, b]) => {
       if (!live) return;
-      if (h === null) missing = true;
-      else offlineSrc = url = URL.createObjectURL(new Blob([h], { type: "text/html" }));
+      if (h === null || (offline.isBundle(id, v) && !b)) {
+        missing = true;
+        return;
+      }
+      offlineFiles = b?.files;
+      if (b) h = offline.offlineBundleHTML(h, b.base);
+      offlineSrc = url = URL.createObjectURL(new Blob([h], { type: "text/html" }));
     });
     return () => {
       live = false;
@@ -122,6 +137,7 @@
     const url = src || offlineSrc;
     if (!h || !url) return;
     const title = untrack(() => meta?.name ?? "page");
+    const files = src ? undefined : offlineFiles;
     let live = true;
     let stop = () => {};
     storageName(id).then((name) => {
@@ -136,7 +152,7 @@
       if (name) f.name = name;
       f.src = url;
       h.replaceChildren(f);
-      if (name) stop = serveStorage(f, id);
+      if (name || files) stop = serveStorage(f, id, files);
     });
     return () => {
       live = false;
@@ -217,6 +233,12 @@
         >
       {/if}
       {#if meta}<span class="text-xs text-white/40">v{shown}</span>{/if}
+      {#if shownBundle}
+        <span
+          class="text-[10px] uppercase tracking-wide text-sky-300/80 border border-sky-300/30 rounded px-1.5 py-0.5"
+          title="An app published with the Specola Vite plugin, made of several files">bundle</span
+        >
+      {/if}
       {#if readOffline}
         <span
           class="text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
@@ -274,7 +296,10 @@
   {:else}
     <div class="flex flex-1 min-h-0">
       {#if missing}
-        <p class="flex-1 p-5 text-white/50">Version {shown} isn't kept on this device. It can be opened when you're back online.</p>
+        <p class="flex-1 p-5 text-white/50">
+          Version {shown} isn't {shownBundle ? "available offline" : "kept on this device"}. It can be opened when you're back
+          online.
+        </p>
       {:else if src || offlineSrc}
         <!-- The sandboxed frame showing the page goes here; see above. -->
         <div bind:this={host} class="flex flex-1 min-w-0"></div>
@@ -296,6 +321,7 @@
                   <div class="flex items-center gap-2">
                     <span class="font-medium">v{v.version}</span>
                     {#if current}<span class="text-[10px] uppercase text-amber-400/80">current</span>{/if}
+                    {#if v.bundle}<span class="text-[10px] uppercase text-sky-300/70">bundle</span>{/if}
                     {#if readOffline && kept?.versions.includes(v.version)}
                       <span class="text-[10px] uppercase text-white/40" title="Kept on this device">offline</span>
                     {/if}

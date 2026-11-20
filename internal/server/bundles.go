@@ -240,6 +240,8 @@ func (s *Server) handleCreateBundleUpload(w http.ResponseWriter, r *http.Request
 		"uploadUrl": uploadURL,
 		"expiresAt": expires,
 		"command":   plugin.PublishCommand(uploadURL),
+		// For the app's hint: the plugin must be installed once first.
+		"pluginInstall": plugin.InstallCommand(s.pluginURL()),
 	})
 }
 

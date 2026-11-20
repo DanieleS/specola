@@ -27,6 +27,8 @@ export type PageMeta = {
   public: boolean;
   /** Where to load the rendered page from; may be on a separate origin. */
   viewUrl: string;
+  /** The current version is an SPA bundle (docs/spa-bundles.md). */
+  bundle?: boolean;
   /** Set when this is a copy kept by the service worker, read offline. */
   offline?: boolean;
 };
@@ -68,6 +70,26 @@ export type VersionInfo = {
   restoredFrom?: number;
   /** What changed, as written by whoever published it. */
   note?: string;
+  /** This version is an SPA bundle. */
+  bundle?: boolean;
+};
+
+/** A bundle version's files, other than index.html. */
+export type VersionFiles = {
+  bundle: boolean;
+  /** Where the files are served, ending in "/"; "" for a plain version. */
+  base: string;
+  files: { path: string; size: number; contentType: string; sha256: string }[];
+};
+
+/** A link to publish a bundle with, valid 30 minutes. */
+export type BundleUpload = {
+  uploadUrl: string;
+  expiresAt: string;
+  /** The command that builds and publishes the app, run in its project. */
+  command: string;
+  /** The command that installs this instance's Vite plugin. */
+  pluginInstall: string;
 };
 
 const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
@@ -129,6 +151,11 @@ export const api = {
   setFavorite: (kind: ItemKind, id: string, on: boolean) =>
     req<void>(on ? "PUT" : "DELETE", `/api/${kind}s/${id}/favorite`),
   versions: (id: string) => req<VersionInfo[]>("GET", `/api/pages/${id}/versions`),
+  versionFiles: (id: string, v: number) => req<VersionFiles>("GET", `/api/pages/${id}/versions/${v}/files`),
+  /** A link to publish a bundle: a new page in folderId, or a new version of page id. */
+  bundleUpload: (
+    r: { kind: "new"; title: string; folderId: string | null; note?: string } | { kind: "version"; id: string; note?: string },
+  ) => req<BundleUpload>("POST", "/api/bundle-uploads", r),
   restoreVersion: (id: string, from: number) =>
     req<{ version: number }>("POST", `/api/pages/${id}/versions`, { restoreFrom: from }),
   /** The user's localStorage for page id; written by pagedata.ts. */

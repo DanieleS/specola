@@ -91,7 +91,8 @@ accept it; pages with their data inlined shrink several times over.
 Specola is an installable Progressive Web App (manifest, icons, service
 worker), and pages can be read without a connection.
 
-- **Kept pages**: every page you open is kept on the device (the last 30).
+- **Kept pages**: every page you open is kept on the device (the last 30,
+  and no more than 256 MiB of them). A bundle is kept with all its files.
   **Save offline** in the viewer pins a page: it is never evicted and is
   brought up to its current version each time Specola opens online; pages
   you've lost access to are dropped then. The **Offline** tab lists what the
@@ -101,7 +102,8 @@ worker), and pages can be read without a connection.
   Search, publishing and every change need a connection.
 - Offline, a kept page is shown from a `blob:` URL in the same sandboxed
   iframe (no `allow-same-origin`), so its scripts still run on an opaque
-  origin.
+  origin. A bundle's files are handed to the page SDK, which serves them
+  from `blob:` URLs ([docs/spa-bundles.md](docs/spa-bundles.md), "Offline").
 - What the device keeps belongs to the signed-in user: **Logout** wipes it,
   and so does signing in as someone else on the same browser.
 

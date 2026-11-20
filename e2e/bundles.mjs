@@ -6,7 +6,9 @@
 // sandboxed frame, that the app renders, a lazy import resolves, workers run,
 // fetched JSON and CSS url()s load, window.specola.base/basename are right,
 // a deep path survives pushState + reload and a direct load, and a public
-// link works too.
+// link works too. Then it keeps the bundle for offline viewing in the app,
+// goes offline, and checks the kept copy runs the same way (and that a plain
+// page still shows offline).
 //
 // Needs: Go, a PostgreSQL to create throwaway databases on, the SPA built
 // (cd web && npm run build), plugin dependencies (cd plugin && npm install)
@@ -177,6 +179,107 @@ async function checkServer(app, viewOrigin) {
     check(errors.length === 0, 'no uncaught errors in any page', errors);
     await context.close();
   }
+
+  await checkOffline(app, api, id, base);
+}
+
+// checkOffline opens the bundle and a plain page in the app online (which
+// keeps them), saves the bundle for offline, then reloads the app offline and
+// checks both run from the kept copies.
+async function checkOffline(app, api, id, base) {
+  const plain = await api('POST', '/api/pages', {
+    name: 'E2E plain',
+    html: '<!doctype html><p id="p">plain</p><script>document.getElementById("p").textContent = "plain ran"</script>',
+  });
+  const context = await browser.newContext();
+  const errors = [];
+  context.on('weberror', (e) => errors.push(String(e.error())));
+  let offline = false;
+  const network = []; // requests for the bundle's files while offline
+  context.on('request', (r) => offline && r.url().startsWith(base) && network.push(r.url()));
+  try {
+    const page = await context.newPage();
+    await page.goto(app + '/');
+    // Once the service worker is in control, the app's own reads (say,
+    // /api/me) are kept for offline too.
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await page.reload();
+    await waitFor(() => page.evaluate(() => !!navigator.serviceWorker.controller), 'service worker in control');
+    const kept = (pid, field = 'versions') =>
+      waitFor(() => page.evaluate(([pid, field]) => JSON.parse(localStorage.getItem('specola:offline') || '{}').pages?.[pid]?.[field]?.includes(1), [pid, field]), `page kept (${field})`);
+
+    // The new-page form hands out the commands that publish a bundle.
+    await page.goto(`${app}/#/new`);
+    await page.getByLabel('Title').fill('From the form');
+    await page.getByRole('button', { name: 'Get the commands' }).click();
+    await page.locator('code.font-mono').nth(1).waitFor();
+    const commands = await page.locator('code.font-mono').allTextContents();
+    check(
+      commands.length === 2 && commands[0] === `npm i -D ${app}/tools/specola-vite-plugin-${pluginVersion}.tgz` && /^npx specola-publish --upload '.+\/upload\/bundle\/[^/]+'$/.test(commands[1]),
+      'new-page form shows the plugin install and publish commands',
+      commands,
+    );
+
+    await page.goto(`${app}/#/p/${plain.id}`);
+    await kept(plain.id);
+    await page.goto(`${app}/#/p/${id}`);
+    const online = await waitFor(() => page.frames().find((f) => /^https?:/.test(f.url()) && f.url().includes(`/view/${id}`)), 'page frame');
+    expectResults('online in the app', await results(online), { base });
+    check(await page.locator('span', { hasText: /^bundle$/ }).first().isVisible(), 'viewer header shows the bundle badge');
+    await kept(id, 'bundles');
+    check(true, 'opening the bundle kept it with its files');
+    await page.getByRole('button', { name: 'Save offline' }).click();
+    await page.getByRole('button', { name: 'Saved offline ✓' }).waitFor();
+    check(true, 'bundle saved offline (pinned)');
+    const cached = await page.evaluate(async (pid) => {
+      const c = await caches.open('specola-pages');
+      return (await c.keys()).map((r) => new URL(r.url).pathname).filter((p) => p.startsWith(`/__offline/pages/${pid}/`)).length;
+    }, id);
+    check(cached > 5, 'bundle files are in Cache Storage', cached);
+
+    await context.setOffline(true);
+    offline = true;
+    await page.reload();
+    const frame = await waitFor(() => page.frames().find((f) => f.url().startsWith('blob:')), 'offline frame');
+    check(await page.locator('text=offline copy').isVisible(), 'viewer shows the offline copy');
+    const r = await results(frame);
+    expectResults('offline', r, { base });
+    // e2e.woff2 is no real font (the check is that it is fetched), so its
+    // face fails to decode either way: check the kept bytes reach it.
+    const style = await frame.evaluate(async () => {
+      const css = [...document.styleSheets].flatMap((s) => [...s.cssRules].map((r) => r.cssText)).join(' ');
+      const font = css.match(/@font-face[^}]*url\("([^"]+)"\)/)?.[1] ?? '';
+      return {
+        font,
+        fontBytes: font.startsWith('blob:') ? (await (await fetch(font)).text()).slice(0, 4) : '',
+        fontStatus: [...document.fonts].find((f) => f.family.includes('E2E'))?.status,
+        background: getComputedStyle(document.body).backgroundImage,
+      };
+    });
+    check(style.fontBytes === 'wOF2' && style.fontStatus !== 'unloaded', 'offline: CSS font url() loads from a kept blob', style);
+    check(style.background.startsWith('url("blob:'), 'offline: CSS image url() points at a kept blob', style.background);
+
+    check(network.length === 0, 'offline: no request for the bundle files', network);
+
+    // A plain page offline, as before.
+    await page.goto(`${app}/#/p/${plain.id}`);
+    const pf = await waitFor(() => page.frames().find((f) => f.url().startsWith('blob:') && f !== frame), 'plain offline frame');
+    await pf.waitForFunction(() => document.getElementById('p')?.textContent === 'plain ran', null, { timeout: 15000 });
+    check(true, 'plain page runs offline');
+
+    // A bundle missing a file is reported, not shown broken.
+    await page.evaluate(async (pid) => {
+      const c = await caches.open('specola-pages');
+      const key = (await c.keys()).find((r) => r.url.includes(`/__offline/pages/${pid}/1/file/`));
+      await c.delete(key);
+    }, id);
+    await page.goto(`${app}/#/p/${id}`);
+    await page.getByText("isn't available offline").waitFor();
+    check(!page.frames().some((f) => f.url().startsWith('blob:')), 'a bundle not kept whole is reported as not available offline');
+  } finally {
+    check(errors.length === 0, 'offline: no uncaught errors', errors);
+    await context.close();
+  }
 }
 
 // results waits for the app's checks to finish in frame and returns them.
@@ -194,10 +297,12 @@ function expectResults(where, r, { base, basename, path }) {
   check(v('blobWorker')?.value === 63, `${where}: blob: worker passes through`, r.blobWorker);
   check(v('json') === 'hello from data.json', `${where}: fetched JSON loads`, r.json);
   check(v('image') === 32, `${where}: image loads`, r.image);
+  check(v('baseFetch') === 'hello from public/', `${where}: fetch of specola.base + path`, r.baseFetch);
+  check(v('baseXHR') === 'hello from public/', `${where}: XHR of specola.base + path`, r.baseXHR);
   check(v('storage')?.value === 'kept', `${where}: localStorage works`, r.storage);
   const s = v('specola') || {};
   check(s.base === base, `${where}: window.specola.base`, s.base);
-  check(s.basename === basename, `${where}: window.specola.basename`, s.basename);
+  if (basename !== undefined) check(s.basename === basename, `${where}: window.specola.basename`, s.basename);
   if (path) check(s.path === path, `${where}: location.pathname`, s.path);
 }
 

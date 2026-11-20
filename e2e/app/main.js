@@ -34,6 +34,18 @@ const checks = {
     return ask(new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))));
   },
   json: async () => (await (await fetch(dataUrl)).json()).greeting,
+  // A file from public/, found by window.specola.base (offline, the SDK
+  // serves such URLs from the kept copy).
+  baseFetch: async () => (await (await fetch(window.specola.base + 'extra.json')).json()).extra,
+  baseXHR: () =>
+    new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open('GET', window.specola.base + 'extra.json');
+      x.responseType = 'json';
+      x.onload = () => resolve(x.response.extra);
+      x.onerror = () => reject(new Error('XHR failed'));
+      x.send();
+    }),
   image: () =>
     new Promise((resolve, reject) => {
       const img = new Image();

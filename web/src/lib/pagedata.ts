@@ -2,12 +2,14 @@
 // internal/server/pagesdk.js). The page runs on an opaque origin and cannot
 // call the API, so the viewer loads its data before loading it, passes it in
 // the frame's name, and saves its writes, as the signed-in user, from a
-// MessagePort handed to the page on its first hello.
+// MessagePort handed to the page on its first hello. Offline, the same port
+// hands a kept bundle's files to the page (see offline.svelte.ts).
 // A numbered version is cached for a year with the runtime it was served with,
 // so this side must keep answering older runtimes: extend the protocol, don't
 // change it.
 
 import { api, UNAUTHORIZED_EVENT } from "./api";
+import type { BundleFile } from "./offline.svelte";
 
 type Write = { op: "write"; clear?: boolean; set?: Record<string, string>; remove?: string[] };
 type Reply = { ok: true } | { ok: false; error: string };
@@ -40,8 +42,10 @@ export async function storageName(id: string): Promise<string | null> {
  * The returned function stops answering hellos; a port already handed out
  * keeps working until its frame is gone, so a page's last writes (say, from
  * its pagehide as it is replaced) are still saved.
+ * files, when given, are the kept bundle shown offline in frame: they go to
+ * the page over the port when its hello asks for them.
  */
-export function serveStorage(frame: HTMLIFrameElement, id: string): () => void {
+export function serveStorage(frame: HTMLIFrameElement, id: string, files?: BundleFile[]): () => void {
   let port: MessagePort | null = null;
 
   function onMessage(e: MessageEvent) {
@@ -57,6 +61,7 @@ export function serveStorage(frame: HTMLIFrameElement, id: string): () => void {
       if (m.data?.op === "write") send(id, m.data, (r) => p.postMessage(r));
     };
     page.postMessage({ specola: "port" }, "*", [ch.port2]);
+    if (files && e.data.files) p.postMessage({ op: "files", files });
   }
 
   window.addEventListener("message", onMessage);

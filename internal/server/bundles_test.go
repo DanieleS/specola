@@ -18,6 +18,7 @@ import (
 	"github.com/danieles/specola/internal/config"
 	"github.com/danieles/specola/internal/store"
 	"github.com/danieles/specola/internal/testdb"
+	"github.com/danieles/specola/plugin"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -154,12 +155,13 @@ func TestBundleUploadProtocol(t *testing.T) {
 		}
 		code, body := call(t, ts, alice, "POST", "/api/bundle-uploads", `{"kind":"new","title":"App","note":"first"}`)
 		var g struct {
-			UploadURL, Command string
-			ExpiresAt          time.Time
+			UploadURL, Command, PluginInstall string
+			ExpiresAt                         time.Time
 		}
 		mustJSON(t, body, &g)
 		if code != http.StatusCreated || !strings.HasPrefix(g.UploadURL, "http://test/upload/bundle/") ||
 			g.Command != "npx specola-publish --upload '"+g.UploadURL+"'" ||
+			g.PluginInstall != "npm i -D http://test"+plugin.TarballPath() ||
 			time.Until(g.ExpiresAt) < 29*time.Minute || time.Until(g.ExpiresAt) > 31*time.Minute {
 			t.Fatalf("mint: %d %s", code, body)
 		}

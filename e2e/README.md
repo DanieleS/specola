@@ -7,7 +7,11 @@ origin), publishes the build with the real `specola-publish` CLI, and checks
 inside the sandboxed frame that the app renders, a lazy `import()` resolves,
 workers run, fetched JSON and CSS `url()`s load, `window.specola.base` and
 `basename` are right, a deep path survives `pushState` + reload and a direct
-load, and public links work.
+load, and public links work. Then, in the app, it opens and saves the bundle
+for offline, goes offline (`context.setOffline`), reloads, and checks the
+kept copy runs the same way from Cache Storage without a request for its
+files, that a plain page still shows offline, and that a bundle missing a
+file is reported as not available offline.
 
 Run it from the repository root:
 
