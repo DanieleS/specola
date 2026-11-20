@@ -96,7 +96,7 @@ CHOOSE HOW TO PUBLISH, before writing anything:
   (a) ` + plugin.InstallCommand(pluginURL) + `
   (b) in vite.config add the plugin: import specola from '@specola/vite-plugin'; then plugins: [/* your framework plugin */, specola()]
   (c) call create_bundle_upload (kind "new" with a title, or kind "version" with the page id)
-  (d) run the command it returns (npx specola-publish --upload '<url>'): it runs vite build, uploads, and prints the page id and url.
+  (d) run the command it returns (npx --no -- specola-publish --upload '<url>'), as it is: it runs vite build, uploads, and prints the page id and url. If npx says the package is missing (a 404 from the npm registry, or "canceled due to missing packages"), the plugin isn't installed where you ran it: do (a) in the project directory and run the command there.
 ` + bundleConstraints + `
 
 ` + pageRuntime + `
@@ -111,9 +111,11 @@ const pageRuntime = `Every page runs in a sandbox on an opaque origin, without a
 // bundleConstraints are what an app must respect to run as a bundle, one line
 // each.
 var bundleConstraints = fmt.Sprintf(`Bundle constraints:
-  - Client-side routing: prefer a hash router (createHashRouter, #/... URLs), which also works when the page is viewed offline; a path router needs <BrowserRouter basename={window.specola?.basename}> (or your router's basename option) and doesn't route offline.
-  - Workers run as classic scripts (the plugin builds them so; {type: "module"} is ignored); no SharedWorker or service worker.
-  - Own files: fetch a URL imported from the module (import url from './data.json?url', or new URL('./x.bin', import.meta.url)); a public/ file is window.specola.base + 'logo.png'. Never root-absolute URLs ('/data.json'): they point at Specola, not the bundle.
+  - Client-side routing: prefer a hash router (createHashRouter, #/... URLs), which also works when the page is viewed offline as long as it navigates with history.pushState or <a href="#/..."> links (assigning location.hash does nothing offline); a path router needs <BrowserRouter basename={window.specola?.basename}> (or your router's basename option) and doesn't route offline.
+  - Workers: new Worker(new URL('./worker.js', import.meta.url), {type: "module"}) (the module type is what vite dev needs; the plugin builds the worker as a classic script, imports and import() inlined, and Specola runs it so); no SharedWorker or service worker.
+  - Own files: fetch a URL imported from the module (import url from './data.json?url', or new URL('./x.bin', import.meta.url)), in the page and in workers alike; a public/ file is window.specola.base + 'logo.png'. Never root-absolute URLs ('/data.json'): they point at Specola, not the bundle.
+  - SVG icons: no external sprites (<use href="/icons.svg#x">, as in the create-vite templates): they stay blank on the page's opaque origin whatever the URL. Inline the sprite (import sprite from './icons.svg?raw', put it in the page, then <use href="#x">) or inline each <svg>; SVG files as <img> work.
+  - TypeScript: window.specola is typed by '@specola/vite-plugin/client': add it to "types" in tsconfig.app.json (next to "vite/client").
   - index.html is the only HTML file; nothing runs on a server (no SSR or API routes).
   - Limits: %d files, %d MB per file, %d MB in all; an upload link is valid %d minutes.`,
 	store.MaxBundleFiles, store.MaxBundleFileBytes>>20, store.MaxBundleBytes>>20, int(store.BundleGrantTTL.Minutes()))

@@ -8,6 +8,9 @@
       "types": "./index.d.ts",
       "import": "./index.js"
     },
+    "./client": {
+      "types": "./client.d.ts"
+    },
     "./package.json": "./package.json"
   },
   "types": "./index.d.ts",
@@ -17,6 +20,7 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "client.d.ts",
     "lib/",
     "bin/",
     "README.md"

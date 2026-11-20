@@ -14,7 +14,7 @@ import { VERSION } from './version.js';
 const CONCURRENCY = 4;
 const MAX_RETRIES = 4;
 
-export const USAGE = `Usage: npx specola-publish --upload <url> [options]
+export const USAGE = `Usage: npx --no -- specola-publish --upload <url> [options]
 
 Builds the Vite app in the current directory and uploads it to Specola as a
 bundle. The upload URL comes from the MCP tool create_bundle_upload.

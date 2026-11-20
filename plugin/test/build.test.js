@@ -99,11 +99,19 @@ test('the worker is built as a classic script', () => {
   assert.doesNotThrow(() => new vm.Script(code));
   assert.doesNotMatch(code, /^\s*(import|export)\b/m);
   assert.match(code, /\*\s*2/, 'math.js is bundled into the worker');
+  assert.match(code, /\*\s*3/, 'the dynamically imported triple.js is inlined into the worker');
+  assert.ok(!listFiles(out.outDir).some((f) => /triple/.test(f)), 'no separate chunk for the worker');
 });
 
 test('root-absolute references to public files are reported', () => {
   assert.ok(out.warnings.some((w) => /refers to "\/logo.png"/.test(w)), out.warnings.join('\n'));
   assert.ok(!out.warnings.some((w) => /"\/favicon.svg"/.test(w)));
+});
+
+test('external SVG sprites are reported, with advice that works', () => {
+  assert.ok(out.warnings.some((w) => /uses "\/sprite.svg" as an external SVG sprite.*\?raw/s.test(w)), out.warnings.join('\n'));
+  // Not also as a root-absolute reference, whose advice can't help a sprite.
+  assert.ok(!out.warnings.some((w) => /refers to "\/sprite.svg"/.test(w)), out.warnings.join('\n'));
 });
 
 test('the build fails when it exceeds the limits', async () => {

@@ -22,7 +22,7 @@ kind "new" publishes a new page (title required, folder_id optional); kind "vers
 (a) once: ` + plugin.InstallCommand(pluginURL) + `
 (b) once: add specola() to the plugins in vite.config (import specola from '@specola/vite-plugin')
 (c) call this tool
-(d) run the returned command within ` + bundleTTLText + `: it runs vite build and uploads only the files the server lacks, then prints {"id","version","url"}. Use --no-build if the app is already built into dist/, --dir for another output directory.
+(d) run the returned command, as it is, within ` + bundleTTLText + `: it runs vite build and uploads only the files the server lacks, then prints {"id","version","url"}. Use --no-build if the app is already built into dist/, --dir for another output directory. If npx says the package is missing (a 404 from the npm registry, or "canceled due to missing packages"), the plugin isn't installed there: run (a) in the project directory first.
 ` + bundleConstraints + `
 ` + pageRuntime
 }

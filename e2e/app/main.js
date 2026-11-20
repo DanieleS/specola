@@ -26,8 +26,35 @@ const checks = {
   },
   lazy: async () => (await import('./lazy.js')).lazy(),
   worker: () => ask(new Worker(new URL('./worker.js', import.meta.url))),
-  // The SDK drops type: "module" for an http(s) URL, with a warning.
+  // The SDK drops type: "module" for the bundle's own (classic) workers.
   moduleWorker: () => ask(new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })),
+  // A worker's own files, by URLs relative to the worker.
+  assetWorker: () => ask(new Worker(new URL('./assetworker.js', import.meta.url), { type: 'module' })),
+  // A fragment link drives hash routing (offline too, where the page is a
+  // blob: document).
+  hashLink: () =>
+    new Promise((resolve, reject) => {
+      history.replaceState(history.state, '', location.href.split('#')[0]);
+      const a = document.createElement('a');
+      a.href = '#/e2e-route';
+      a.textContent = 'route';
+      document.body.append(a);
+      const t = setTimeout(() => reject(new Error('no hashchange; hash is ' + JSON.stringify(location.hash))), 3000);
+      addEventListener('hashchange', function on() {
+        removeEventListener('hashchange', on);
+        clearTimeout(t);
+        const hash = location.hash;
+        history.replaceState(history.state, '', location.href.split('#')[0]);
+        resolve(hash);
+      });
+      a.click();
+    }),
+  // Counts the loads that saw this page's localStorage (offline too).
+  count: () => {
+    const n = Number(localStorage.getItem('count') || 0) + 1;
+    localStorage.setItem('count', String(n));
+    return n;
+  },
   // A blob: worker the page makes itself is passed through untouched.
   blobWorker: () => {
     const src = 'onmessage = (e) => postMessage(e.data * 3)';

@@ -1,8 +1,8 @@
 # SPA bundles — design and contract
 
-Status: being implemented on branch `ccr-c6bf3320-7faeji`. Server, plugin,
-CLI, MCP, routing, the SDK, the SPA (badges, publish hint) and offline
-viewing are done and checked end to end in Chromium (`e2e/bundles.mjs`).
+Status: implemented. Server, plugin, CLI, MCP, routing, the SDK, the SPA
+(badges, publish hint) and offline viewing are checked end to end in
+Chromium (`e2e/bundles.mjs`).
 
 A **bundle** is a page whose current (or any) version is a multi-file build of a
 single-page app (typically Vite), instead of one self-contained HTML document.
@@ -47,7 +47,9 @@ Safari and Firefox are not verified yet.
 
 - `bundle_blob(sha256 text PRIMARY KEY, size_bytes bigint NOT NULL, content bytea NOT NULL, created_at timestamptz NOT NULL DEFAULT now())`
   — content-addressed file contents, deduplicated across all versions and pages.
-  `sha256` is 64 lowercase hex chars.
+  `sha256` is 64 lowercase hex chars. `content` is stored uncompressed
+  (`STORAGE EXTERNAL`, migration `0010_bundle_blob_storage.sql`), so a slice
+  of it can be read without reading the whole value (see Serving).
 - `asset_version.bundle_key text UNIQUE NULL` — non-null marks the version as a
   bundle. Random, 32 bytes base64url (43 chars). It is the capability in the
   bundle's file URLs (see Serving). A restored version gets a new key.
@@ -131,7 +133,8 @@ commit, as the existing grants are.
    400 (also 400 before any manifest was posted). The grant and the manifest
    entry are checked before the body is read, and no more than the entry's
    size is read. A body over the per-file limit answers 413 (always when its
-   `Content-Length` says so; a chunked body longer than its entry answers 400).
+   `Content-Length` says so, once the token is checked; a chunked body longer
+   than its entry answers 400).
    Stores the blob (an existing one just has its `created_at` reset), records
    it as sent through the grant, answers `204`. Idempotent.
 4. `POST /upload/bundle/{token}/commit` with `{"note"?:"…"}` (the note overrides
@@ -148,7 +151,9 @@ commit, as the existing grants are.
    answers 400.
 
 Errors: unknown token 404, used/expired grant 410, as today; these come
-before any other error (an invalid manifest, an old plugin, a bad body). A plain upload
+before any other error (an invalid manifest, an old plugin, a bad body:
+JSON that doesn't parse or is too large, a note that is too long, a blob
+over the limit). A plain upload
 grant used on these endpoints, or a bundle grant used on `PUT /upload/{token}`,
 answers 400. Access lost between mint and commit answers 404 (403 if the user
 can still see the page but no longer edit it).
@@ -159,7 +164,7 @@ can still see the page but no longer edit it).
   `{"kind":"new"|"version","title","folderId","id","note"}` (`title` required
   for `new`, `id` for `version`) mints a bundle upload grant, valid 30 minutes,
   and answers `201 {"uploadUrl","expiresAt","command","pluginInstall"}` where `command` is
-  `npx specola-publish --upload '<uploadUrl>'` and `pluginInstall` the
+  `npx --no -- specola-publish --upload '<uploadUrl>'` and `pluginInstall` the
   `npm i -D <tarball URL>` of this instance. The new-page form uses it: a
   short hint says apps with a build step are published with the plugin, and a
   button mints a link for the title and folder being filled in and shows both
@@ -185,6 +190,19 @@ outside authentication.
   or archived, itself or through a folder above it (else 404). No user check:
   the key is the capability. With a view origin, the app origin answers 404
   for `/b/…`, as it does for `/view`.
+- What that means for revoking access: the key is in every `index.html` the
+  version is served with, so whoever opened the version (as a viewer, or
+  through a public link) can keep fetching all its files after their share is
+  removed or the link revoked, and can pass the URLs on, until the page is
+  archived. Files are sent `Cache-Control: public, immutable`, so shared
+  caches may keep them even after that. Only the HTML, and so the key of a
+  later version, is cut off at once. A new version (or a restore) gets a new
+  key.
+- The lookup reads the file's metadata only; the content is read from the
+  database as it is sent, 1 MiB at a time (`substring` on the stored bytes),
+  at most 4 reads at once across the server. So a `HEAD`, a matching
+  `If-None-Match` (304) or a small range costs no read, or one chunk, of a
+  file of up to 25 MiB.
 - Headers: `Content-Type` from the extension (table below), `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: sandbox allow-scripts allow-popups allow-forms allow-modals`,
   `Access-Control-Allow-Origin: *`, `Cross-Origin-Resource-Policy: cross-origin`,
@@ -230,13 +248,18 @@ of `localStorage` data is unchanged.
 The SDK wraps `window.Worker` with a subclass (so `instanceof Worker` and
 `Worker.prototype` keep working): `new Worker(url, opts)` where `url` resolves
 (against `document.baseURI`) to an `http(s):` URL becomes a classic worker
-from a `blob:` URL whose source is `importScripts(<absolute url>)`, one blob
-per URL. `{type:"module"}` is honoured only for `blob:`/`data:` URLs given by
-the page, which pass through untouched; for an http(s) URL it is dropped with
-a `console.warn` (module workers cannot run on an opaque origin). The plugin
-builds workers as classic scripts (`worker.format: "iife"`) so this works.
-Inside such a worker `self.location` is the `blob:` URL, so relative URLs
-there don't reach the bundle (see plugin/README.md, Workers).
+from a `blob:` URL whose source is a prelude then `importScripts(<absolute url>)`,
+one blob per URL. `{type:"module"}` is honoured only for `blob:`/`data:` URLs
+given by the page, which pass through untouched; for an http(s) URL it is
+dropped (module workers cannot run on an opaque origin), with a
+`console.warn` unless the URL is under the page's `specola.base`: the plugin
+builds a bundle's workers as classic scripts (`worker.format: "iife"`), and
+`{type:"module"}` is what `vite dev` needs for a worker with imports.
+The prelude makes the worker's `self.location` its script's real URL (a
+`URL` object) instead of the `blob:` URL, and resolves relative URLs given
+to `fetch` and `importScripts` against it, so Vite's compiled
+`new URL(file, self.location.href)` (from `?url` imports and
+`new URL(…, import.meta.url)` in a worker) reaches the bundle.
 
 ### Routing (deep paths)
 
@@ -269,7 +292,7 @@ shell with it).
 
 - New tool `create_bundle_upload` (`kind` new|version, `title?`, `folder_id?`,
   `id?`, `note?`) → `{upload_url, expires_at, command, plugin_install}` where
-  `command` is the exact `npx specola-publish --upload '<upload_url>'` to run
+  `command` is the exact `npx --no -- specola-publish --upload '<upload_url>'` to run
   in the project and `plugin_install` the `npm i -D <tarball URL>` of this
   instance. The command is built by `plugin.PublishCommand`, shared with
   `POST /api/bundle-uploads`.
@@ -286,9 +309,12 @@ shell with it).
   multiple files, lazy loading, workers, wasm, many assets) → the Vite plugin,
   with the exact steps and this instance's URLs ((a) `npm i -D <tarball URL>`,
   (b) `specola()` in `vite.config` plugins, (c) `create_bundle_upload`, (d) run
-  the returned command) and the key constraints (a hash router preferred,
-  since it also routes offline, else the router basename; classic workers,
-  own files by module-relative URLs, `localStorage` per user, no IndexedDB,
+  the returned command, as it is, and what to do when npx says the package is
+  missing) and the key constraints (a hash router preferred, since it also
+  routes offline when it navigates by `pushState` or links, else the router
+  basename; workers with `{type:"module"}`, built and run as classic
+  scripts; own files by module-relative URLs, in workers too; no external
+  SVG sprites; the `client` types; `localStorage` per user, no IndexedDB,
   limits). This steering is a product requirement.
 
 ## Plugin and CLI distribution
@@ -312,21 +338,35 @@ shell with it).
 
 ### Plugin behaviour
 
-- Sets `base: "./"`, `worker.format: "iife"`, keeps hashed file names.
+- Sets `base: "./"`, `worker.format: "iife"`, keeps hashed file names. A
+  classic worker is one file, so a worker's dynamic `import()`s are inlined:
+  up to Vite 7 the plugin sets `worker.rollupOptions.output.inlineDynamicImports`
+  (Rollup can't split an iife build and would fail with an error that
+  doesn't name the plugin); Vite 8's Rolldown inlines them by itself.
 - Rewrites `index.html` references to bundle files to `__SPECOLA_BASE__/…`.
 - Adds `<meta name="generator" content="specola-vite-plugin/<version>">`.
 - Option `searchText` (string): emitted as `<noscript data-specola-search>…</noscript>`
   in `index.html` so full-text search finds the page.
 - Fails the build when limits are exceeded or another `.html` is emitted; warns
   when the app references root-absolute paths (`"/…"`) that would escape the
-  bundle (e.g. files from `public/` referenced from JS as `/logo.png`).
+  bundle (e.g. files from `public/` referenced from JS as `/logo.png`), and
+  when `index.html` or a JS chunk uses an external SVG sprite
+  (`"icons.svg#id"`, or an SVG file's URL with `#id` added, as Vue's
+  compiled templates do): an opaque-origin document loads `<use>` references
+  from no URL at all, so the advice is to inline the sprite (`?raw`).
+- Types: `index.d.ts` for `vite.config`; `client.d.ts`, exported as
+  `@specola/vite-plugin/client`, declares `window.specola` for app code
+  (add it to `types` in `tsconfig.app.json`).
 - Dev server: provides a stand-in `window.specola` (`base: "/"`, `basename: ""`,
   `persistent: false`, a no-op `flush`; `localStorage` is the browser's own)
   so apps can use the API locally.
 
 ### CLI `specola-publish`
 
-`npx specola-publish --upload <url> [--dir dist] [--no-build] [--note "…"]`:
+`npx --no -- specola-publish --upload <url> [--dir dist] [--no-build] [--note "…"]`
+(`--no`: npx runs only the project's installed bin, never a package of that
+name fetched from the public registry, which would get the upload link; `--`
+keeps npm from reading the CLI's options as its own):
 GET the grant info, run `vite build` (unless `--no-build`), walk the output
 directory, skip junk files, hash, POST the manifest, PUT missing blobs (4 at a
 time, retry network errors and 5xx answers up to 4 times with backoff), commit,
@@ -387,8 +427,11 @@ The SDK, inside the page's origin:
    path-like string that resolves, against the module's own `{base}path`, to a
    bundle file: to the absolute `{base}path` for a JS file (a module from
    `blob:` can't resolve relative specifiers; this covers static and dynamic
-   imports and `new URL("x.js", import.meta.url)` for workers), to the file's
-   `blob:` URL otherwise; `import.meta.url` becomes the module's `{base}path`.
+   imports and `new URL("x.js", import.meta.url)` for workers) and for a CSS
+   file (Vite's preload helper tells a lazy chunk's CSS by its URL ending in
+   `.css`; the `<link>` it adds gets the `blob:` URL from the `href` setter),
+   to the file's `blob:` URL otherwise; `import.meta.url` becomes the
+   module's `{base}path`.
    Then it makes `blob:` URLs for them (leaves, then CSS, then JS);
 3. installs an import map from every `{base}path.js` to its `blob:` URL (this
    handles import cycles), and maps the files' absolute URLs (`specola.base`
@@ -404,12 +447,30 @@ A bundle that isn't kept whole (a file missing from the cache) is reported as
 "not available offline" rather than shown broken. A plain page offline works
 exactly as before.
 
+On any `blob:` document (a bundle or a plain page offline), Chromium refuses
+every fragment navigation ("Not allowed to load local resource"), but
+`history.pushState` works: the SDK handles a click on a fragment link
+(`<a href="#…">`) that the page didn't `preventDefault`, with `pushState`,
+the `popstate` and `hashchange` events the navigation would fire, and the
+scroll to the target.
+
+Page storage offline (plain pages and bundles alike): the frame's data comes
+from the service worker's copy of `GET /api/pages/{id}/data`, which the
+viewer updates with each write once it is saved, so a page opened offline
+starts from its latest saved data. Writes not saved yet are kept in
+`localStorage` (`specola:outbox`, with the user they belong to, removed on
+logout) as well as in memory: they are folded into the data a page is
+handed, and sent when the app next runs online, so they survive reloading
+or closing the app while offline.
+
 Known limits offline:
 
 - The document is a `blob:` URL: `history.pushState` to a path throws a
   `SecurityError` (verified in Chromium) and `location.pathname` is not under
   `specola.basename`, so an app routing by path (`<BrowserRouter>`) doesn't
-  route offline; a hash router works.
+  route offline; a hash router works, as long as it navigates with
+  `pushState` or links: assigning `location.hash` (or `location.href` to a
+  fragment) still fails, and can't be intercepted.
 - References the rewriting can't see stay as they are and fail: a path built
   at run time other than from `specola.base` (or `import.meta.url`), or given
   to something other than the APIs above (say, CSS `@import` of another CSS

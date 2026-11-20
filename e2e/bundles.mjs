@@ -3,12 +3,15 @@
 // builds e2e/app with the Vite plugin, starts a real Specola (once on the
 // app origin alone, once with a separate view origin), publishes the build
 // with the real specola-publish CLI, and checks in Chromium, inside the
-// sandboxed frame, that the app renders, a lazy import resolves, workers run,
-// fetched JSON and CSS url()s load, window.specola.base/basename are right,
-// a deep path survives pushState + reload and a direct load, and a public
-// link works too. Then it keeps the bundle for offline viewing in the app,
-// goes offline, and checks the kept copy runs the same way (and that a plain
-// page still shows offline).
+// sandboxed frame, that the app renders, a lazy import resolves with its CSS,
+// workers run and find their own files, a fragment link routes, fetched JSON
+// and CSS url()s load, window.specola.base/basename are right, a deep path
+// survives pushState + reload and a direct load, and a public link works
+// too; and that the viewer fits a phone's width. Then it keeps the bundle for
+// offline viewing in the app, goes offline, and checks the kept copy runs the
+// same way (and that a plain page still shows offline), that the page's
+// localStorage starts from its latest data offline and keeps its offline
+// writes across reloads, and that they are saved once back online.
 //
 // Needs: Go, a PostgreSQL to create throwaway databases on, the SPA built
 // (cd web && npm run build), plugin dependencies (cd plugin && npm install)
@@ -106,7 +109,7 @@ async function checkServer(app, viewOrigin) {
   check(tarball.ok && tarball.headers.get('content-type') === 'application/gzip', 'plugin tarball is served', tarball.status);
 
   const up = await api('POST', '/api/bundle-uploads', { kind: 'new', title: 'E2E bundle', note: 'e2e' });
-  check(up.command === `npx specola-publish --upload '${up.uploadUrl}'`, 'upload command', up.command);
+  check(up.command === `npx --no -- specola-publish --upload '${up.uploadUrl}'`, 'upload command', up.command);
   const out = execFileSync(process.execPath, [join(root, 'plugin/bin/specola-publish.js'), '--upload', up.uploadUrl, '--dir', dist, '--no-build'], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -142,7 +145,7 @@ async function checkServer(app, viewOrigin) {
     const viewer = await results(frame);
     expectResults('viewer', viewer, { base, basename });
     check(viewer.storage?.value?.persistent === true, 'viewer: localStorage reaches the server', viewer.storage);
-    check(consoleLines.some((l) => l.includes("module workers can't run")), 'module worker dropped with a console warning');
+    check(!consoleLines.some((l) => l.includes("module workers can't run")), 'a bundle worker with {type:"module"} starts without a warning', consoleLines);
     for (const [what, re] of [
       ['CSS font url()', /\/assets\/e2e-[^/]+\.woff2$/],
       ['CSS image url()', /\/assets\/pattern-[^/]+\.svg$/],
@@ -151,12 +154,15 @@ async function checkServer(app, viewOrigin) {
       check(r && r.status === 200, `${what} loads from the bundle`, r || responses.map((r) => r.url));
     }
 
+    // 1b. At phone width the viewer's header fits, and its controls don't overlap.
+    await checkPhoneWidth(context, app, id);
+
     // 2. pushState to a deep path, then reload the frame: served again.
     await frame.evaluate((b) => history.pushState({}, '', b + '/deep/route?x=1'), basename);
     const deepURL = await frame.evaluate(() => location.href);
     await frame.evaluate(() => setTimeout(() => location.reload(), 0));
     await frame.waitForURL(deepURL).catch(() => {});
-    await frame.waitForFunction(() => document.documentElement.dataset.e2e === 'done' && performance.navigation.type === 1, null, { timeout: 15000 });
+    await frame.waitForFunction(() => document.documentElement.dataset.e2e === 'done' && performance.getEntriesByType('navigation')[0]?.type === 'reload', null, { timeout: 15000 });
     const reloaded = await frame.evaluate(() => window.__e2e);
     expectResults('reloaded deep path', reloaded, { base, basename, path: basename + '/deep/route' });
 
@@ -215,7 +221,7 @@ async function checkOffline(app, api, id, base) {
     await page.locator('code.font-mono').nth(1).waitFor();
     const commands = await page.locator('code.font-mono').allTextContents();
     check(
-      commands.length === 2 && commands[0] === `npm i -D ${app}/tools/specola-vite-plugin-${pluginVersion}.tgz` && /^npx specola-publish --upload '.+\/upload\/bundle\/[^/]+'$/.test(commands[1]),
+      commands.length === 2 && commands[0] === `npm i -D ${app}/tools/specola-vite-plugin-${pluginVersion}.tgz` && /^npx --no -- specola-publish --upload '.+\/upload\/bundle\/[^/]+'$/.test(commands[1]),
       'new-page form shows the plugin install and publish commands',
       commands,
     );
@@ -266,6 +272,20 @@ async function checkOffline(app, api, id, base) {
     await other.evaluate(() => window.release());
     await other.close();
 
+    // The page's localStorage across going offline: the reload above opened
+    // the bundle again, which counted a load. Once saved, the copy of the
+    // page's data kept for offline has it too.
+    const reopened = await waitFor(() => page.frames().find((f) => /^https?:/.test(f.url()) && f.url().includes(`/view/${id}`)), 'page frame again');
+    const count = (await results(reopened)).count?.value;
+    const cachedCount = () =>
+      page.evaluate(async (pid) => {
+        const hit = await caches.match(`/api/pages/${pid}/data`, { cacheName: 'specola-api' });
+        return hit ? Number((await hit.json()).count) : null;
+      }, id);
+    await waitFor(async () => Number((await api('GET', `/api/pages/${id}/data`)).count) === count, 'count saved').catch(() => {});
+    await waitFor(async () => (await cachedCount()) === count, 'count kept for offline').catch(() => {});
+    check((await cachedCount()) === count, 'a saved localStorage write updates the data kept for offline', { count, cached: await cachedCount() });
+
     await context.setOffline(true);
     offline = true;
     await page.reload();
@@ -290,9 +310,17 @@ async function checkOffline(app, api, id, base) {
 
     check(network.length === 0, 'offline: no request for the bundle files', network);
 
+    // Offline, the page starts from its latest data, and its writes survive
+    // reloading the app.
+    check(r.count?.value === count + 1, 'offline: localStorage starts from the data saved last online', { count, offline: r.count });
+    await page.reload();
+    const again = await waitFor(() => page.frames().find((f) => f.url().startsWith('blob:')), 'offline frame after reload');
+    const r2 = await results(again);
+    check(r2.count?.value === count + 2, 'offline: localStorage writes survive reloading the app', { count, offline: r2.count });
+
     // A plain page offline, as before.
     await page.goto(`${app}/#/p/${plain.id}`);
-    const pf = await waitFor(() => page.frames().find((f) => f.url().startsWith('blob:') && f !== frame), 'plain offline frame');
+    const pf = await waitFor(() => page.frames().find((f) => f.url().startsWith('blob:') && f !== frame && f !== again), 'plain offline frame');
     await pf.waitForFunction(() => document.getElementById('p')?.textContent === 'plain ran', null, { timeout: 15000 });
     check(true, 'plain page runs offline');
 
@@ -305,9 +333,64 @@ async function checkOffline(app, api, id, base) {
     await page.goto(`${app}/#/p/${id}`);
     await page.getByText("isn't available offline").waitFor();
     check(!page.frames().some((f) => f.url().startsWith('blob:')), 'a bundle not kept whole is reported as not available offline');
+
+    // Back online, the writes made offline reach the server.
+    await context.setOffline(false);
+    offline = false;
+    await page.reload();
+    const back = await waitFor(() => page.frames().find((f) => /^https?:/.test(f.url()) && f.url().includes(`/view/${id}`)), 'page frame back online');
+    const r3 = await results(back);
+    check(r3.count?.value === count + 3, 'back online: the page sees its offline writes', { count, online: r3.count });
+    await waitFor(async () => Number((await api('GET', `/api/pages/${id}/data`)).count) === count + 3, 'offline writes saved').catch(() => {});
+    check(Number((await api('GET', `/api/pages/${id}/data`)).count) === count + 3, 'back online: offline writes are saved on the server');
   } finally {
     check(errors.length === 0, 'offline: no uncaught errors', errors);
     await context.close();
+  }
+}
+
+// checkPhoneWidth opens the page in the app at 375 px wide: nothing may stick
+// out sideways, the header's controls mustn't overlap, and the history
+// panel mustn't squeeze the page.
+async function checkPhoneWidth(context, app, id) {
+  const page = await context.newPage();
+  try {
+    await page.setViewportSize({ width: 375, height: 740 });
+    await page.goto(`${app}/#/p/${id}`);
+    await waitFor(() => page.frames().find((f) => f.url().includes(`/view/${id}`)), 'page frame at phone width');
+    await page.getByRole('button', { name: 'History' }).waitFor();
+    const layout = () =>
+      page.evaluate(() => {
+        const header = document.querySelector('[data-viewer-header]');
+        const boxes = [...header.querySelectorAll('a, button, span')]
+          .map((el) => ({ el, r: el.getBoundingClientRect() }))
+          .filter(({ el, r }) => r.width > 0 && r.height > 0 && !el.querySelector('a, button, span'))
+          .map(({ el, r }) => ({ text: el.textContent.trim().slice(0, 20), l: r.left, r: r.right, t: r.top, b: r.bottom }));
+        const overlaps = [];
+        for (let i = 0; i < boxes.length; i++)
+          for (let j = i + 1; j < boxes.length; j++) {
+            const a = boxes[i], b = boxes[j];
+            if (a.l < b.r - 1 && b.l < a.r - 1 && a.t < b.b - 1 && b.t < a.b - 1) overlaps.push([a.text, b.text]);
+          }
+        const frame = document.querySelector('iframe')?.getBoundingClientRect();
+        return {
+          scroll: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          outside: boxes.filter((b) => b.l < 0 || b.r > innerWidth + 1).map((b) => b.text),
+          overlaps,
+          frameWidth: frame ? Math.round(frame.width) : 0,
+        };
+      });
+    const closed = await layout();
+    check(closed.scroll <= 0 && closed.outside.length === 0 && closed.overlaps.length === 0, 'phone width: header fits without overlaps', closed);
+    await page.getByRole('button', { name: 'History' }).click();
+    await page.getByRole('complementary', { name: 'Version history' }).waitFor();
+    const open = await waitFor(async () => {
+      const l = await layout();
+      return l.frameWidth >= 375 ? l : null;
+    }, 'page frame at full width').catch(layout);
+    check(open.scroll <= 0 && open.frameWidth >= 375, 'phone width: history doesn\'t squeeze the page', open);
+  } finally {
+    await page.close();
   }
 }
 
@@ -320,7 +403,14 @@ async function results(frame) {
 function expectResults(where, r, { base, basename, path }) {
   const v = (name) => (r[name] && r[name].ok ? r[name].value : r[name]);
   check(v('render') === 'bundle rendered', `${where}: app renders`, r.render);
-  check(v('lazy') === 'bundle lazy chunk', `${where}: lazy import() resolves`, r.lazy);
+  check(v('lazy') === 'bundle lazy chunk|rgb(10, 20, 30)', `${where}: lazy import() resolves, with its CSS`, r.lazy);
+  const aw = v('assetWorker')?.value;
+  check(
+    aw?.viaImport === 'hello from the worker' && aw?.viaURL === 'hello from the worker' && aw?.location?.startsWith(base + 'assets/assetworker-'),
+    `${where}: a worker loads its own files by relative URLs`,
+    r.assetWorker,
+  );
+  check(v('hashLink') === '#/e2e-route', `${where}: a fragment link changes the hash and fires hashchange`, r.hashLink);
   check(v('worker')?.value === 42 && v('worker')?.isWorker === true, `${where}: worker runs (instanceof Worker)`, r.worker);
   check(v('moduleWorker')?.value === 42, `${where}: {type:"module"} worker runs as classic`, r.moduleWorker);
   check(v('blobWorker')?.value === 63, `${where}: blob: worker passes through`, r.blobWorker);

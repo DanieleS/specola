@@ -37,7 +37,7 @@ func TestMCPBundles(t *testing.T) {
 	var up upload
 	callTool(t, cs, "create_bundle_upload", map[string]any{"kind": "new", "title": "App", "note": "first build"}, &up)
 	path, ok := strings.CutPrefix(up.UploadURL, app+"/upload/bundle/")
-	if !ok || up.Command != "npx specola-publish --upload '"+up.UploadURL+"'" || up.PluginInstall != install ||
+	if !ok || up.Command != "npx --no -- specola-publish --upload '"+up.UploadURL+"'" || up.PluginInstall != install ||
 		time.Until(up.ExpiresAt) < 29*time.Minute || time.Until(up.ExpiresAt) > 31*time.Minute {
 		t.Fatalf("create_bundle_upload = %+v", up)
 	}

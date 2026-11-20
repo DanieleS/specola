@@ -13,7 +13,8 @@ scripts can run without being able to touch Specola's session or API.
 
 > Status: early. Publish, browse, version with notes, view, share, public
 > links, favorites,
-> full-text search, offline viewing as an installable PWA, and an
+> full-text search, offline viewing as an installable PWA, SPA bundles
+> (multi-file apps built with the Specola Vite plugin), and an
 > OAuth-protected MCP endpoint for agents.
 
 ## Stack
@@ -24,7 +25,7 @@ page viewer, and the built SPA.
 | Area | Choice |
 | --- | --- |
 | Backend | Go, [`chi`](https://github.com/go-chi/chi) router, [`pgx`](https://github.com/jackc/pgx), [`goose`](https://github.com/pressly/goose) migrations |
-| Database | PostgreSQL (HTML stored inline) |
+| Database | PostgreSQL (HTML stored inline; SPA bundle files stored too, as `bytea`) |
 | Auth | OIDC (tested against Logto); dev bypass for local work |
 | Frontend | Vite + Svelte + TypeScript, built to static assets embedded in the binary |
 | Image | multi-stage build to a distroless static base (~15 MB) |
@@ -39,11 +40,21 @@ tokens), not by email.
 - **folder** — a tree; soft-delete + archive aware.
 - **asset** — a page. `current_version` points at the latest version.
 - **asset_version** — immutable history; the HTML lives inline in `content`,
-  with an optional `note` on what changed.
+  with an optional `note` on what changed. A version with a `bundle_key` is
+  an SPA bundle: `content` is its `index.html`, and the key is the capability
+  in its files' URLs.
+- **asset_version_file** — a bundle version's other files: path, content
+  type, size and the sha256 of their content.
+- **bundle_blob** — bundle file contents by sha256, deduplicated across all
+  versions and pages, stored uncompressed as `bytea` (up to 25 MiB per file,
+  100 MiB per bundle). A periodic sweep deletes blobs no version uses (and no
+  live upload names) after 24 hours. Plan database size and backups with
+  them in mind.
 - **acl_entry** — one user (`sub`), one role (`VIEWER` / `EDITOR`) on a folder *xor* an
   asset. A folder grant is inherited by everything beneath it.
 - **asset_grant** — short-lived, single-use token so a client can `curl` a large
-  HTML body instead of inlining it in a request.
+  HTML body instead of inlining it in a request, or upload a bundle (`bundle`,
+  with the `manifest` it accepted and the blobs `uploaded` through it).
 - **favorite** — personal stars.
 - **page_data** — per page and user, the page's `localStorage`.
 - **public_link** — a page's public links: the sha256 of the token, an
@@ -85,6 +96,10 @@ accept it; pages with their data inlined shrink several times over.
   `If-None-Match` answers 304 without reading the HTML out of the database.
 - The SPA shell is `no-cache`, so a deploy reaches the browser at once; the
   bundle under `/assets/` has hashed names and is cached for a year.
+- A page bundle's files (`/b/{key}/{path}`) never change under their key and
+  are sent `Cache-Control: public, max-age=31536000, immutable` with their
+  sha256 as `ETag`; a `HEAD`, a 304 or a small range reads little or nothing
+  from the database.
 
 ## Offline and install (PWA)
 
@@ -134,7 +149,8 @@ API: `GET/PUT/DELETE /api/{pages|folders}/{id}/acl` (`PUT` takes
 To show a page to someone without a Specola account, its owner makes a
 **public link** from the Share dialog: a secret URL that shows the page,
 read-only, to anyone who has it, without signing in. Nothing else in Specola
-is reachable from it.
+is reachable from it, except the files of an SPA bundle it shows (see
+below).
 
 - A link follows the current version, or is **pinned** to one. It can expire
   after a number of days (at most 366) or never, and carries an optional
@@ -142,6 +158,13 @@ is reachable from it.
 - Only the token's sha256 is stored, so the URL is shown once, when the link
   is made. The owner sees each link's label, expiry, views and last use, and
   can **revoke** it; it stops working at once (nothing is cached).
+- An SPA bundle's files are served by an unguessable per-version key with no
+  per-user check, and the key is in the HTML. Revoking a link (or removing a
+  share) stops the page being served, but whoever loaded that version can
+  still fetch its files, and pass their URLs on, until the page is archived;
+  the files are cached publicly, so copies may outlive even that. Treat
+  what a bundle's files contain as shared with everyone who opened it. A new
+  version gets a new key.
 - A link works only while the page is active and its creator still owns it:
   archiving the page or a folder above it takes its links down, and
   restoring it brings them back.
@@ -170,6 +193,9 @@ pages (and libraries) use the standard APIs unchanged:
   before loading the page and passes it in the frame's `name`. Writes are
   batched and saved by the viewer, which retries while offline, even after
   the page is gone, and folds unsaved writes into the data it passes next.
+  Unsaved writes are also kept in the browser, so they survive reloading or
+  closing the app offline and are sent when it next runs online; the copy of
+  the data kept for offline is updated with each saved write.
 - Up to 1000 keys and 1 MB per user and page; past that `setItem` throws
   `QuotaExceededError`, as the real one does.
 - `sessionStorage` and `document.cookie` work in memory, for that load only.
@@ -278,7 +304,7 @@ user**, so they land in that user's gallery.
 | `list_public_links` | `id` | the page's public links, with expiry and views |
 | `revoke_public_link` | `id`, `link_id` | `{ok}` |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
-| `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx specola-publish` command to run, and the plugin install command |
+| `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx --no -- specola-publish` command to run, and the plugin install command |
 
 Apps with a build step are published as **SPA bundles** with the Vite plugin
 in [`plugin/`](plugin/README.md), which each instance serves at
@@ -338,10 +364,15 @@ CIMD clients then connect without being registered in advance.
   `localStorage`, saved by the viewer and scoped to that page and user.
 - For defense in depth, set `SPECOLA_VIEW_ORIGIN` to a second hostname that
   also reaches Specola (requests are routed by `Host`). Pages are then served
-  only from that origin, which serves nothing else, and the app origin refuses
-  `/view`. The view origin has no session: the SPA gets a signed view token
+  only from that origin, which serves nothing else (the pages, public links,
+  and SPA bundle files under `/b/`), and the app origin refuses `/view` and
+  `/b/`. The view origin has no session: the SPA gets a signed view token
   (one user, one page, valid for an hour) with the page metadata, and access
-  is still checked on every request, so removing a share takes effect at once.
+  is still checked on every request, so removing a share takes effect at once
+  for the page. Not for an SPA bundle's files: they are reached by a
+  per-version key in the page's HTML, with no user check, so someone who
+  loaded a version keeps access to its files until the page is archived (see
+  Public links).
   Responses carry `Referrer-Policy: no-referrer` so the token doesn't leak.
   They also allow CORS reads from the app origin, which is how the app keeps
   pages for offline viewing; offline, a kept page is rendered from the app

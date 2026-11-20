@@ -9,7 +9,7 @@
 // change it.
 
 import { api, UNAUTHORIZED_EVENT } from "./api";
-import type { BundleFile } from "./offline.svelte";
+import { index as offlineIndex, type BundleFile } from "./offline.svelte";
 
 type Write = { op: "write"; clear?: boolean; set?: Record<string, string>; remove?: string[] };
 type Reply = { ok: true } | { ok: false; error: string };
@@ -27,11 +27,7 @@ export async function storageName(id: string): Promise<string | null> {
     return null;
   }
   // Writes still on their way to the server are part of the data.
-  for (const { w } of outboxes.get(id) ?? []) {
-    if (w.clear) data = {};
-    for (const k of w.remove ?? []) delete data[k];
-    Object.assign(data, w.set);
-  }
+  for (const { w } of outboxes.get(id) ?? []) data = apply(data, w);
   return "specola:" + JSON.stringify({ data });
 }
 
@@ -74,12 +70,54 @@ export function serveStorage(frame: HTMLIFrameElement, id: string, saves = true,
 
 // Each page's writes not saved yet, in order. They outlive the frame that made
 // them: the viewer swaps frames when going offline and back, for instance.
+// They outlive the app too: they are kept in localStorage (OUTBOX_KEY, with
+// the user they belong to), and resumeWrites() sends what an earlier run of
+// the app left unsaved, say after a reload while offline.
 const outboxes = new Map<string, { w: Write; done: (r: Reply) => void }[]>();
+
+/** Where unsaved writes are kept; offline.clear() removes it on logout. */
+export const OUTBOX_KEY = "specola:outbox";
+type Kept = { owner: string; pages: Record<string, Write[]> };
+
+function keepOutboxes() {
+  const pages: Record<string, Write[]> = {};
+  for (const [id, q] of outboxes) if (q.length) pages[id] = q.map((x) => x.w);
+  try {
+    if (Object.keys(pages).length) localStorage.setItem(OUTBOX_KEY, JSON.stringify({ owner: offlineIndex.owner, pages } satisfies Kept));
+    else localStorage.removeItem(OUTBOX_KEY);
+  } catch {
+    // Storage full or unavailable: the writes are still sent while the app runs.
+  }
+}
+
+/**
+ * Sends the writes an earlier run of the app left unsaved, if they belong to
+ * the signed-in user (offline.claim has bound the offline data to them).
+ * Call once the user is known, online or not: unsaved writes wait for the
+ * server, and storageName folds them into the data meanwhile.
+ */
+export function resumeWrites() {
+  let kept: Kept | null = null;
+  try {
+    kept = JSON.parse(localStorage.getItem(OUTBOX_KEY) ?? "null");
+  } catch {
+    // Corrupt: nothing to resume.
+  }
+  if (!kept || typeof kept.pages !== "object" || kept.owner !== offlineIndex.owner || !offlineIndex.owner) {
+    if (kept) keepOutboxes();
+    return;
+  }
+  for (const [id, ws] of Object.entries(kept.pages)) {
+    if (!Array.isArray(ws) || outboxes.get(id)?.length) continue;
+    for (const w of ws) send(id, w, () => {});
+  }
+}
 
 function send(id: string, w: Write, done: (r: Reply) => void) {
   const q = outboxes.get(id) ?? [];
   outboxes.set(id, q);
   q.push({ w, done });
+  keepOutboxes();
   if (q.length === 1) void drain(id, q);
 }
 
@@ -98,13 +136,39 @@ async function drain(id: string, q: { w: Write; done: (r: Reply) => void }[]) {
         continue;
       }
       q.shift();
+      keepOutboxes();
       done({ ok: false, error: err instanceof Error ? err.message : String(err) });
       continue;
     }
     q.shift();
+    keepOutboxes();
+    await keptData(id, w).catch(() => {});
     done({ ok: true });
   }
   outboxes.delete(id);
+}
+
+// The service worker keeps the last GET of a page's data for offline use
+// (web/sw.js), from before the page's writes of that visit: each saved
+// write is applied to that copy, so the page starts from its latest data
+// offline too.
+async function keptData(id: string, w: Write) {
+  if (!("caches" in window)) return;
+  const url = new URL(`/api/pages/${id}/data`, location.href).href;
+  const cache = await caches.open("specola-api");
+  const hit = await cache.match(url);
+  if (!hit) return;
+  const data = apply(await hit.json(), w);
+  const headers = new Headers(hit.headers);
+  headers.delete("Content-Length");
+  headers.delete("Content-Encoding");
+  await cache.put(url, new Response(JSON.stringify(data), { status: hit.status, statusText: hit.statusText, headers }));
+}
+
+function apply(data: Record<string, string>, w: Write): Record<string, string> {
+  if (w.clear) data = {};
+  for (const k of w.remove ?? []) delete data[k];
+  return Object.assign(data, w.set);
 }
 
 class Unreachable extends Error {}

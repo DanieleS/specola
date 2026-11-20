@@ -88,6 +88,12 @@ export async function clear() {
   index.pages = {};
   index.owner = "";
   persist();
+  try {
+    // The page data writes not saved yet (pagedata.ts, OUTBOX_KEY).
+    localStorage.removeItem("specola:outbox");
+  } catch {
+    // Storage unavailable: nothing kept there either.
+  }
   if (supported) await Promise.all([caches.delete(PAGES), caches.delete(API)]);
 }
 

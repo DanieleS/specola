@@ -107,7 +107,7 @@ func TestPackIsDeterministic(t *testing.T) {
 }
 
 func TestCommands(t *testing.T) {
-	if got := PublishCommand("https://s.test/upload/bundle/tok"); got != "npx specola-publish --upload 'https://s.test/upload/bundle/tok'" {
+	if got := PublishCommand("https://s.test/upload/bundle/tok"); got != "npx --no -- specola-publish --upload 'https://s.test/upload/bundle/tok'" {
 		t.Fatalf("PublishCommand = %q", got)
 	}
 	if got := InstallCommand("https://s.test/tools/x.tgz"); got != "npm i -D https://s.test/tools/x.tgz" {

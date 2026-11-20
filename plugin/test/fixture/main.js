@@ -22,3 +22,6 @@ fetch(dataUrl)
 const logo = document.createElement('img');
 logo.src = '/logo.png';
 document.body.append(logo);
+
+// An external SVG sprite: blank in a bundle, so the plugin must warn about it.
+document.body.insertAdjacentHTML('beforeend', '<svg><use href="/sprite.svg#dot"></use></svg>');

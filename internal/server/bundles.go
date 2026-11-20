@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,11 +71,14 @@ func (s *Server) boot(key, basename string) bootData {
 // handleBundleFile serves one file of a bundle. The files run inside the
 // page's opaque origin, which loads them cross-origin: hence CORS for anyone
 // and a cross-origin resource policy. A file under a key never changes.
+//
+// Anyone with the key may ask, so the content is read lazily, a chunk at a
+// time: a HEAD or a 304 reads none of it, a range only the chunks it covers.
 func (s *Server) handleBundleFile(w http.ResponseWriter, r *http.Request) {
 	key := chi.URLParam(r, "key")
 	// The decoded path: the files' names may need escaping in a URL.
 	p := strings.TrimPrefix(r.URL.Path, "/b/"+key+"/")
-	f, err := s.st.BundleFile(r.Context(), key, p)
+	f, err := s.st.BundleFileInfo(r.Context(), key, p)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -88,7 +92,57 @@ func (s *Server) handleBundleFile(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Cache-Control", "public, max-age=31536000, immutable")
 	h.Set("ETag", `"`+f.SHA256+`"`)
-	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(f.Content))
+	http.ServeContent(w, r, "", time.Time{}, &blobReader{st: s.st, ctx: r.Context(), sum: f.SHA256, size: f.Size})
+}
+
+// bundleChunkBytes is how much of a bundle file one database read fetches.
+var bundleChunkBytes int64 = 1 << 20
+
+// blobReader reads a bundle file from the database as it is read, one chunk
+// at a time, for http.ServeContent (which only seeks to learn the size, and
+// to the start of a range).
+type blobReader struct {
+	st     *store.Store
+	ctx    context.Context
+	sum    string
+	size   int64
+	off    int64
+	buf    []byte // the chunk at bufOff
+	bufOff int64
+}
+
+func (b *blobReader) Read(p []byte) (int, error) {
+	if b.off >= b.size {
+		return 0, io.EOF
+	}
+	if b.off < b.bufOff || b.off >= b.bufOff+int64(len(b.buf)) {
+		n := min(bundleChunkBytes, b.size-b.off)
+		chunk, err := b.st.ReadBundleBlob(b.ctx, b.sum, b.off, n)
+		if err != nil {
+			return 0, err
+		}
+		b.buf, b.bufOff = chunk, b.off
+	}
+	n := copy(p, b.buf[b.off-b.bufOff:])
+	b.off += int64(n)
+	return n, nil
+}
+
+func (b *blobReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+	case io.SeekCurrent:
+		offset += b.off
+	case io.SeekEnd:
+		offset += b.size
+	default:
+		return 0, errors.New("seek: invalid whence")
+	}
+	if offset < 0 {
+		return 0, errors.New("seek: negative position")
+	}
+	b.off = offset
+	return offset, nil
 }
 
 // bundleLimits are the limits the CLI checks before building.
@@ -123,6 +177,18 @@ func (s *Server) handleBundleUploadInfo(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// grantError answers the error of the request's bundle upload token, if it
+// has one (unknown 404, used or expired 410, not a bundle grant 400), and
+// reports whether it did. The protocol reports these before any problem with
+// the request's body (docs/spa-bundles.md, Upload protocol).
+func (s *Server) grantError(w http.ResponseWriter, r *http.Request) bool {
+	if _, err := s.st.BundleUploadInfo(r.Context(), chi.URLParam(r, "token")); err != nil {
+		httpError(w, err)
+		return true
+	}
+	return false
+}
+
 type manifestReq struct {
 	PluginVersion string             `json:"pluginVersion"`
 	Files         []store.BundleFile `json:"files"`
@@ -131,13 +197,19 @@ type manifestReq struct {
 func (s *Server) handleBundleManifest(w http.ResponseWriter, r *http.Request) {
 	var req manifestReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxManifestBytes)).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		if s.grantError(w, r) {
+			return
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("manifest is over %d bytes", maxManifestBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if !versionAtLeast(req.PluginVersion, minPluginVersion) {
-		// An unknown or used token is the more useful answer.
-		if _, err := s.st.BundleUploadInfo(r.Context(), chi.URLParam(r, "token")); err != nil {
-			httpError(w, err)
+		if s.grantError(w, r) {
 			return
 		}
 		http.Error(w, fmt.Sprintf(
@@ -158,6 +230,9 @@ func (s *Server) handleBundleManifest(w http.ResponseWriter, r *http.Request) {
 // file's size.
 func (s *Server) handleBundleBlob(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > store.MaxBundleFileBytes {
+		if s.grantError(w, r) {
+			return
+		}
 		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -182,7 +257,10 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	var req commitReq
 	// The body is optional: no note keeps the grant's.
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		if s.grantError(w, r) {
+			return
+		}
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	id, version, err := s.st.CommitBundle(r.Context(), chi.URLParam(r, "token"), req.Note)

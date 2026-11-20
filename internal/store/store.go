@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -20,9 +21,19 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool *pgxpool.Pool
+	// blobReads bounds the bundle file reads running at once
+	// (ReadBundleBlob), so anonymous requests for large files can't take
+	// every pooled connection.
+	blobReads chan struct{}
+	// blobBytes counts the bytes of bundle files read from the database.
+	blobBytes atomic.Int64
+}
 
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool, blobReads: make(chan struct{}, maxBlobReads)}
+}
 
 // TreeItem is one row in a folder listing: either a sub-folder or a page.
 type TreeItem struct {

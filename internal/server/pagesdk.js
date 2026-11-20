@@ -15,6 +15,8 @@
 //
 // - new Worker(url) works for http(s) URLs, which an opaque origin can't start
 //   a worker from: see the Worker wrapper below.
+// - Shown from a blob: URL (offline), links to a fragment (<a href="#/x">)
+//   still navigate: see "Fragment links" below.
 // - Offline, a bundle the viewer kept runs from the files it hands over: see
 //   "Offline bundles" below.
 //
@@ -230,8 +232,9 @@
   // and a module worker can't start even from a blob: URL; a classic worker
   // from a blob: URL that calls importScripts(httpUrl) works. So an http(s)
   // URL becomes such a worker (one blob per URL), and {type: "module"} is
-  // dropped for it with a warning: the Vite plugin builds workers as classic
-  // scripts. blob: and data: URLs the page made itself pass through as given.
+  // dropped for it: the Vite plugin builds a bundle's workers as classic
+  // scripts, so only a worker from elsewhere gets a warning. blob: and data:
+  // URLs the page made itself pass through as given.
   // A subclass, so instanceof Worker and Worker.prototype keep working.
   const NativeWorker = window.Worker;
   if (typeof NativeWorker === "function") {
@@ -241,7 +244,7 @@
       const file = offline && files.has(strip(href)) ? strip(href) : "";
       const key = file || href;
       if (!shims.has(key)) {
-        const src = file ? offlineWorker(file) : `importScripts(${JSON.stringify(href)});`;
+        const src = workerPrelude(href, file ? { raw: Object.fromEntries(raw), loaded: Object.fromEntries(loaded) } : null);
         shims.set(key, URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
       }
       return shims.get(key);
@@ -257,7 +260,9 @@
         }
         if (u && (u.protocol === "http:" || u.protocol === "https:")) {
           if (options && options.type === "module") {
-            console.warn("specola: module workers can't run on a page's opaque origin; starting", u.href, "as a classic worker");
+            if (!(boot.base && u.href.startsWith(boot.base))) {
+              console.warn("specola: module workers can't run on a page's opaque origin; starting", u.href, "as a classic worker");
+            }
             options = { ...options, type: "classic" };
           }
           url = shim(u.href);
@@ -268,15 +273,75 @@
     Object.defineProperty(window, "Worker", { value: Worker, writable: true, configurable: true });
   }
 
+  // What a worker started from href runs: a prelude, then href. The worker's
+  // own location is its blob: URL, against which no relative URL resolves
+  // (Vite compiles a worker's new URL(file, import.meta.url) and ?url
+  // imports to new URL(file, self.location.href)): the prelude makes
+  // self.location the script's real URL, and resolves relative URLs given to
+  // fetch and importScripts against it. Offline (maps given), fetch and
+  // importScripts of the bundle's files go to the kept copies.
+  function workerPrelude(href, maps) {
+    return `(() => {
+  const here = new URL(${JSON.stringify(href)});
+  Object.defineProperty(self, "location", { value: here, configurable: true, enumerable: true });
+  const abs = (u) => { if (typeof u !== "string" && !(u instanceof URL)) return u; try { return new URL(u, here).href; } catch { return u; } };
+  const m = ${JSON.stringify(maps)};
+  const k = (u, map) => { if (!m) return; try { const x = new URL(String(u)); x.hash = x.search = ""; return map[x.href]; } catch {} };
+  const f = self.fetch;
+  self.fetch = function (i, o) {
+    const r = i instanceof Request;
+    if (!r) i = abs(i);
+    return f.call(this, (/^(GET|HEAD)$/i.test((o && o.method) || (r ? i.method : "GET")) && k(r ? i.url : i, m && m.raw)) || i, o);
+  };
+  const s = self.importScripts;
+  self.importScripts = (...a) => s.apply(self, a.map((u) => ((u = abs(u)), k(u, m && m.loaded) || u)));
+})();
+importScripts(${JSON.stringify(href)});`;
+  }
+
+  // Fragment links. Offline the page is a blob: document, where Chromium
+  // refuses every fragment navigation ("Not allowed to load local resource"):
+  // a click on <a href="#/route"> would do nothing, and a hash router built on
+  // such links or on hashchange wouldn't route. history.pushState still works,
+  // so a click on a fragment link nobody handled is done with it, with the
+  // popstate and hashchange the navigation would fire (going back fires them
+  // natively). Assigning location.hash can't be caught, and still fails.
+  if (location.protocol === "blob:") {
+    addEventListener("click", (e) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const a = e.composedPath().find((n) => n instanceof HTMLAnchorElement);
+      const href = a && a.getAttribute("href");
+      if (!href || href[0] !== "#" || a.hasAttribute("download") || (a.target && a.target !== "_self")) return;
+      e.preventDefault();
+      const oldURL = location.href;
+      const newURL = oldURL.split("#")[0] + href;
+      if (newURL !== oldURL) {
+        history.pushState(null, "", href);
+        dispatchEvent(new PopStateEvent("popstate", { state: null }));
+        dispatchEvent(new HashChangeEvent("hashchange", { oldURL, newURL }));
+      }
+      let id = href.slice(1);
+      try {
+        id = decodeURIComponent(id);
+      } catch {}
+      const target = id && (document.getElementById(id) || document.getElementsByName(id)[0]);
+      if (target) target.scrollIntoView();
+      else if (id === "" || id.toLowerCase() === "top") scrollTo(0, 0);
+    });
+  }
+
   // Offline bundles (docs/spa-bundles.md, "Offline"). The page is a blob:
   // document, and the network is gone: the viewer hands over every file of
   // the bundle, and this serves them from blob: URLs made here, in the page's
   // own origin. A module loaded from a blob: URL can't resolve a relative
   // specifier, so JS gets its references to bundle files made absolute
   // ({base}path), and an import map sends those to the blob: URLs (cycles
-  // included). CSS url()s and other files' references from JS point at the
-  // blob: URLs directly. fetch, XMLHttpRequest, workers and the src/href of
-  // elements map the files' absolute URLs (say, built from specola.base) too.
+  // included). So do its references to CSS files: Vite's preload helper
+  // tells a lazy chunk's CSS by its URL ending in .css, and the link it adds
+  // gets the blob: URL from the href setter. CSS url()s and JS references to
+  // other files point at the blob: URLs directly. fetch, XMLHttpRequest,
+  // workers and the src/href of elements map the files' absolute URLs (say,
+  // built from specola.base) too.
   // The viewer left the index's module scripts inert (type
   // "specola-module") and its references to the bundle in data-specola-src
   // and data-specola-href; they are brought to life once all is in place.
@@ -284,6 +349,7 @@
   const raw = new Map(); // absolute URL -> blob: URL of the file as published
   const loaded = new Map(); // absolute URL -> blob: URL to load it from
   const isJS = (u) => /\.[mc]?js$/i.test(u);
+  const isCSS = (u) => /\.css$/i.test(u);
   const strip = (u) => {
     const x = new URL(u);
     x.hash = x.search = "";
@@ -309,7 +375,7 @@
     return text
       .replace(QUOTED, (m, q, s) => {
         const u = bundleURL(s, self);
-        return u ? q + (isJS(u.href) ? u.href : loaded.get(u.href)) + q : m;
+        return u ? q + (isJS(u.href) || isCSS(u.href) ? u.href : loaded.get(u.href)) + q : m;
       })
       .replace(/\bimport\.meta\.url\b/g, JSON.stringify(self));
   }
@@ -328,7 +394,7 @@
       files.set(u, f.blob);
       raw.set(u, URL.createObjectURL(f.blob));
     }
-    const kind = (u) => (isJS(u) ? 2 : /\.css$/i.test(u) ? 1 : 0);
+    const kind = (u) => (isJS(u) ? 2 : isCSS(u) ? 1 : 0);
     const all = [...files.keys()].sort((a, b) => kind(a) - kind(b));
     for (const u of all) {
       const k = kind(u);
@@ -356,21 +422,6 @@
       else s.textContent = rewriteJS(old.textContent, new URL("index.html", boot.base).href);
       old.replaceWith(s);
     }
-  }
-
-  // A worker's script, rewritten, behind a prelude giving it the same view of
-  // the bundle's files for fetch and importScripts.
-  function offlineWorker(href) {
-    const maps = JSON.stringify({ raw: Object.fromEntries(raw), loaded: Object.fromEntries(loaded) });
-    return `(() => {
-  const m = ${maps};
-  const k = (u, map) => { try { const x = new URL(String(u)); x.hash = x.search = ""; return map[x.href]; } catch {} };
-  const f = self.fetch;
-  self.fetch = function (i, o) { const r = i instanceof Request; return f.call(this, /^(GET|HEAD)$/i.test((o && o.method) || (r ? i.method : "GET")) && k(r ? i.url : i, m.raw) || i, o); };
-  const s = self.importScripts;
-  self.importScripts = (...a) => s.apply(self, a.map((u) => k(u, m.loaded) || u));
-})();
-importScripts(${JSON.stringify(loaded.get(href))});`;
   }
 
   if (offline) {

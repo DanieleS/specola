@@ -6,6 +6,7 @@
   import PublishForm from "./lib/PublishForm.svelte";
   import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
   import * as offline from "./lib/offline.svelte";
+  import { resumeWrites } from "./lib/pagedata";
 
   type Route = { name: "list" } | { name: "new"; folderId: string | null } | { name: "view"; id: string };
 
@@ -26,6 +27,8 @@
     .then(async (m) => {
       email = m.email || m.sub;
       await offline.claim(m.sub);
+      // Before any page opens: its data folds in the writes still unsaved.
+      resumeWrites();
       auth = "in";
       if (!m.offline) offline.sync().catch((e) => console.warn("offline sync:", e));
     })

@@ -43,7 +43,8 @@ What the plugin does on `vite build`:
 
 - builds with `base: "./"` so every file refers to the others relatively (a
   `base` you set is ignored, with a warning), and builds workers as classic
-  scripts (`worker.format: "iife"`); file names keep their content hashes;
+  scripts (`worker.format: "iife"`, with a worker's dynamic `import()`s
+  inlined into it); file names keep their content hashes;
 - rewrites the references in `index.html` to the bundle's files as
   `__SPECOLA_BASE__/assets/…`: the server replaces the placeholder with the
   bundle's file URL when it serves the page;
@@ -51,7 +52,9 @@ What the plugin does on `vite build`:
   `searchText`, a `<noscript data-specola-search>` element;
 - fails the build when it exceeds the limits or emits an HTML file other
   than `index.html`, and warns when JS or CSS refers to a `public/` file by a
-  root-absolute path (`"/logo.png"`), which would not resolve in a bundle.
+  root-absolute path (`"/logo.png"`), which would not resolve in a bundle,
+  and when the app uses an external SVG sprite (`<use href="icons.svg#id">`),
+  which can't load in a bundle (see SVG icons).
 
 On `vite dev` it provides a stand-in `window.specola`
 (`{ base: "/", basename: "", persistent: false, flush }`) so the app runs
@@ -65,8 +68,15 @@ locally unchanged.
 2. In the project directory, run it:
 
    ```sh
-   npx specola-publish --upload 'https://<your-specola>/upload/bundle/<token>'
+   npx --no -- specola-publish --upload 'https://<your-specola>/upload/bundle/<token>'
    ```
+
+   `--no` makes `npx` run only the `specola-publish` installed in the
+   project. Without it, in a directory where the plugin isn't installed,
+   `npx` would download and run whatever package has that name on the public
+   npm registry, handing it the upload link. If the command fails with a 404
+   from the registry or "npx canceled due to missing packages", install the
+   plugin in this directory first (`npm i -D <tarball URL>`, see Install).
 
 `specola-publish` checks the link, runs `vite build`, uploads only the files
 the server does not have yet, and prints the result as JSON on stdout
@@ -104,23 +114,47 @@ works, including reloads and deep links. Tell the router the prefix:
 or use a hash router (`createHashRouter`, `#/…` URLs), which needs nothing.
 A hash router is the better choice for an app people may open offline: a
 page kept for offline viewing runs from a `blob:` URL, whose path can't
-change, so a path router doesn't route there.
+change, so a path router doesn't route there. Offline, a hash router must
+navigate with `history.pushState` (React Router's hash router does) or with
+links (`<a href="#/route">`, which Specola handles there); assigning
+`location.hash` does nothing on a `blob:` page.
+
+### TypeScript
+
+`window.specola` is typed by `@specola/vite-plugin/client`. The plugin's
+main types are only seen by `vite.config.ts`, so add the client types to
+the app's own program, in `tsconfig.app.json`:
+
+```json
+"types": ["vite/client", "@specola/vite-plugin/client"]
+```
+
+or with a line in any `.d.ts` file under `src/` (say, `src/vite-env.d.ts`):
+
+```ts
+/// <reference types="@specola/vite-plugin/client" />
+```
 
 ### Workers
 
-Only classic workers work (pages run on an opaque origin, where module
-workers cannot start). Write workers the usual Vite way — the plugin builds
-them as classic scripts:
+Only classic workers run (pages run on an opaque origin, where module
+workers cannot start), and the plugin builds workers as classic scripts.
+Write them the usual Vite way, with `{ type: 'module' }`:
 
 ```js
-const worker = new Worker(new URL('./worker.js', import.meta.url));
+const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 ```
 
-`import` statements inside the worker are fine (they are bundled into it).
-Inside the worker, `self.location` is a `blob:` URL: pass it any absolute
-URL it needs to fetch (for instance `window.specola.base + 'assets/…'` or a
-`new URL('./data.bin', import.meta.url).href` computed in the page).
-SharedWorkers and service workers are not supported.
+`{ type: 'module' }` is what `vite dev` needs to run a worker that has
+`import` statements (in dev, Vite serves the worker's source as a module);
+in the published bundle Specola starts it as the classic script the plugin
+built. `import` statements and dynamic `import()` inside the worker are fine:
+they are bundled into it.
+
+Inside the worker, `self.location` is the worker script's own URL, so its
+own files resolve as in the page: `import url from './data.json?url'`,
+`new URL('./x.bin', import.meta.url)`, and relative URLs given to `fetch`
+or `importScripts`. SharedWorkers and service workers are not supported.
 
 ### Fetching your own files
 
@@ -139,12 +173,25 @@ included in the bundle, but reach them from code as
 `window.specola.base + 'logo.png'`, or better, import them from `src/`.
 References to `public/` files in `index.html` itself are rewritten and work.
 
+### SVG icons
+
+External SVG sprites don't work in a bundle: `<svg><use href="/icons.svg#x"></use></svg>`
+(as in the `npm create vite` templates) shows nothing, whatever the URL,
+because the page runs on an opaque origin and browsers load `<use>`
+references only from the page itself. The plugin warns when it sees one.
+Inline the sprite instead: import its markup (`import sprite from
+'./icons.svg?raw'`), put it in the page once (for instance in a hidden
+`<div>` at the top of `<body>`) and use `<use href="#x">`; or inline each
+icon's `<svg>`, or use SVG files as images (`<img src={iconUrl}>`), which
+work.
+
 ### Storage
 
 `localStorage` works and is saved by Specola per page and user
 (`window.specola.persistent` says whether it is; `await window.specola.flush()`
-waits for pending writes). Cookies, IndexedDB and `sessionStorage` are not
-available on the page's opaque origin.
+waits for pending writes). `sessionStorage` and `document.cookie` work in
+memory, for one load only; IndexedDB is not available on the page's opaque
+origin.
 
 ## Limits
 
@@ -163,7 +210,9 @@ earlier.
 ## Not supported
 
 - Multi-page apps: only `index.html` may be HTML.
-- Module workers, SharedWorkers, service workers.
+- Module workers (a worker is built and run as a classic script),
+  SharedWorkers, service workers.
+- External SVG sprites (`<use href="icons.svg#id">`): inline them.
 - Server-side rendering, API routes, or anything that needs a server: a
   bundle is static files.
 - Building on the server: bundles are built on your machine and uploaded.

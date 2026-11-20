@@ -5,6 +5,7 @@ import { readdirSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { escapeHTML, injectBody, injectHead, rewriteIndexRefs } from './lib/html.js';
 import { DEFAULT_LIMITS, bundleProblems, isHTMLPath, isJunk } from './lib/rules.js';
+import { findSprites, spriteWarning } from './lib/sprites.js';
 import { VERSION } from './lib/version.js';
 
 export { VERSION };
@@ -39,11 +40,14 @@ export function specola(options = {}) {
     // viewed, so everything must be relative ("./"), and workers must be
     // classic scripts: the page runs on an opaque origin, where module
     // workers cannot start (the page SDK turns http(s) workers into classic
-    // blob: workers that importScripts the real file).
+    // blob: workers that importScripts the real file). A classic script is
+    // one file, so a worker's dynamic import()s are inlined into it: Rollup
+    // (Vite 5 to 7) can't split an iife build and fails without this, with
+    // an error that doesn't point here; Rolldown (Vite 8) inlines them anyway.
     config(user) {
       userBase = user.base;
       userWorkerFormat = user.worker?.format;
-      return { base: './', worker: { format: 'iife' } };
+      return { base: './', worker: { format: 'iife', ...workerSplitOptions(this?.meta?.viteVersion) } };
     },
 
     configResolved(resolved) {
@@ -85,6 +89,7 @@ export function specola(options = {}) {
         this.error('Specola bundles need an index.html at the root of the build output (no index.html was emitted)');
       }
       let html = typeof index.source === 'string' ? index.source : Buffer.from(index.source).toString('utf8');
+      const sprites = warnSprites(this, bundle, html);
       html = rewriteIndexRefs(html, files);
       html = injectHead(html, `<meta name="generator" content="specola-vite-plugin/${VERSION}">`);
       if (typeof options.searchText === 'string' && options.searchText.trim() !== '') {
@@ -92,7 +97,7 @@ export function specola(options = {}) {
       }
       index.source = html;
 
-      warnRootAbsolute(this, bundle, publicFiles);
+      warnRootAbsolute(this, bundle, publicFiles, sprites);
 
       const sizes = [
         ...Object.values(bundle).map((f) => ({
@@ -110,6 +115,18 @@ export function specola(options = {}) {
 }
 
 export default specola;
+
+/**
+ * The worker bundler options that keep a worker in one file, for the Vite
+ * version running (this.meta.viteVersion, when Vite provides it): Rollup's
+ * rollupOptions up to Vite 7; Vite 8 bundles with Rolldown, which inlines a
+ * worker's dynamic imports on its own and deprecates rollupOptions.
+ */
+export function workerSplitOptions(viteVersion) {
+  const major = Number(String(viteVersion ?? '').split('.')[0]);
+  if (major >= 8) return {};
+  return { rollupOptions: { output: { inlineDynamicImports: true } } };
+}
 
 function byteLength(source) {
   return typeof source === 'string' ? Buffer.byteLength(source, 'utf8') : source.byteLength;
@@ -140,11 +157,29 @@ function listPublicFiles(config) {
 }
 
 /**
+ * Warns about external SVG sprites in index.html (its source, html) and the
+ * JS chunks: they can't load in a bundle (lib/sprites.js). Returns the
+ * sprites found, by file, so the root-absolute warning doesn't give advice
+ * that can't help them.
+ */
+function warnSprites(ctx, bundle, html) {
+  const found = new Map();
+  const texts = [['index.html', html], ...Object.values(bundle).filter((f) => f.type === 'chunk').map((f) => [f.fileName, f.code])];
+  for (const [file, text] of texts) {
+    const sprites = findSprites(text);
+    if (sprites.length === 0) continue;
+    found.set(file, new Set(sprites));
+    ctx.warn(spriteWarning(file, sprites));
+  }
+  return found;
+}
+
+/**
  * Warns about JS/CSS that refers to a public/ file by a root-absolute path
  * ("/logo.png"): in a bundle that resolves against the Specola server's root,
- * not the bundle, so the file is not found.
+ * not the bundle, so the file is not found. A sprite has its own warning.
  */
-function warnRootAbsolute(ctx, bundle, publicFiles) {
+function warnRootAbsolute(ctx, bundle, publicFiles, sprites = new Map()) {
   if (publicFiles.length === 0) return;
   const names = new Set(publicFiles.map((f) => f.path));
   const re = /(["'`(])\/([^"'`()\s?#]+)/g;
@@ -154,7 +189,7 @@ function warnRootAbsolute(ctx, bundle, publicFiles) {
     else if (f.fileName.endsWith('.css')) text = String(f.source);
     else continue;
     const found = new Set();
-    for (const m of text.matchAll(re)) if (names.has(m[2])) found.add(m[2]);
+    for (const m of text.matchAll(re)) if (names.has(m[2]) && !sprites.get(f.fileName)?.has('/' + m[2])) found.add(m[2]);
     for (const p of found) {
       ctx.warn(
         `${f.fileName} refers to "/${p}" (from public/), which will not resolve inside a Specola bundle: ` +

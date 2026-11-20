@@ -1,3 +1,4 @@
+/// <reference path="./client.d.ts" />
 import type { Plugin } from 'vite';
 
 /** Bundle limits. The server's values are the defaults; lower them to fail
@@ -32,20 +33,6 @@ export default specola;
 /** This plugin's version. */
 export declare const VERSION: string;
 
-/** What Specola's page SDK provides at runtime (and the plugin, under `vite dev`). */
-export interface SpecolaRuntime {
-  /** The URL the bundle's files are served under, ending in "/" ("/" in dev, "" for plain pages). */
-  base: string;
-  /** The path prefix the page is served under, for client-side routers ("" in dev). */
-  basename: string;
-  /** Whether localStorage writes are saved by Specola. */
-  persistent: boolean;
-  /** Saves pending localStorage writes now. */
-  flush(): Promise<void>;
-}
-
-declare global {
-  interface Window {
-    specola?: SpecolaRuntime;
-  }
-}
+// window.specola, for vite.config and app code alike; app code gets it from
+// '@specola/vite-plugin/client' (see client.d.ts).
+export type { SpecolaRuntime } from './client.js';

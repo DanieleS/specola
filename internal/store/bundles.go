@@ -451,12 +451,13 @@ func (s *Store) PutBundleBlob(ctx context.Context, token, sum string, body io.Re
 // else it returns *ErrMissingBlobs. Everything happens in one transaction,
 // which also consumes the grant.
 func (s *Store) CommitBundle(ctx context.Context, token, note string) (id string, version int, err error) {
-	commitNote, err := CleanNote(note)
-	if err != nil {
-		return "", 0, err
-	}
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
 		g, err := openBundleGrant(ctx, tx, token, true)
+		if err != nil {
+			return err
+		}
+		// After the grant: a used or expired link is the more useful answer.
+		commitNote, err := CleanNote(note)
 		if err != nil {
 			return err
 		}
@@ -587,21 +588,43 @@ type BundleFileContent struct {
 	Content     []byte
 }
 
-// BundleFile returns the file at path of the bundle version with key, as long
-// as its page is active (not deleted, nor archived itself or under an
-// archived folder). No user is involved: the key is the capability.
+// BundleFile returns the file at path of the bundle version with key, content
+// included (see BundleFileInfo).
 func (s *Store) BundleFile(ctx context.Context, key, path string) (*BundleFileContent, error) {
-	var f BundleFileContent
+	info, err := s.BundleFileInfo(ctx, key, path)
+	if err != nil {
+		return nil, err
+	}
+	b, err := s.ReadBundleBlob(ctx, info.SHA256, 0, info.Size)
+	if err != nil {
+		return nil, err
+	}
+	return &BundleFileContent{SHA256: info.SHA256, ContentType: info.ContentType, Content: b}, nil
+}
+
+// BundleFileInfo describes a bundle file to serve, without its content.
+type BundleFileInfo struct {
+	SHA256      string
+	ContentType string
+	Size        int64
+}
+
+// BundleFileInfo returns what the file at path of the bundle version with
+// key is, as long as its page is active (not deleted, nor archived itself or
+// under an archived folder). No user is involved: the key is the capability.
+// The content is read separately (ReadBundleBlob), so a HEAD, a conditional
+// request or a small range doesn't cost a read of the whole file.
+func (s *Store) BundleFileInfo(ctx context.Context, key, path string) (*BundleFileInfo, error) {
+	var f BundleFileInfo
 	err := s.pool.QueryRow(ctx, `
-		SELECT f.sha256, f.content_type, b.content
+		SELECT f.sha256, f.content_type, f.size_bytes
 		FROM asset_version v
 		JOIN asset a ON a.id = v.asset_id
 		JOIN asset_version_file f ON f.asset_version_id = v.id
-		JOIN bundle_blob b ON b.sha256 = f.sha256
 		WHERE v.bundle_key = $1 AND f.path = $2
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL
 		  AND (a.folder_id IS NULL OR NOT folder_hidden(a.folder_id))`, key, path).
-		Scan(&f.SHA256, &f.ContentType, &f.Content)
+		Scan(&f.SHA256, &f.ContentType, &f.Size)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -610,6 +633,42 @@ func (s *Store) BundleFile(ctx context.Context, key, path string) (*BundleFileCo
 	}
 	return &f, nil
 }
+
+// maxBlobReads is how many ReadBundleBlob calls run at once; the others wait.
+const maxBlobReads = 4
+
+// ReadBundleBlob reads n bytes of blob sum's content from offset off (both
+// within the blob). Only that slice leaves the database: blobs are stored
+// uncompressed (migration 0010), so Postgres reads just the slice. At most
+// maxBlobReads run at once, which keeps connections for everything else.
+func (s *Store) ReadBundleBlob(ctx context.Context, sum string, off, n int64) ([]byte, error) {
+	if off < 0 || n < 0 {
+		return nil, &ErrInvalid{"invalid range"}
+	}
+	select {
+	case s.blobReads <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-s.blobReads }()
+	var b []byte
+	err := s.pool.QueryRow(ctx, `SELECT substring(content FROM $2::int + 1 FOR $3::int) FROM bundle_blob WHERE sha256 = $1`, sum, off, n).Scan(&b)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) != n {
+		return nil, fmt.Errorf("blob %s: read %d bytes at %d, want %d", sum, len(b), off, n)
+	}
+	s.blobBytes.Add(int64(len(b)))
+	return b, nil
+}
+
+// BundleBytesRead is how many bytes of bundle files were read from the
+// database so far (for tests and monitoring).
+func (s *Store) BundleBytesRead() int64 { return s.blobBytes.Load() }
 
 // VersionFiles returns the bundle key and files (index.html aside) of one
 // version of a page sub can see. A plain version has key "" and no files.

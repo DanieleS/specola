@@ -220,38 +220,43 @@
 </script>
 
 <div class="flex flex-col h-[calc(100vh-3.5rem)]">
-  <div class="flex items-center justify-between gap-3 px-5 h-12 border-b border-white/10 shrink-0">
-    <div class="flex items-center gap-3 min-w-0">
-      <a href="#/" class="text-white/50 hover:text-white/90" aria-label="Back to gallery">←</a>
-      <span class="font-medium truncate">{meta?.name ?? "…"}</span>
+  <!-- One row from sm up; below it, the title row and the actions wrap, so
+       nothing sticks out or overlaps at phone width. -->
+  <div
+    data-viewer-header
+    class="flex flex-wrap sm:flex-nowrap items-center justify-between gap-x-3 gap-y-1 px-3 sm:px-5 py-2 sm:py-0 sm:h-12 border-b border-white/10 shrink-0"
+  >
+    <div class="flex items-center gap-2 sm:gap-3 min-w-0 w-full sm:w-auto">
+      <a href="#/" class="shrink-0 text-white/50 hover:text-white/90" aria-label="Back to gallery">←</a>
+      <span class="font-medium truncate min-w-0">{meta?.name ?? "…"}</span>
       {#if meta && !readOffline}
         <button
-          class={meta.favorite ? "text-amber-400" : "text-white/30 hover:text-amber-300"}
+          class="shrink-0 {meta.favorite ? 'text-amber-400' : 'text-white/30 hover:text-amber-300'}"
           aria-label={meta.favorite ? "Remove from favorites" : "Add to favorites"}
           aria-pressed={meta.favorite}
           onclick={toggleFavorite}>{meta.favorite ? "★" : "☆"}</button
         >
       {/if}
-      {#if meta}<span class="text-xs text-white/40">v{shown}</span>{/if}
+      {#if meta}<span class="shrink-0 text-xs text-white/40">v{shown}</span>{/if}
       {#if shownBundle}
         <span
-          class="text-[10px] uppercase tracking-wide text-sky-300/80 border border-sky-300/30 rounded px-1.5 py-0.5"
+          class="shrink-0 text-[10px] uppercase tracking-wide text-sky-300/80 border border-sky-300/30 rounded px-1.5 py-0.5"
           title="An app published with the Specola Vite plugin, made of several files">bundle</span
         >
       {/if}
       {#if readOffline}
         <span
-          class="text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
+          class="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
           title="The copy kept on this device">offline copy</span
         >
       {/if}
       {#if meta && meta.role !== "owner"}
-        <span class="text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
+        <span class="shrink-0 text-[10px] uppercase tracking-wide text-white/50 border border-white/15 rounded px-1.5 py-0.5"
           >{meta.role}</span
         >
       {/if}
     </div>
-    <div class="flex items-center gap-4 shrink-0">
+    <div class="flex flex-wrap items-center gap-x-3 sm:gap-x-4 gap-y-1 sm:shrink-0">
       {#if offline.supported && meta && (!readOffline || kept?.pinned)}
         <button
           class={action}
@@ -294,7 +299,7 @@
   {#if error}
     <p class="p-5 text-red-400">{error}</p>
   {:else}
-    <div class="flex flex-1 min-h-0">
+    <div class="relative flex flex-1 min-h-0">
       {#if missing}
         <p class="flex-1 p-5 text-white/50">
           Version {shown} isn't {shownBundle ? "available offline" : "kept on this device"}. It can be opened when you're back
@@ -306,7 +311,11 @@
       {/if}
 
       {#if historyOpen}
-        <aside class="w-72 shrink-0 border-l border-white/10 overflow-y-auto" aria-label="Version history">
+        <!-- Beside the page from sm up; over it, at the right, below. -->
+        <aside
+          class="absolute inset-y-0 right-0 z-10 w-72 max-w-full bg-[#0b0d12] shadow-xl sm:static sm:shadow-none shrink-0 border-l border-white/10 overflow-y-auto"
+          aria-label="Version history"
+        >
           <h2 class="px-4 pt-4 pb-2 text-sm font-semibold">History</h2>
           <ul>
             {#each versions as v (v.version)}

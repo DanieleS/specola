@@ -24,7 +24,7 @@ import (
 // The files npm would pack: package.json and what its "files" lists. Keep in
 // sync with package.json (a test checks); never node_modules or the tests.
 //
-//go:embed package.json index.js index.d.ts lib bin README.md
+//go:embed package.json index.js index.d.ts client.d.ts lib bin README.md
 var sources embed.FS
 
 // npm's own fixed date for packed files, so the tarball is the same bytes on
@@ -62,8 +62,11 @@ func InstallCommand(tarballURL string) string { return "npm i -D " + tarballURL 
 
 // PublishCommand is what an agent runs in the project directory to build the
 // app and upload it as a bundle through uploadURL (a bundle upload link).
+// npx --no only runs the specola-publish the project has installed: without
+// it, npx would fetch a package of that name from the public registry (and
+// run it with the upload link), which isn't this plugin.
 func PublishCommand(uploadURL string) string {
-	return "npx specola-publish --upload '" + uploadURL + "'"
+	return "npx --no -- specola-publish --upload '" + uploadURL + "'"
 }
 
 func mustManifest() manifest {

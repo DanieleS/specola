@@ -160,7 +160,7 @@ func TestBundleUploadProtocol(t *testing.T) {
 		}
 		mustJSON(t, body, &g)
 		if code != http.StatusCreated || !strings.HasPrefix(g.UploadURL, "http://test/upload/bundle/") ||
-			g.Command != "npx specola-publish --upload '"+g.UploadURL+"'" ||
+			g.Command != "npx --no -- specola-publish --upload '"+g.UploadURL+"'" ||
 			g.PluginInstall != "npm i -D http://test"+plugin.TarballPath() ||
 			time.Until(g.ExpiresAt) < 29*time.Minute || time.Until(g.ExpiresAt) > 31*time.Minute {
 			t.Fatalf("mint: %d %s", code, body)
@@ -311,12 +311,20 @@ func TestBundleUploadProtocol(t *testing.T) {
 		for name, req := range map[string][3]string{
 			"manifest, old plugin": {"POST", "/upload/bundle/nope/manifest", app.manifest("0.1.0")},
 			"manifest, invalid":    {"POST", "/upload/bundle/nope/manifest", files{"a.js": "x"}.manifest("1.0.0")},
+			"manifest, not JSON":   {"POST", "/upload/bundle/nope/manifest", "{"},
+			"manifest, bad files":  {"POST", "/upload/bundle/nope/manifest", `{"pluginVersion":"1.0.0","files":"x"}`},
 			"blob":                 {"PUT", "/upload/bundle/nope/blobs/" + sum("x"), "x"},
 			"commit":               {"POST", "/upload/bundle/nope/commit", ""},
+			"commit, not JSON":     {"POST", "/upload/bundle/nope/commit", "{"},
+			"commit, long note":    {"POST", "/upload/bundle/nope/commit", `{"note":"` + strings.Repeat("n", 5000) + `"}`},
 		} {
 			if code, body := send(t, ts, req[0], req[1], []byte(req[2])); code != http.StatusNotFound {
 				t.Errorf("%s: %d %s, want 404", name, code, body)
 			}
+		}
+		// A body over the file limit, by its Content-Length.
+		if code, body := send(t, ts, "PUT", "/upload/bundle/nope/blobs/"+sum("x"), make([]byte, 25<<20+1)); code != http.StatusNotFound {
+			t.Errorf("blob over the limit: %d %s, want 404", code, body)
 		}
 		path := mintBundle(t, ts, alice, `{"kind":"new","title":"Big"}`)
 		big := files{"index.html": "<p>big</p>", "big.bin": strings.Repeat("x", 25<<20+1)}
@@ -347,13 +355,19 @@ func TestBundleUploadProtocol(t *testing.T) {
 		if _, err := pool.Exec(t.Context(), `UPDATE asset_grant SET expires_at = now() - interval '1 second' WHERE bundle AND consumed_at IS NULL`); err != nil {
 			t.Fatal(err)
 		}
-		for _, method := range []string{"GET", "POST"} {
-			p := path
-			if method == "POST" {
-				p += "/commit"
-			}
-			if code, _ := send(t, ts, method, p, nil); code != http.StatusGone {
-				t.Fatalf("%s %s: %d, want 410", method, p, code)
+		for _, req := range [][3]string{
+			{"GET", path, ""},
+			{"POST", path + "/commit", ""},
+			// A bad body still learns first that the link is dead.
+			{"POST", path + "/commit", "{"},
+			{"POST", path + "/commit", `{"note":"` + strings.Repeat("n", 5000) + `"}`},
+			{"POST", path + "/manifest", "{"},
+			{"POST", path + "/manifest", `{"pluginVersion":"1.0.0","files":"x"}`},
+			{"POST", path + "/manifest", files{"a.js": "x"}.manifest("0.1.0")},
+			{"PUT", path + "/blobs/" + sum("x"), "x"},
+		} {
+			if code, body := send(t, ts, req[0], req[1], []byte(req[2])); code != http.StatusGone {
+				t.Errorf("%s %s %.40q: %d %s, want 410", req[0], req[1], req[2], code, body)
 			}
 		}
 	})
@@ -372,7 +386,9 @@ func TestBundleUploadProtocol(t *testing.T) {
 }
 
 func TestBundleServing(t *testing.T) {
-	ts, _ := newBundleTestServer(t, &config.Config{AppBaseURL: "http://test"})
+	st := store.New(testdb.New(t))
+	ts := httptest.NewServer(New(&config.Config{AppBaseURL: "http://test", TrustedUserHeader: userHeader}, st, nil, nil))
+	t.Cleanup(ts.Close)
 	const alice = "alice@example.com"
 	index := `<!doctype html><link rel="stylesheet" href="__SPECOLA_BASE__/assets/s.css">` +
 		`<script type="module" src="__SPECOLA_BASE__/assets/app.js"></script>`
@@ -463,6 +479,45 @@ func TestBundleServing(t *testing.T) {
 		if b := readBody(t, res); res.StatusCode != http.StatusPartialContent || b != "console" ||
 			res.Header.Get("Content-Range") != fmt.Sprintf("bytes 0-6/%d", len(app["assets/app.js"])) || res.Header.Get("Content-Encoding") != "" {
 			t.Fatalf("range: %d %q, Content-Range %q, Content-Encoding %q", res.StatusCode, b, res.Header.Get("Content-Range"), res.Header.Get("Content-Encoding"))
+		}
+	})
+
+	t.Run("content is read only when sent", func(t *testing.T) {
+		defer func(n int64) { bundleChunkBytes = n }(bundleChunkBytes)
+		bundleChunkBytes = 4 // app.js is 26 bytes: 7 chunks
+		read := func(h http.Header, method string) (int, string, int64) {
+			t.Helper()
+			before := st.BundleBytesRead()
+			req, _ := http.NewRequest(method, ts.URL+base+"assets/app.js", nil)
+			for k, v := range h {
+				req.Header[k] = v
+			}
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return res.StatusCode, readBody(t, res), st.BundleBytesRead() - before
+		}
+		js := app["assets/app.js"]
+		if code, b, n := read(nil, "GET"); code != http.StatusOK || b != js || n != int64(len(js)) {
+			t.Errorf("GET: %d %q, read %d bytes", code, b, n)
+		}
+		if code, _, n := read(nil, "HEAD"); code != http.StatusOK || n != 0 {
+			t.Errorf("HEAD: %d, read %d bytes, want none", code, n)
+		}
+		if code, _, n := read(http.Header{"If-None-Match": {`"` + sum(js) + `"`}}, "GET"); code != http.StatusNotModified || n != 0 {
+			t.Errorf("If-None-Match: %d, read %d bytes, want none", code, n)
+		}
+		if code, b, n := read(http.Header{"Range": {"bytes=0-0"}}, "GET"); code != http.StatusPartialContent || b != "c" || n != 4 {
+			t.Errorf("first byte: %d %q, read %d bytes, want one chunk", code, b, n)
+		}
+		// Across chunks, and two ranges at once.
+		if code, b, _ := read(http.Header{"Range": {"bytes=6-13"}}, "GET"); code != http.StatusPartialContent || b != js[6:14] {
+			t.Errorf("range across chunks: %d %q, want %q", code, b, js[6:14])
+		}
+		if code, b, _ := read(http.Header{"Range": {"bytes=1-2,20-"}}, "GET"); code != http.StatusPartialContent ||
+			!strings.Contains(b, js[1:3]) || !strings.Contains(b, js[20:]) {
+			t.Errorf("two ranges: %d %q", code, b)
 		}
 	})
 
