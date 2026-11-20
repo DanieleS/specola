@@ -81,7 +81,7 @@ func (s *Server) handlePublicLink(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
-	html, err := s.st.OpenPublicLink(r.Context(), chi.URLParam(r, "token"))
+	html, key, err := s.st.OpenPublicLink(r.Context(), chi.URLParam(r, "token"))
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "this link doesn't exist or has been revoked", http.StatusNotFound)
@@ -93,7 +93,7 @@ func (s *Server) handlePublicLink(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
-	writePage(w, html, "'none'")
+	writePage(w, s.pageHTML(html, key), "'none'")
 }
 
 // writePage sends a page's HTML, with the page SDK added, sandboxed onto an

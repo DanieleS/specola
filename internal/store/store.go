@@ -52,6 +52,8 @@ type PageMeta struct {
 	// Public: the page has a public link that hasn't expired. Only told to
 	// the owner.
 	Public bool `json:"public"`
+	// Bundle: the current version is an SPA bundle (see bundles.go).
+	Bundle bool `json:"bundle"`
 }
 
 // querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
@@ -294,11 +296,13 @@ func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error)
 	err := s.pool.QueryRow(ctx, `
 		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
 		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`,
-		       r.level = 3 AND `+hasPublicLinks+`
+		       r.level = 3 AND `+hasPublicLinks+`,
+		       EXISTS (SELECT 1 FROM asset_version v
+		               WHERE v.asset_id = a.id AND v.version = a.current_version AND v.bundle_key IS NOT NULL)
 		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
 		WHERE a.id = $1::uuid AND r.level > 0
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public)
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public, &m.Bundle)
 	m.Role = r.String()
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound
@@ -325,12 +329,13 @@ func (s *Store) CurrentContent(ctx context.Context, sub, id string) (string, err
 	return html, err
 }
 
-// CurrentVersion returns the number and content hash of the current version of
-// a page sub can see, so a cached copy can be validated without loading the
-// HTML.
+// CurrentVersion returns the number and a hash of the content of the current
+// version of a page sub can see, so a cached copy can be validated without
+// loading the HTML. For a bundle the hash covers its key too, since the HTML
+// served names the key: two bundle versions with the same index.html differ.
 func (s *Store) CurrentVersion(ctx context.Context, sub, id string) (version int, hash string, err error) {
 	err = s.pool.QueryRow(ctx, `
-		SELECT av.version, av.content_hash
+		SELECT av.version, av.content_hash || COALESCE('.' || left(md5(av.bundle_key), 8), '')
 		FROM asset a
 		JOIN asset_version av ON av.asset_id = a.id AND av.version = a.current_version
 		WHERE a.id = $1::uuid AND asset_access($2, a.id) > 0

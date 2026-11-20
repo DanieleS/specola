@@ -95,7 +95,8 @@ func main() {
 	slog.Info("specola stopped")
 }
 
-// sweepGrants periodically deletes upload grants that expired over a day ago.
+// sweepGrants periodically deletes upload grants that expired over a day ago,
+// and the bundle blobs that nothing uses and that are over a day old.
 func sweepGrants(ctx context.Context, st *store.Store) {
 	t := time.NewTicker(10 * time.Minute)
 	defer t.Stop()
@@ -104,6 +105,11 @@ func sweepGrants(ctx context.Context, st *store.Store) {
 			slog.Warn("sweep grants", "err", err)
 		} else if n > 0 {
 			slog.Info("swept expired grants", "count", n)
+		}
+		if n, err := st.SweepBundleBlobs(ctx, 24*time.Hour); err != nil {
+			slog.Warn("sweep bundle blobs", "err", err)
+		} else if n > 0 {
+			slog.Info("swept unused bundle blobs", "count", n)
 		}
 		select {
 		case <-ctx.Done():

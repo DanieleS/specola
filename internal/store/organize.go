@@ -25,6 +25,8 @@ type VersionInfo struct {
 	EditedBy     string    `json:"editedBy,omitempty"` // email, or sub when unknown
 	RestoredFrom *int      `json:"restoredFrom,omitempty"`
 	Note         *string   `json:"note,omitempty"`
+	// Bundle: the version is an SPA bundle (see bundles.go).
+	Bundle bool `json:"bundle"`
 }
 
 // Versions lists a page's versions, newest first. sub must be able to see it.
@@ -33,7 +35,8 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT v.version, v.size_bytes, v.created_at, COALESCE(u.email, v.edited_by_sub, ''), v.restored_from_version, v.note
+		SELECT v.version, v.size_bytes, v.created_at, COALESCE(u.email, v.edited_by_sub, ''), v.restored_from_version, v.note,
+		       v.bundle_key IS NOT NULL
 		FROM asset_version v LEFT JOIN app_user u ON u.sub = v.edited_by_sub
 		WHERE v.asset_id = $1::uuid
 		ORDER BY v.version DESC`, id)
@@ -44,7 +47,7 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 	out := []VersionInfo{}
 	for rows.Next() {
 		var v VersionInfo
-		if err := rows.Scan(&v.Version, &v.SizeBytes, &v.CreatedAt, &v.EditedBy, &v.RestoredFrom, &v.Note); err != nil {
+		if err := rows.Scan(&v.Version, &v.SizeBytes, &v.CreatedAt, &v.EditedBy, &v.RestoredFrom, &v.Note, &v.Bundle); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -54,24 +57,39 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 
 // VersionContent returns the HTML of one version of a page sub can see.
 func (s *Store) VersionContent(ctx context.Context, sub, id string, version int) (string, error) {
+	html, _, err := s.VersionPage(ctx, sub, id, version)
+	return html, err
+}
+
+// VersionPage returns the HTML of one version of a page sub can see, and its
+// bundle key ("" for a plain page), which serving needs to point the HTML at
+// the bundle's files.
+func (s *Store) VersionPage(ctx context.Context, sub, id string, version int) (html, bundleKey string, err error) {
 	if err := checkPage(ctx, s.pool, id, sub, RoleViewer); err != nil {
-		return "", err
+		return "", "", err
 	}
 	return versionContent(ctx, s.pool, id, version)
 }
 
-func versionContent(ctx context.Context, q querier, id string, version int) (string, error) {
-	var html string
-	err := q.QueryRow(ctx, `SELECT content FROM asset_version WHERE asset_id = $1::uuid AND version = $2`, id, version).Scan(&html)
+func versionContent(ctx context.Context, q querier, id string, version int) (html, bundleKey string, err error) {
+	var key *string
+	err = q.QueryRow(ctx, `SELECT content, bundle_key FROM asset_version WHERE asset_id = $1::uuid AND version = $2`, id, version).Scan(&html, &key)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound
+		return "", "", ErrNotFound
 	}
-	return html, err
+	if err != nil {
+		return "", "", err
+	}
+	if key != nil {
+		bundleKey = *key
+	}
+	return html, bundleKey, nil
 }
 
 // RestoreVersion copies an earlier version's HTML into a new current version,
-// keeping the history intact, and returns the new version number. note is
-// optional (see CleanNote).
+// keeping the history intact, and returns the new version number. A bundle
+// version is restored as a bundle with the same files under a new key. note
+// is optional (see CleanNote).
 func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int, note string) (version int, err error) {
 	n, err := CleanNote(note)
 	if err != nil {
@@ -81,12 +99,17 @@ func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int, no
 		if err := checkPage(ctx, tx, id, sub, RoleEditor); err != nil {
 			return err
 		}
-		html, err := versionContent(ctx, tx, id, from)
+		html, key, err := versionContent(ctx, tx, id, from)
 		if err != nil {
 			return err
 		}
-		version, err = addVersion(ctx, tx, id, html, n, sub, &from)
-		return err
+		if version, err = addVersion(ctx, tx, id, html, n, sub, &from); err != nil {
+			return err
+		}
+		if key != "" {
+			return copyBundleFiles(ctx, tx, id, from, version)
+		}
+		return nil
 	})
 	return version, err
 }

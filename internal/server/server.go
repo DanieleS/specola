@@ -79,10 +79,20 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 
 	// The token is the credential: no session needed, so agents can curl it.
 	r.Put("/upload/{token}", s.handleUpload)
+	r.Route("/upload/bundle/{token}", func(r chi.Router) {
+		r.Get("/", s.handleBundleUploadInfo)
+		r.Post("/manifest", s.handleBundleManifest)
+		r.Put("/blobs/{sha256}", s.handleBundleBlob)
+		r.Post("/commit", s.handleBundleCommit)
+	})
 
 	// Public links: the token is the credential, and no session is involved.
 	if cfg.ViewOrigin == "" {
 		r.Get("/s/{token}", s.handlePublicLink)
+		// Bundle files: the key is the capability. HEAD too, so a client
+		// checking a file isn't answered by the SPA shell.
+		r.Get("/b/{key}/*", s.handleBundleFile)
+		r.Head("/b/{key}/*", s.handleBundleFile)
 	}
 
 	if cfg.ViewOrigin != "" {
@@ -93,6 +103,8 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		vr.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 		vr.Get("/view/{id}", s.handleTokenView)
 		vr.Get("/s/{token}", s.handlePublicLink)
+		vr.Get("/b/{key}/*", s.handleBundleFile)
+		vr.Head("/b/{key}/*", s.handleBundleFile)
 		s.viewMux = vr
 	}
 
@@ -109,6 +121,8 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Get("/pages/{id}", s.handlePageMeta)
 			r.Get("/pages/{id}/versions", s.handleVersions)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
+			r.Get("/pages/{id}/versions/{v}/files", s.handleVersionFiles)
+			r.Post("/bundle-uploads", s.handleCreateBundleUpload)
 			r.Get("/pages/{id}/data", s.handlePageData)
 			r.Patch("/pages/{id}/data", s.handleUpdatePageData)
 			r.Delete("/pages/{id}/data", s.handleClearPageData)
@@ -140,6 +154,11 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		r.Get("/s/*", func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "public links are served from "+cfg.ViewOrigin, http.StatusNotFound)
 		})
+		bundleElsewhere := func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "bundle files are served from "+cfg.ViewOrigin, http.StatusNotFound)
+		}
+		r.Get("/b/*", bundleElsewhere)
+		r.Head("/b/*", bundleElsewhere)
 	}
 
 	// Everything else is the SPA (public shell; data endpoints above are gated).
@@ -150,6 +169,11 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// A byte range is of the stored representation: compressing the part
+	// would make it meaningless, so ranges are answered uncompressed.
+	if r.Header.Get("Range") != "" {
+		r.Header.Del("Accept-Encoding")
+	}
 	if s.viewMux != nil && strings.EqualFold(r.Host, s.viewHost) {
 		s.viewMux.ServeHTTP(w, r)
 		return
@@ -644,7 +668,7 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 			return
 		}
 	}
-	html, err := s.st.VersionContent(ctx, sub, id, n)
+	html, key, err := s.st.VersionPage(ctx, sub, id, n)
 	if err != nil {
 		w.Header().Del("Cache-Control")
 		w.Header().Del("ETag")
@@ -658,7 +682,7 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id strin
 		// in the URL is the credential, so no cookies are involved.
 		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AppBaseURL)
 	}
-	writePage(w, html, ancestors)
+	writePage(w, s.pageHTML(html, key), ancestors)
 }
 
 // etagMatches reports whether an If-None-Match header names etag. Comparison
@@ -729,6 +753,11 @@ func httpError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, store.ErrGrantKind), errors.Is(err, store.ErrUnknownUser), errors.Is(err, store.ErrSelfShare):
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var missing *store.ErrMissingBlobs
+	if errors.As(err, &missing) {
+		writeJSON(w, http.StatusConflict, map[string][]string{"missing": missing.Missing})
 		return
 	}
 	var invalid *store.ErrInvalid
