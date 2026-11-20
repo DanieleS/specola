@@ -67,9 +67,13 @@ type Conventions struct {
 	FolderID   string `json:"folderId"`
 	FolderName string `json:"folderName"`
 	// Path names the folder from the top of its tree, " / " between names;
-	// a folder above it the reader can't see is "…".
-	Path       string    `json:"path"`
-	Text       string    `json:"text"`
+	// a folder the reader can't see, this one included (its conventions are
+	// inherited by a sub-folder shared with them), is "…", and so is
+	// FolderName then.
+	Path string `json:"path"`
+	Text string `json:"text"`
+	// StyleRefID is nil for a reader who neither sees the page nor owns
+	// the folder.
 	StyleRefID *string   `json:"styleRefId"`
 	StyleRef   *StyleRef `json:"styleRef"`
 	// UpdatedBy names who wrote them: their name and email, as known.
@@ -204,6 +208,7 @@ func (s *Store) SetPreferences(ctx context.Context, sub string, in PreferencesIn
 func conventionsAt(ctx context.Context, q querier, sub, folderID string) (*Conventions, error) {
 	var c Conventions
 	var name, email *string
+	var srcOwner bool
 	err := q.QueryRow(ctx, `
 		WITH RECURSIVE chain AS (
 		  SELECT id, parent_id, name, 0 AS depth FROM folder WHERE id = $1::uuid
@@ -216,15 +221,17 @@ func conventionsAt(ctx context.Context, q querier, sub, folderID string) (*Conve
 		  JOIN folder_conventions fc ON fc.folder_id = c.id
 		  ORDER BY c.depth LIMIT 1
 		)
-		SELECT src.id::text, src.name,
-		       (SELECT string_agg(CASE WHEN c.depth = src.depth OR folder_access($2, c.id, true) > 0
+		SELECT src.id::text,
+		       CASE WHEN folder_access($2, src.id, true) > 0 THEN src.name ELSE '…' END,
+		       (SELECT string_agg(CASE WHEN folder_access($2, c.id, true) > 0
 		                               THEN c.name ELSE '…' END, ' / ' ORDER BY c.depth DESC)
 		        FROM chain c WHERE c.depth >= src.depth),
+		       folder_access($2, src.id, true) >= 3,
 		       fc.text, fc.style_ref_asset_id::text, fc.updated_by_sub, u.name, u.email, fc.updated_at
 		FROM src
 		JOIN folder_conventions fc ON fc.folder_id = src.id
 		LEFT JOIN app_user u ON u.sub = fc.updated_by_sub`, folderID, sub).
-		Scan(&c.FolderID, &c.FolderName, &c.Path, &c.Text, &c.StyleRefID, &c.UpdatedBySub, &name, &email, &c.UpdatedAt)
+		Scan(&c.FolderID, &c.FolderName, &c.Path, &srcOwner, &c.Text, &c.StyleRefID, &c.UpdatedBySub, &name, &email, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, nil
 	}
@@ -234,6 +241,11 @@ func conventionsAt(ctx context.Context, q querier, sub, folderID string) (*Conve
 	c.UpdatedBy = displayUser(c.UpdatedBySub, name, email)
 	if c.StyleRef, err = styleRef(ctx, q, sub, c.StyleRefID); err != nil {
 		return nil, err
+	}
+	// The id of a reference the reader can't see is kept only for the
+	// folder's owners, who may save the conventions with it unchanged.
+	if c.StyleRef == nil && !srcOwner {
+		c.StyleRefID = nil
 	}
 	return &c, nil
 }
@@ -326,6 +338,8 @@ func (s *Store) DeleteFolderConventions(ctx context.Context, sub, folderID strin
 // AgentConventions is what an agent publishing for sub into a folder should
 // respect, besides the user's explicit request.
 type AgentConventions struct {
+	// At is the folder published into; nil for the root.
+	At *string
 	// Folder are the conventions in force in the folder; nil if none.
 	Folder *Conventions
 	// User are sub's preferences; nil if they ask nothing.
@@ -345,11 +359,29 @@ func (a *AgentConventions) Empty() bool {
 // (nil: their root, where only their preferences apply). sub must be able to
 // see the folder.
 func (s *Store) AgentConventions(ctx context.Context, sub string, folderID *string) (*AgentConventions, error) {
-	out := &AgentConventions{}
+	if err := checkFolder(ctx, s.pool, folderID, sub, RoleViewer); err != nil {
+		return nil, err
+	}
+	return s.agentConventions(ctx, sub, folderID)
+}
+
+// AgentConventionsForPage returns what applies when sub publishes a version
+// of page id: the conventions of the folder it is in, even when the page is
+// shared with sub on its own and the folder isn't, besides sub's preferences.
+func (s *Store) AgentConventionsForPage(ctx context.Context, sub, id string) (*AgentConventions, error) {
+	if err := checkPage(ctx, s.pool, id, sub, RoleViewer); err != nil {
+		return nil, err
+	}
+	var folderID *string
+	if err := s.pool.QueryRow(ctx, `SELECT folder_id::text FROM asset WHERE id = $1::uuid`, id).Scan(&folderID); err != nil {
+		return nil, err
+	}
+	return s.agentConventions(ctx, sub, folderID)
+}
+
+func (s *Store) agentConventions(ctx context.Context, sub string, folderID *string) (*AgentConventions, error) {
+	out := &AgentConventions{At: folderID}
 	if folderID != nil {
-		if err := checkFolder(ctx, s.pool, folderID, sub, RoleViewer); err != nil {
-			return nil, err
-		}
 		c, err := conventionsAt(ctx, s.pool, sub, *folderID)
 		if err != nil {
 			return nil, err

@@ -230,4 +230,25 @@ func TestMCPPreferencesAndConventions(t *testing.T) {
 	if c := bobGrant.Conventions; c == nil || c.Folder == nil || c.Folder.Text != "Four KPIs on top" || c.User != nil || c.StyleReference != nil {
 		t.Fatalf("bob's conventions = %+v", c)
 	}
+
+	// A page shared with bob on its own, in a folder he can't see: a new
+	// version still gets the folder's conventions, without its name.
+	var private struct{ ID string }
+	callTool(t, cs, "create_folder", map[string]any{"name": "Board"}, &private)
+	if code, body := call(t, ts, alice, "PUT", "/api/folders/"+private.ID+"/conventions", `{"text":"Board style","styleRefId":"`+ds+`"}`); code != http.StatusOK {
+		t.Fatalf("set conventions: %d %s", code, body)
+	}
+	var memo struct{ ID string }
+	callTool(t, cs, "publish_page", map[string]any{"title": "Memo", "html": "<p>m</p>", "folder_id": private.ID}, &memo)
+	if code, body := call(t, ts, alice, "PUT", "/api/pages/"+memo.ID+"/acl", `{"email":"`+bob+`","role":"editor"}`); code != http.StatusNoContent {
+		t.Fatalf("share page: %d %s", code, body)
+	}
+	bobGrant.Conventions = nil
+	callTool(t, bobCS, "create_bundle_upload", map[string]any{"kind": "version", "id": memo.ID}, &bobGrant)
+	if c := bobGrant.Conventions; c == nil || c.Folder == nil || c.Folder.Text != "Board style" || c.Folder.Path != "…" || c.Folder.Inherited || c.StyleReference != nil {
+		t.Fatalf("bob's conventions on a shared page = %+v", c)
+	}
+	if c := bobGrant.Conventions; strings.Contains(c.Folder.Path+c.About, "Board") {
+		t.Fatalf("the folder's name leaks: %+v", c.Folder)
+	}
 }

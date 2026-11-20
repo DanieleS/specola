@@ -94,9 +94,13 @@ Where the sketch above was open, the implementation decided:
   `folder.written_by`, `folder.updated_at`, `user.mode`, and
   `style_reference.url`/`from` (`folder` or `user`: the folder's reference
   wins if the publisher can see it). For a new version, the page's folder
-  counts. A failure to read conventions never fails the tool call.
+  counts, also when only the page is shared with the publisher. A failure to
+  read conventions never fails the tool call.
 - `folder.path` runs from the top of the tree to the folder the conventions
-  are set on; folders above it the reader can't see are shown as `…`.
+  are set on; folders the reader can't see, that one included (conventions
+  inherited by a sub-folder shared on its own), are shown as `…`. The id of
+  a style reference the reader can't see is told only to the folder's
+  owners (so they can save the conventions with it unchanged).
 - `GET /api/folders/{id}/conventions` answers `{own, effective, canEdit}`;
   `PUT` and `DELETE` answer the same. Saving with a style reference left
   unchanged skips the visibility check, so text can still be saved after the

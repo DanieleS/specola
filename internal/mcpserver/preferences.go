@@ -161,13 +161,18 @@ func (t *tools) conventions(ctx context.Context, sub string, folderID *string) *
 		slog.Warn("mcp: read conventions", "err", err)
 		return nil
 	}
+	return t.conventionsOf(c)
+}
+
+// conventionsOf is the conventions object for c; nil when nothing applies.
+func (t *tools) conventionsOf(c *store.AgentConventions) *conventionsOut {
 	if c.Empty() {
 		return nil
 	}
 	out := &conventionsOut{About: conventionsAbout, Precedence: "request > folder > user"}
 	if f := c.Folder; f != nil {
 		out.Folder = &folderConvOut{
-			ID: f.FolderID, Path: f.Path, Inherited: folderID != nil && *folderID != f.FolderID,
+			ID: f.FolderID, Path: f.Path, Inherited: c.At != nil && *c.At != f.FolderID,
 			WrittenBy: f.UpdatedBy, UpdatedAt: f.UpdatedAt, Text: f.Text,
 		}
 	}
@@ -183,11 +188,12 @@ func (t *tools) conventions(ctx context.Context, sub string, folderID *string) *
 // pageConventions is conventions for publishing a version of page id: those
 // of the folder it is in.
 func (t *tools) pageConventions(ctx context.Context, sub, id string) *conventionsOut {
-	meta, err := t.st.PageMeta(ctx, sub, id)
+	c, err := t.st.AgentConventionsForPage(ctx, sub, id)
 	if err != nil {
+		slog.Warn("mcp: read conventions", "err", err)
 		return nil
 	}
-	return t.conventions(ctx, sub, meta.FolderID)
+	return t.conventionsOf(c)
 }
 
 // grantConventions is conventions for what an upload grant publishes: a new

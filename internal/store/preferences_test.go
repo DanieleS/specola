@@ -126,10 +126,20 @@ func TestFolderConventions(t *testing.T) {
 	if err != nil || fc.Own != nil || fc.CanEdit || fc.Effective == nil || fc.Effective.FolderID != team || fc.Effective.Text != "ECharts, EUR" {
 		t.Fatalf("bob on Reports = %+v, %v", fc, err)
 	}
-	// Bob can't see Team, so its name is hidden in the path but the source's
-	// own name is told; nor can he see the style reference page.
-	if fc.Effective.Path != "Team" || fc.Effective.StyleRef != nil || fc.Effective.StyleRefID == nil {
+	// Bob can't see Team, so its name is hidden; nor can he see the style
+	// reference page, whose id isn't told either.
+	if fc.Effective.Path != "…" || fc.Effective.FolderName != "…" || fc.Effective.StyleRef != nil || fc.Effective.StyleRefID != nil {
 		t.Fatalf("bob's effective = %+v", fc.Effective)
+	}
+	// Alice, who owns Team, keeps the id of a reference she no longer sees.
+	if _, err := pool.Exec(ctx, `UPDATE asset SET archived_at = now() WHERE id = $1`, ds); err != nil {
+		t.Fatal(err)
+	}
+	if fc, _ := st.FolderConventions(ctx, "alice", team); fc.Own == nil || fc.Own.StyleRef != nil || fc.Own.StyleRefID == nil || *fc.Own.StyleRefID != ds {
+		t.Fatalf("alice's own with an archived reference = %+v", fc.Own)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE asset SET archived_at = NULL WHERE id = $1`, ds); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := st.FolderConventions(ctx, "dave", reports); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("stranger reads: %v", err)
@@ -140,7 +150,7 @@ func TestFolderConventions(t *testing.T) {
 		t.Fatal(err)
 	}
 	fc, _ = st.FolderConventions(ctx, "carol", reports)
-	if fc.Effective == nil || fc.Effective.FolderID != finance || fc.Effective.Path != "… / Finance" || fc.Effective.Text != "React + Tailwind" {
+	if fc.Effective == nil || fc.Effective.FolderID != finance || fc.Effective.Path != "… / …" || fc.Effective.FolderName != "…" || fc.Effective.Text != "React + Tailwind" {
 		t.Fatalf("carol on Reports = %+v", fc.Effective)
 	}
 	fc, _ = st.FolderConventions(ctx, "alice", reports)
@@ -186,6 +196,22 @@ func TestFolderConventions(t *testing.T) {
 	ac, _ = st.AgentConventions(ctx, "alice", &finance)
 	if ac.StyleRef == nil || ac.StyleRef.ID != secret || ac.StyleRefFrom != "user" {
 		t.Fatalf("alice in Finance = %+v", ac.StyleRef)
+	}
+	// A page in Finance shared with carol on its own: publishing a version,
+	// Finance's conventions apply, though she can't see the folder.
+	inFinance, _, _ := st.CreatePage(ctx, &finance, "Budget", "<p>b</p>", "", "alice")
+	if err := st.Share(ctx, "alice", KindPage, inFinance, "carol", RoleEditor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AgentConventions(ctx, "carol", &finance); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("carol in Finance: %v", err)
+	}
+	ac, err = st.AgentConventionsForPage(ctx, "carol", inFinance)
+	if err != nil || ac.Folder == nil || ac.Folder.FolderID != finance || ac.Folder.Path != "… / …" || ac.At == nil || *ac.At != finance {
+		t.Fatalf("carol on Budget = %+v, %v", ac, err)
+	}
+	if _, err := st.AgentConventionsForPage(ctx, "dave", inFinance); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stranger on Budget: %v", err)
 	}
 	ac, _ = st.AgentConventions(ctx, "carol", nil)
 	if !ac.Empty() {

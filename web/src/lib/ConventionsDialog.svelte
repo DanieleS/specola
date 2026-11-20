@@ -22,6 +22,10 @@
   let busy = $state(false);
   let error = $state("");
 
+  // Folders the user can't open are "…" in the path (the source included).
+  let inheritedFrom = $derived(
+    inherited && inherited.folderName !== "…" ? inherited.path : "a folder above, which you can't open",
+  );
   let count = $derived([...text].length);
   let tooLong = $derived(count > MAX_PREFERENCE_CHARS);
 
@@ -90,7 +94,7 @@
         {#if inherited && !own}
           <div class="mb-4 p-3 rounded-md border border-white/10 bg-white/[0.03] text-sm">
             <p class="text-white/60 mb-1">
-              Now inherited from <span class="text-white/85">{inherited.path}</span>, by {inherited.updatedBy}. Conventions
+              Now inherited from <span class="text-white/85">{inheritedFrom}</span>, by {inherited.updatedBy}. Conventions
               set here replace them for this folder.
             </p>
             {#if inherited.text}
