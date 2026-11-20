@@ -366,7 +366,7 @@
   const m = ${maps};
   const k = (u, map) => { try { const x = new URL(String(u)); x.hash = x.search = ""; return map[x.href]; } catch {} };
   const f = self.fetch;
-  self.fetch = function (i, o) { return f.call(this, (!o || !o.method || /^(GET|HEAD)$/i.test(o.method)) && k(i instanceof Request ? i.url : i, m.raw) || i, o); };
+  self.fetch = function (i, o) { const r = i instanceof Request; return f.call(this, /^(GET|HEAD)$/i.test((o && o.method) || (r ? i.method : "GET")) && k(r ? i.url : i, m.raw) || i, o); };
   const s = self.importScripts;
   self.importScripts = (...a) => s.apply(self, a.map((u) => k(u, m.loaded) || u));
 })();

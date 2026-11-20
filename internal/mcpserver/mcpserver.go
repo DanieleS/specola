@@ -111,7 +111,7 @@ const pageRuntime = `Every page runs in a sandbox on an opaque origin, without a
 // bundleConstraints are what an app must respect to run as a bundle, one line
 // each.
 var bundleConstraints = fmt.Sprintf(`Bundle constraints:
-  - Client-side routing: <BrowserRouter basename={window.specola?.basename}> (or the basename option of your router), or a hash router.
+  - Client-side routing: prefer a hash router (createHashRouter, #/... URLs), which also works when the page is viewed offline; a path router needs <BrowserRouter basename={window.specola?.basename}> (or your router's basename option) and doesn't route offline.
   - Workers run as classic scripts (the plugin builds them so; {type: "module"} is ignored); no SharedWorker or service worker.
   - Own files: fetch a URL imported from the module (import url from './data.json?url', or new URL('./x.bin', import.meta.url)); a public/ file is window.specola.base + 'logo.png'. Never root-absolute URLs ('/data.json'): they point at Specola, not the bundle.
   - index.html is the only HTML file; nothing runs on a server (no SSR or API routes).

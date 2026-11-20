@@ -128,16 +128,23 @@ async function fetchHTML(viewUrl: string, v: number, bundle = false): Promise<Re
  */
 export async function keep(meta: PageMeta, v: number, pin = false) {
   if (!supported || !index.owner) return;
+  const owner = index.owner;
   let stored: Stored | null = null;
   if (!index.pages[meta.id]?.versions.includes(v)) {
     // Opening a page and saving it at once mustn't download a bundle twice.
     const k = htmlKey(meta.id, v);
     let p = storing.get(k);
     if (!p) {
-      p = store(meta, v).finally(() => storing.delete(k));
+      p = held(k, () => store(meta, v)).finally(() => storing.delete(k));
       storing.set(k, p);
     }
     stored = await p;
+    // A bundle takes a while: the user may have logged out meanwhile, and
+    // what was kept for them must not outlive that.
+    if (index.owner !== owner) {
+      if (!index.pages[meta.id]?.versions.includes(v)) await drop(await caches.open(PAGES), meta.id, [v]);
+      return;
+    }
   }
   const old = index.pages[meta.id];
   const versions = [...new Set([...(old?.versions ?? []), v])].sort((a, b) => a - b);
@@ -159,6 +166,14 @@ export async function keep(meta: PageMeta, v: number, pin = false) {
 type Stored = { bundle: boolean; bytes: number };
 const storing = new Map<string, Promise<Stored>>();
 
+// held runs f holding a lock named after k, which tells prune in every tab
+// that version k is being stored.
+const LOCK = "specola-keep ";
+async function held<T>(k: string, f: () => Promise<T>): Promise<T> {
+  if (!navigator.locks) return f();
+  return navigator.locks.request(LOCK + k, f);
+}
+
 // store puts version v of a page in the cache: its HTML and, for a bundle,
 // its files.
 async function store(meta: PageMeta, v: number): Promise<Stored> {
@@ -171,7 +186,13 @@ async function store(meta: PageMeta, v: number): Promise<Stored> {
   const c = await caches.open(PAGES);
   // The files first: a version counts as kept once its HTML is.
   const bytes = bundle ? await keepFiles(c, meta.id, v, files!) : 0;
-  await c.put(htmlKey(meta.id, v), new Response(html, { headers: { "Content-Type": "text/html" } }));
+  try {
+    await c.put(htmlKey(meta.id, v), new Response(html, { headers: { "Content-Type": "text/html" } }));
+  } catch (e) {
+    // Say, out of quota: the files must not stay behind, kept by no one.
+    await drop(c, meta.id, [v]);
+    throw e;
+  }
   return { bundle, bytes: bytes + html.size };
 }
 
@@ -304,12 +325,34 @@ async function evict() {
   }
 }
 
+// prune deletes what the cache holds of versions the index doesn't list and
+// no tab is storing: the files of a bundle whose download was cut short (the
+// tab closed, say), which nothing else would ever delete.
+async function prune() {
+  const c = await caches.open(PAGES);
+  const keys = await c.keys();
+  // Versions another tab is storing right now.
+  const busy = new Set((await navigator.locks?.query())?.held?.map((l) => l.name) ?? []);
+  await Promise.all(
+    keys.map((r) => {
+      const m = /^\/__offline\/pages\/([^/]+)\/(\d+)(?:\/|$)/.exec(new URL(r.url).pathname);
+      if (!m) return;
+      const id = decodeURIComponent(m[1]);
+      const v = Number(m[2]);
+      const k = htmlKey(id, v);
+      if (index.pages[id]?.versions.includes(v) || storing.has(k) || busy.has(LOCK + k)) return;
+      return c.delete(r);
+    }),
+  );
+}
+
 /**
  * Brings every saved page up to its current version, dropping the others, and
  * forgets pages the user can no longer see. Run when the app starts online.
  */
 export async function sync() {
   if (!supported) return;
+  await prune().catch((e) => console.warn("offline prune:", e));
   for (const p of Object.values(index.pages).filter((p) => p.pinned)) {
     try {
       const meta = await api.pageMeta(p.id);

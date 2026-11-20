@@ -42,10 +42,12 @@ export async function storageName(id: string): Promise<string | null> {
  * The returned function stops answering hellos; a port already handed out
  * keeps working until its frame is gone, so a page's last writes (say, from
  * its pagehide as it is replaced) are still saved.
- * files, when given, are the kept bundle shown offline in frame: they go to
- * the page over the port when its hello asks for them.
+ * saves is whether the frame was handed the page's data (storageName): only
+ * then are its writes saved, so a page that never saw the data can't write
+ * over it. files, when given, are the kept bundle shown offline in frame:
+ * they go to the page over the port when its hello asks for them.
  */
-export function serveStorage(frame: HTMLIFrameElement, id: string, files?: BundleFile[]): () => void {
+export function serveStorage(frame: HTMLIFrameElement, id: string, saves = true, files?: BundleFile[]): () => void {
   let port: MessagePort | null = null;
 
   function onMessage(e: MessageEvent) {
@@ -58,7 +60,9 @@ export function serveStorage(frame: HTMLIFrameElement, id: string, files?: Bundl
     const ch = new MessageChannel();
     const p = (port = ch.port1);
     p.onmessage = (m: MessageEvent<Write>) => {
-      if (m.data?.op === "write") send(id, m.data, (r) => p.postMessage(r));
+      if (m.data?.op !== "write") return;
+      if (saves) send(id, m.data, (r) => p.postMessage(r));
+      else p.postMessage({ ok: false, error: "this page's saved data couldn't be loaded" } satisfies Reply);
     };
     page.postMessage({ specola: "port" }, "*", [ch.port2]);
     if (files && e.data.files) p.postMessage({ op: "files", files });

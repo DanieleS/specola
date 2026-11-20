@@ -152,7 +152,7 @@
       if (name) f.name = name;
       f.src = url;
       h.replaceChildren(f);
-      if (name || files) stop = serveStorage(f, id, files);
+      if (name || files) stop = serveStorage(f, id, !!name, files);
     });
     return () => {
       live = false;

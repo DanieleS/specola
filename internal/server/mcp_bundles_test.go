@@ -22,7 +22,7 @@ func TestMCPBundles(t *testing.T) {
 	// The instructions steer apps with a build step to the plugin, with this
 	// instance's own install command.
 	ins := cs.InitializeResult().Instructions
-	for _, want := range []string{"publish_page", install, "specola()", "create_bundle_upload", "npm create vite", "window.specola?.basename", "IndexedDB is unavailable"} {
+	for _, want := range []string{"publish_page", install, "specola()", "create_bundle_upload", "npm create vite", "prefer a hash router", "window.specola?.basename", "IndexedDB is unavailable"} {
 		if !strings.Contains(ins, want) {
 			t.Errorf("instructions lack %q", want)
 		}

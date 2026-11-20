@@ -11,7 +11,11 @@
 
   // An app with a build step is published as a bundle from its project,
   // with the Vite plugin: this gets the commands to run there.
-  let upload = $state<BundleUpload | null>(null);
+  // The link is made for the title, folder and note given when it was asked
+  // for: once they change, its commands are no longer shown.
+  let upload = $state<(BundleUpload & { for: string }) | null>(null);
+  let uploadFor = $derived(JSON.stringify([name.trim(), folderId, note]));
+  let shownUpload = $derived(upload?.for === uploadFor ? upload : null);
   let uploading = $state(false);
   let copied = $state("");
 
@@ -23,7 +27,8 @@
     }
     uploading = true;
     try {
-      upload = await api.bundleUpload({ kind: "new", title: name.trim(), folderId, note });
+      const what = uploadFor;
+      upload = { ...(await api.bundleUpload({ kind: "new", title: name.trim(), folderId, note })), for: what };
     } catch (err) {
       error = String(err);
     } finally {
@@ -89,14 +94,14 @@
           >{uploading ? "Getting a link…" : "Get the commands"}</button
         >
       </p>
-      {#if upload}
+      {#if shownUpload}
         <p class="mt-2">In the project, once:</p>
-        {@render command(upload.pluginInstall)}
+        {@render command(shownUpload.pluginInstall)}
         <p class="mt-2">
           then add <code class="text-white/70">specola()</code> to the plugins in vite.config and publish (the link works for 30 minutes,
           once):
         </p>
-        {@render command(upload.command)}
+        {@render command(shownUpload.command)}
       {/if}
     </div>
     <div>

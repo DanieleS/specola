@@ -102,6 +102,9 @@ works, including reloads and deep links. Tell the router the prefix:
 ```
 
 or use a hash router (`createHashRouter`, `#/…` URLs), which needs nothing.
+A hash router is the better choice for an app people may open offline: a
+page kept for offline viewing runs from a `blob:` URL, whose path can't
+change, so a path router doesn't route there.
 
 ### Workers
 

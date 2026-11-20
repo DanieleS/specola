@@ -251,7 +251,8 @@ using the History API can reload and deep link:
 
 `viewUrl` in `GET /api/pages/{id}` uses the new token-in-path form. An SPA
 using React Router writes `<BrowserRouter basename={window.specola?.basename}>`
-(or uses a hash router).
+(or uses a hash router, which the MCP instructions recommend: it also routes
+when the page is viewed offline, see Offline).
 
 `?v=N` keeps working below the prefix. Caching is per URL, as before
 (`?v=N` immutable, the current version revalidated); the current version's
@@ -285,9 +286,10 @@ shell with it).
   multiple files, lazy loading, workers, wasm, many assets) → the Vite plugin,
   with the exact steps and this instance's URLs ((a) `npm i -D <tarball URL>`,
   (b) `specola()` in `vite.config` plugins, (c) `create_bundle_upload`, (d) run
-  the returned command) and the key constraints (router basename or hash
-  router, classic workers, own files by module-relative URLs, `localStorage`
-  per user, no IndexedDB, limits). This steering is a product requirement.
+  the returned command) and the key constraints (a hash router preferred,
+  since it also routes offline, else the router basename; classic workers,
+  own files by module-relative URLs, `localStorage` per user, no IndexedDB,
+  limits). This steering is a product requirement.
 
 ## Plugin and CLI distribution
 
@@ -351,8 +353,12 @@ HTML's key: `/__offline/pages/{id}/{v}` (HTML), `…/{v}/files` (the list),
 `…/{v}/file/{path}`. The HTML is stored last, and only then is the version
 recorded as kept (`bundles` in the localStorage index lists the versions kept
 as bundles), so a half-kept bundle is never taken for a kept one; a failed
-download deletes what it stored. Removing a page or a stale version deletes
-its files too. Each kept version's size, files included, is recorded, and
+download deletes what it stored, and so does a download that ends after
+the user logged out. A download holds a Web Lock named after the version's
+key; when the app starts online it deletes whatever the cache holds of a
+version that the index doesn't list and no tab is storing (a download cut
+short by closing the tab). Removing a page or a stale version deletes its
+files too. Each kept version's size, files included, is recorded, and
 recent (unpinned) pages are evicted beyond 30 pages **or** 256 MiB together,
 oldest first, but never the most recent one.
 
@@ -370,7 +376,9 @@ files to the SDK over the existing `MessagePort`:
 - the SDK knows it is offline when it has a base and its document is a
   `blob:` URL; its hello then carries `files: true` (sent whether or not
   localStorage is persistent), and the viewer answers with the port, then
-  `{op:"files", files:[{path, type, blob}]}` on it.
+  `{op:"files", files:[{path, type, blob}]}` on it. The port saves the
+  page's `localStorage` writes only if the frame was handed its data, as
+  online; otherwise it refuses them.
 
 The SDK, inside the page's origin:
 

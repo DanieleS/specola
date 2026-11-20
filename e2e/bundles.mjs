@@ -219,6 +219,9 @@ async function checkOffline(app, api, id, base) {
       'new-page form shows the plugin install and publish commands',
       commands,
     );
+    // The link was made for that title: once it changes, its commands go.
+    await page.getByLabel('Title').fill('Another title');
+    check((await page.locator('code.font-mono').count()) === 0, 'new-page form hides commands made for an earlier title');
 
     await page.goto(`${app}/#/p/${plain.id}`);
     await kept(plain.id);
@@ -236,6 +239,32 @@ async function checkOffline(app, api, id, base) {
       return (await c.keys()).map((r) => new URL(r.url).pathname).filter((p) => p.startsWith(`/__offline/pages/${pid}/`)).length;
     }, id);
     check(cached > 5, 'bundle files are in Cache Storage', cached);
+
+    // Files of a version the index doesn't list (a download cut short) are
+    // deleted when the app next starts online.
+    // Files another tab is storing (it holds the version's lock) stay.
+    const orphan = `/__offline/pages/${id}/99/file/assets/gone.js`;
+    const storing = `/__offline/pages/${id}/98/file/assets/coming.js`;
+    const other = await context.newPage();
+    await other.goto(app + '/');
+    await other.evaluate(
+      (k) =>
+        new Promise((held) =>
+          navigator.locks.request('specola-keep ' + k.replace(/\/file\/.*/, ''), () => (held(), new Promise((r) => (window.release = r)))),
+        ),
+      storing,
+    );
+    const has = (k) => page.evaluate(async (k) => !!(await (await caches.open('specola-pages')).match(k)), k);
+    await page.evaluate(async (ks) => {
+      const c = await caches.open('specola-pages');
+      for (const k of ks) await c.put(k, new Response('x'));
+    }, [orphan, storing]);
+    await page.reload();
+    await waitFor(async () => !(await has(orphan)), 'orphan pruned');
+    check(true, 'files no kept version lists are pruned');
+    check(await has(storing), 'files another tab is storing are not pruned');
+    await other.evaluate(() => window.release());
+    await other.close();
 
     await context.setOffline(true);
     offline = true;
