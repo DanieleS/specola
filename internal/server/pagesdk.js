@@ -13,10 +13,17 @@
 //   nothing can't overwrite what was saved.
 // - sessionStorage and document.cookie work in memory, for this load only.
 //
+// - new Worker(url) works for http(s) URLs, which an opaque origin can't start
+//   a worker from: see the Worker wrapper below.
+//
 // window.specola.persistent says whether localStorage reaches the server;
 // await window.specola.flush() resolves once every write so far is saved
 // (waiting out the viewer being offline), and rejects if one was refused.
-(() => {
+// window.specola.base is the URL a bundle's files are served under, ending in
+// "/" ("" for a plain page); window.specola.basename is the path the page is
+// served under, for a client-side router (<BrowserRouter basename=…>). The
+// server passes both as boot, in place of SPECOLA_BOOT at the end.
+((boot) => {
   if (window.specola) return;
   const MAX_BYTES = 1 << 20;
   const MAX_KEYS = 1000;
@@ -210,10 +217,48 @@
     });
   }
 
+  // Workers. On an opaque origin, new Worker(httpUrl) throws a SecurityError
+  // and a module worker can't start even from a blob: URL; a classic worker
+  // from a blob: URL that calls importScripts(httpUrl) works. So an http(s)
+  // URL becomes such a worker (one blob per URL), and {type: "module"} is
+  // dropped for it with a warning: the Vite plugin builds workers as classic
+  // scripts. blob: and data: URLs the page made itself pass through as given.
+  // A subclass, so instanceof Worker and Worker.prototype keep working.
+  const NativeWorker = window.Worker;
+  if (typeof NativeWorker === "function") {
+    const shims = new Map();
+    const shim = (href) => {
+      if (!shims.has(href)) {
+        const src = `importScripts(${JSON.stringify(href)});`;
+        shims.set(href, URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+      }
+      return shims.get(href);
+    };
+    class Worker extends NativeWorker {
+      constructor(url, options) {
+        let u = null;
+        try {
+          u = new URL(url, document.baseURI);
+        } catch {}
+        if (u && (u.protocol === "http:" || u.protocol === "https:")) {
+          if (options && options.type === "module") {
+            console.warn("specola: module workers can't run on a page's opaque origin; starting", u.href, "as a classic worker");
+            options = { ...options, type: "classic" };
+          }
+          url = shim(u.href);
+        }
+        super(url, options);
+      }
+    }
+    Object.defineProperty(window, "Worker", { value: Worker, writable: true, configurable: true });
+  }
+
   define(
     window,
     "specola",
     Object.freeze({
+      base: typeof boot.base === "string" ? boot.base : "",
+      basename: typeof boot.basename === "string" ? boot.basename : "",
       get persistent() {
         return persistent;
       },
@@ -226,4 +271,4 @@
       },
     }),
   );
-})();
+})(SPECOLA_BOOT);

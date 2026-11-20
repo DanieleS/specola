@@ -12,9 +12,9 @@ import (
 )
 
 // Public links show a page to anyone holding the URL, without signing in. They
-// are served at /s/{token}, on the view origin when there is one, as the whole
-// document: the same CSP sandbox puts the page on an opaque origin, and its
-// localStorage works in memory only.
+// are served at /s/{token} (and any path below it), on the view origin when
+// there is one, as the whole document: the same CSP sandbox puts the page on
+// an opaque origin, and its localStorage works in memory only.
 
 // publicLinkURL is where a public link's page is served.
 func (s *Server) publicLinkURL(token string) string {
@@ -93,16 +93,17 @@ func (s *Server) handlePublicLink(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
-	writePage(w, s.pageHTML(html, key), "'none'")
+	writePage(w, s.pageHTML(html, key), "'none'", s.boot(key, "/s/"+chi.URLParam(r, "token")))
 }
 
-// writePage sends a page's HTML, with the page SDK added, sandboxed onto an
-// opaque origin; ancestors are the origins allowed to frame it.
-func writePage(w http.ResponseWriter, html, ancestors string) {
+// writePage sends a page's HTML, with the page SDK added and given boot,
+// sandboxed onto an opaque origin; ancestors are the origins allowed to
+// frame it.
+func writePage(w http.ResponseWriter, html, ancestors string, boot bootData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy",
 		"sandbox allow-scripts allow-popups allow-forms allow-modals; frame-ancestors "+ancestors)
-	_, _ = io.WriteString(w, withSDK(html))
+	_, _ = io.WriteString(w, withSDK(html, boot))
 }

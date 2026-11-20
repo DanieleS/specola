@@ -1,0 +1,9 @@
+/* url()s relative to this file must resolve under the bundle's base. */
+@font-face {
+  font-family: 'E2E';
+  src: url('./assets/e2e.woff2') format('woff2');
+}
+body {
+  font-family: 'E2E', sans-serif;
+  background: url('./assets/pattern.svg');
+}

@@ -239,6 +239,9 @@ by `SPECOLA_TEST_DATABASE_URL`, and are skipped when it is unset:
 SPECOLA_TEST_DATABASE_URL="postgres://postgres:dev@localhost:5432/postgres?sslmode=disable" go test ./...
 ```
 
+`node e2e/bundles.mjs` (or `make e2e`) publishes a real SPA bundle and checks
+it in Chromium; see [`e2e/README.md`](e2e/README.md).
+
 ## Production (container)
 
 ```sh
@@ -273,6 +276,12 @@ user**, so they land in that user's gallery.
 | `list_public_links` | `id` | the page's public links, with expiry and views |
 | `revoke_public_link` | `id`, `link_id` | `{ok}` |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
+| `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx specola-publish` command to run, and the plugin install command |
+
+Apps with a build step are published as **SPA bundles** with the Vite plugin
+in [`plugin/`](plugin/README.md), which each instance serves at
+`/tools/specola-vite-plugin-<version>.tgz`; the server instructions steer
+agents there. See [`docs/spa-bundles.md`](docs/spa-bundles.md).
 
 The same access rules as the UI apply to every tool. Tools carry MCP
 annotations: the reading ones (`list`, `get_page`, `list_versions`, `search`,

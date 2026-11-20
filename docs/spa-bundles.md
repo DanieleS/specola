@@ -1,6 +1,8 @@
 # SPA bundles — design and contract
 
-Status: being implemented on branch `ccr-c6bf3320-7faeji`.
+Status: being implemented on branch `ccr-c6bf3320-7faeji`. Server, plugin,
+CLI, MCP, routing and the SDK are done and checked end to end in Chromium
+(`e2e/bundles.mjs`); offline viewing of bundles in the SPA is not done yet.
 
 A **bundle** is a page whose current (or any) version is a multi-file build of a
 single-page app (typically Vite), instead of one self-contained HTML document.
@@ -214,14 +216,22 @@ restore) can share an `index.html` but not a key.
 The server passes boot data to the SDK (same injected `<script>`, ahead of the
 page's own): `window.specola.base` (the bundle's file base URL ending in `/`,
 or `""` for a plain page) and `window.specola.basename` (the path prefix the
-page is served under, for client-side routers, see Routing).
+page is served under, for client-side routers, see Routing). `pagesdk.js` is
+a function `((boot) => {…})(SPECOLA_BOOT)`; the server puts the JSON of
+`{"base","basename"}` in place of `SPECOLA_BOOT` per request (`<`, `>` and `&`
+escaped, so it can't close the script). The first-load `window.name` handoff
+of `localStorage` data is unchanged.
 
-The SDK wraps `window.Worker`: `new Worker(url, opts)` where `url` resolves to
-an `http(s):` URL becomes a classic worker from a `blob:` URL whose source is
-`importScripts(<absolute url>)`. `{type:"module"}` is honoured only for
-`blob:`/`data:` URLs given by the page; for an http(s) URL it is dropped with a
-`console.warn` (module workers cannot run on an opaque origin). The plugin
+The SDK wraps `window.Worker` with a subclass (so `instanceof Worker` and
+`Worker.prototype` keep working): `new Worker(url, opts)` where `url` resolves
+(against `document.baseURI`) to an `http(s):` URL becomes a classic worker
+from a `blob:` URL whose source is `importScripts(<absolute url>)`, one blob
+per URL. `{type:"module"}` is honoured only for `blob:`/`data:` URLs given by
+the page, which pass through untouched; for an http(s) URL it is dropped with
+a `console.warn` (module workers cannot run on an opaque origin). The plugin
 builds workers as classic scripts (`worker.format: "iife"`) so this works.
+Inside such a worker `self.location` is the `blob:` URL, so relative URLs
+there don't reach the bundle (see plugin/README.md, Workers).
 
 ### Routing (deep paths)
 
@@ -238,20 +248,38 @@ using the History API can reload and deep link:
 using React Router writes `<BrowserRouter basename={window.specola?.basename}>`
 (or uses a hash router).
 
+`?v=N` keeps working below the prefix. Caching is per URL, as before
+(`?v=N` immutable, the current version revalidated); the current version's
+`ETag` also covers the basename, since it is part of what is sent (a deep path
+under the same prefix gets the same tag and the same body).
+
+The SPA's service worker leaves navigations to `/view/…` alone, as before, so
+a reload of a deep path inside the frame reaches the server.
+
 ## MCP
 
 - New tool `create_bundle_upload` (`kind` new|version, `title?`, `folder_id?`,
-  `id?`, `note?`) → `{upload_url, expires_at, command}` where `command` is the
-  exact `npx specola-publish --upload '<upload_url>'` to run in the project.
-- `get_page` on a bundle version also returns `bundle: {files:[{path,size,content_type}], base}`
-  and a `note` saying it is a bundle that must be changed from its source
-  project and republished with the plugin.
-- `list_versions`, page metadata: versions/pages carry `bundle: true`.
-- Server `instructions` and the `publish_page`/`new_version` descriptions are
-  rewritten so an agent **uses the Vite plugin for anything with a build step**
-  (framework apps, multiple files, lazy loading), with the exact install
-  command (plugin tarball URL of this instance) and steps. Single-file pages
-  keep using `publish_page`. This steering is a product requirement.
+  `id?`, `note?`) → `{upload_url, expires_at, command, plugin_install}` where
+  `command` is the exact `npx specola-publish --upload '<upload_url>'` to run
+  in the project and `plugin_install` the `npm i -D <tarball URL>` of this
+  instance. The command is built by `plugin.PublishCommand`, shared with
+  `POST /api/bundle-uploads`.
+- `get_page` returns `bundle: {files:[{path,size,content_type}], base}` when
+  the version it returns the HTML of is a bundle (`null` otherwise: this
+  replaces the page metadata's boolean `bundle`, which is about the current
+  version, in this tool's output), and then a `note` saying it is a bundle
+  that must be changed from its source project and republished with the
+  plugin.
+- `list_versions`, `GET /api/pages/{id}` and `…/versions`: versions/pages carry `bundle`.
+- Server `instructions` and the `publish_page`/`new_version`/`create_upload_grant`/`get_page`
+  descriptions are rewritten so an agent **chooses**: a single self-contained
+  HTML document → `publish_page`; anything with a build step (framework apps,
+  multiple files, lazy loading, workers, wasm, many assets) → the Vite plugin,
+  with the exact steps and this instance's URLs ((a) `npm i -D <tarball URL>`,
+  (b) `specola()` in `vite.config` plugins, (c) `create_bundle_upload`, (d) run
+  the returned command) and the key constraints (router basename or hash
+  router, classic workers, own files by module-relative URLs, `localStorage`
+  per user, no IndexedDB, limits). This steering is a product requirement.
 
 ## Plugin and CLI distribution
 
@@ -259,10 +287,18 @@ using React Router writes `<BrowserRouter basename={window.specola?.basename}>`
   runtime dependencies, Node ≥ 18, `vite` ≥ 5 as a peer dependency).
 - Exports `specola(options?)` (the Vite plugin) and ships the bin
   `specola-publish`.
-- The Go server embeds `plugin/` sources and serves an npm tarball built at
-  startup (deterministic tar.gz, files under `package/`) at
-  `GET /tools/specola-vite-plugin-<version>.tgz` (public, immutable, on the app
-  origin). Install: `npm i -D <appBase>/tools/specola-vite-plugin-<version>.tgz`.
+- The Go server embeds `plugin/` sources (`plugin/embed.go`, package
+  `plugin`: exactly `package.json` and what its `"files"` lists, never
+  `node_modules` or the tests; a test checks the two lists agree) and serves
+  an npm tarball built once at startup at
+  `GET /tools/specola-vite-plugin-<version>.tgz` (public, on the app origin,
+  `Content-Type: application/gzip`, `Cache-Control: public, max-age=31536000, immutable`,
+  `ETag` its sha256; any other name under `/tools/` answers 404). The
+  tarball is deterministic: entries sorted, under `package/`, npm's fixed
+  mtime (1985-10-26 08:15 UTC), owner 0, mode 0755 for the `bin` files and
+  0644 for the rest. Install: `npm i -D <appBase>/tools/specola-vite-plugin-<version>.tgz`.
+  A manifest from a plugin older than `minPluginVersion` is refused with that
+  install command.
 
 ### Plugin behaviour
 

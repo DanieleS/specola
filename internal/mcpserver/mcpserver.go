@@ -14,6 +14,7 @@ import (
 
 	"github.com/danieles/specola/internal/auth"
 	"github.com/danieles/specola/internal/store"
+	"github.com/danieles/specola/plugin"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -30,6 +31,11 @@ type Options struct {
 	// OnUser, when set, is called with the caller's identity on every tool
 	// call, e.g. to record the user.
 	OnUser func(ctx context.Context, id auth.Identity)
+	// PluginURL is where this instance serves the Vite plugin's npm package,
+	// which the instructions tell agents to install.
+	PluginURL string
+	// BundleBase is the URL a bundle's files are served under, from its key.
+	BundleBase func(key string) string
 	// LocalhostProtection keeps the SDK's DNS-rebinding check. Only needed
 	// without bearer auth; behind a reverse proxy on loopback it rejects
 	// every request, since the Host header is the public name.
@@ -42,7 +48,7 @@ type Options struct {
 func Handler(st *store.Store, opts Options) http.Handler {
 	t := &tools{st: st, opts: opts}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "specola", Title: "Specola", Version: "0.1.0"}, &mcp.ServerOptions{
-		Instructions: instructions,
+		Instructions: instructions(opts.PluginURL),
 	})
 	// Read-only tools say so: clients such as Hermes replay only those after a
 	// dropped connection, and may skip asking the user before calling them.
@@ -57,6 +63,7 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_page", Description: getPageDesc, Annotations: readOnly}, t.getPage)
 	mcp.AddTool(srv, &mcp.Tool{Name: "list_versions", Description: listVersionsDesc, Annotations: readOnly}, t.listVersions)
 	mcp.AddTool(srv, &mcp.Tool{Name: "create_upload_grant", Description: grantDesc, Annotations: additive}, t.createUploadGrant)
+	mcp.AddTool(srv, &mcp.Tool{Name: "create_bundle_upload", Description: bundleUploadDesc(opts.PluginURL), Annotations: additive}, t.createBundleUpload)
 	mcp.AddTool(srv, &mcp.Tool{Name: "create_folder", Description: createFolderDesc, Annotations: additive}, t.createFolder)
 	mcp.AddTool(srv, &mcp.Tool{Name: "rename", Description: renameDesc, Annotations: idempotent}, t.rename)
 	mcp.AddTool(srv, &mcp.Tool{Name: "move", Description: moveDesc, Annotations: idempotent}, t.move)
@@ -76,24 +83,50 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	})
 }
 
-const instructions = `Specola stores versioned, interactive HTML pages in the user's own gallery.
-Publish a page with publish_page, update it with new_version (each call adds a version; history is kept), and find existing pages with search or list.
-Give every version a short note saying what changed; it is what the user reads in the history.
-Organise with create_folder, move, rename and archive; nothing is ever deleted, and archive can be undone with unarchive.
-Share with other Specola users with share; to show a page to someone without an account, make a public link with create_public_link.
-Pages must be self-contained HTML: inline CSS and JS; imports from public CDNs are fine. Pages run in a sandbox without access to Specola itself.
-localStorage works as usual and is saved by Specola for each user who views the page (their own, private, the same on every version; up to 1 MB). sessionStorage and cookies last for one load only; IndexedDB is unavailable.
-For HTML over ~100 KB, don't inline it in a tool argument: call create_upload_grant and PUT the file to the returned URL with curl.`
+// instructions steer an agent to the right way to publish: a single HTML
+// document through the tools, or anything with a build step as a bundle with
+// the Vite plugin served at pluginURL. Choosing well is the point: an app
+// squeezed into one HTML file loses lazy loading, workers and its assets.
+func instructions(pluginURL string) string {
+	return `Specola stores versioned, interactive web pages in the user's own gallery and shows them to the user, to people they share with, and through public links.
 
-const htmlNote = ` The HTML must be a complete, self-contained document: inline CSS and JS (CDN imports are fine). It is rendered in a sandboxed iframe; localStorage works and is saved per user, IndexedDB is unavailable. For HTML over ~100 KB use create_upload_grant instead, so the content isn't truncated.`
+CHOOSE HOW TO PUBLISH, before writing anything:
+- A single self-contained HTML document (a report, an explainer, a chart, a small tool; inline CSS and JS, imports from public CDNs are fine): publish_page, then new_version for each change. Over ~100 KB, use create_upload_grant and PUT the file with curl instead of inlining it.
+- Anything with a build step: a framework app (React, Vue, Svelte, ...), several source files, code splitting or lazy loading, workers, wasm, many assets. Do NOT inline a build into one HTML file: publish it as a bundle with the Specola Vite plugin. In the project directory:
+  (a) ` + plugin.InstallCommand(pluginURL) + `
+  (b) in vite.config add the plugin: import specola from '@specola/vite-plugin'; then plugins: [/* your framework plugin */, specola()]
+  (c) call create_bundle_upload (kind "new" with a title, or kind "version" with the page id)
+  (d) run the command it returns (npx specola-publish --upload '<url>'): it runs vite build, uploads, and prints the page id and url.
+` + bundleConstraints + `
+
+` + pageRuntime + `
+Give every version a short note saying what changed; it is what the user reads in the history.
+Find pages with search or list. Organise with create_folder, move, rename and archive; nothing is ever deleted, and archive can be undone with unarchive.
+Share with other Specola users with share; to show a page to someone without an account, make a public link with create_public_link.`
+}
+
+// pageRuntime is what every page, plain or bundle, can rely on.
+const pageRuntime = `Every page runs in a sandbox on an opaque origin, without access to Specola itself. localStorage works and is saved by Specola for each user who views the page (private, the same on every version, up to 1 MB); sessionStorage and cookies last one load; IndexedDB is unavailable.`
+
+// bundleConstraints are what an app must respect to run as a bundle, one line
+// each.
+var bundleConstraints = fmt.Sprintf(`Bundle constraints:
+  - Client-side routing: <BrowserRouter basename={window.specola?.basename}> (or the basename option of your router), or a hash router.
+  - Workers run as classic scripts (the plugin builds them so; {type: "module"} is ignored); no SharedWorker or service worker.
+  - Own files: fetch a URL imported from the module (import url from './data.json?url', or new URL('./x.bin', import.meta.url)); a public/ file is window.specola.base + 'logo.png'. Never root-absolute URLs ('/data.json'): they point at Specola, not the bundle.
+  - index.html is the only HTML file; nothing runs on a server (no SSR or API routes).
+  - Limits: %d files, %d MB per file, %d MB in all; an upload link is valid %d minutes.`,
+	store.MaxBundleFiles, store.MaxBundleFileBytes>>20, store.MaxBundleBytes>>20, int(store.BundleGrantTTL.Minutes()))
+
+const htmlNote = ` The HTML must be ONE complete, self-contained document: inline CSS and JS (CDN imports are fine). It is rendered in a sandboxed iframe; localStorage works and is saved per user, IndexedDB is unavailable. For HTML over ~100 KB use create_upload_grant instead, so the content isn't truncated. For an app with a build step (a framework, several files, lazy loading, workers, wasm, many assets) don't use this tool: publish a bundle with the Specola Vite plugin, see create_bundle_upload.`
 
 const (
-	publishDesc    = `Publish a new HTML page to the user's Specola gallery and return its id and link.` + htmlNote
-	newVersionDesc = `Replace the content of an existing page by adding a new version. Earlier versions stay in the history.` + htmlNote
+	publishDesc    = `Publish a new page from a single HTML document to the user's Specola gallery and return its id and link.` + htmlNote
+	newVersionDesc = `Replace the content of an existing page with a single HTML document, adding a new version. Earlier versions stay in the history. A page that is a bundle (bundle: true) is updated by publishing the bundle again: create_bundle_upload with kind "version".` + htmlNote
 	listDesc       = `List the folders and pages in a folder of the user's gallery (the user's own root when folder_id is omitted), or with shared_with_me the items other users shared with them, or with archived the items the user archived. Each item carries the user's role: owner, editor or viewer.`
-	getPageDesc    = `Get a page's metadata and the HTML of its current version, or of an earlier one with version.`
+	getPageDesc    = `Get a page's metadata and the HTML of its current version, or of an earlier one with version. When that version is a bundle (an app built with the Specola Vite plugin), html is only its index.html and bundle lists its other files; a bundle can't be edited through these tools: change its source project and publish it again with create_bundle_upload (kind "version").`
 
-	listVersionsDesc = `List a page's versions, newest first, with when each was made, by whom, its size and its note.`
+	listVersionsDesc = `List a page's versions, newest first, with when each was made, by whom, its size, its note, and whether it is a bundle.`
 	createFolderDesc = `Create a folder in the user's gallery, at the root or inside parent_id, and return its id.`
 	renameDesc       = `Rename a page or folder. Needs editor access.`
 	moveDesc         = `Move a page or folder into folder_id, or to the user's root when folder_id is omitted. Moving into a folder needs editor access on both; moving to the root only the item's owner may do.`
@@ -101,7 +134,7 @@ const (
 	unarchiveDesc    = `Restore an archived page or folder the user owns, with everything that was inside it. list with archived shows what can be restored.`
 	searchDesc       = `Full-text search over the titles and text of every page the user can see, their own and shared with them, best match first. Supports "quoted phrases", OR, and -excluded words. Matching is on whole words, without stemming.`
 	shareDesc        = `Share a page or folder the user owns with another Specola user by email. role "viewer" can read, "editor" can also add versions and create items inside a folder, "none" removes the share. Sharing a folder covers everything beneath it. The other user must have signed in to Specola at least once.`
-	grantDesc        = `Get a one-time URL to upload a large HTML file over plain HTTP instead of passing it as a tool argument. kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. PUT the raw HTML file as the request body (see the returned curl command) within 10 minutes; the response holds the page id, version and url.`
+	grantDesc        = `Get a one-time URL to upload a large single HTML file over plain HTTP instead of passing it as a tool argument. kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. PUT the raw HTML file as the request body (see the returned curl command) within 10 minutes; the response holds the page id, version and url. Not for apps with a build step or several files: those are bundles, see create_bundle_upload.`
 )
 
 // GrantTTL is how long an upload grant stays valid.
@@ -250,6 +283,10 @@ type getPageOut struct {
 	URL         string `json:"url"`
 	HTML        string `json:"html"`
 	HTMLVersion int    `json:"html_version" jsonschema:"the version html belongs to; version is the current one"`
+	// Bundle replaces PageMeta's flag (which is about the current version):
+	// it describes the version html belongs to.
+	Bundle *bundleInfo `json:"bundle" jsonschema:"set when the version html belongs to is a bundle: html is its index.html, and these are its other files"`
+	Note   string      `json:"note,omitempty" jsonschema:"what to know before changing this version"`
 }
 
 func (t *tools) getPage(ctx context.Context, req *mcp.CallToolRequest, in getPageIn) (*mcp.CallToolResult, getPageOut, error) {
@@ -269,7 +306,14 @@ func (t *tools) getPage(ctx context.Context, req *mcp.CallToolRequest, in getPag
 	if err != nil {
 		return nil, getPageOut{}, toolError(err, "page or version")
 	}
-	return nil, getPageOut{PageMeta: *meta, URL: t.pageURL(in.ID), HTML: html, HTMLVersion: v}, nil
+	out := getPageOut{PageMeta: *meta, URL: t.pageURL(in.ID), HTML: html, HTMLVersion: v}
+	if out.Bundle, err = t.bundleInfo(ctx, who.Sub, in.ID, v); err != nil {
+		return nil, getPageOut{}, toolError(err, "page or version")
+	}
+	if out.Bundle != nil {
+		out.Note = bundleNote
+	}
+	return nil, out, nil
 }
 
 type pageIDIn struct {

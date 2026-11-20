@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/danieles/specola/internal/store"
+	"github.com/danieles/specola/plugin"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -54,6 +55,16 @@ func (s *Server) pageHTML(html, bundleKey string) string {
 		return html
 	}
 	return strings.ReplaceAll(html, basePlaceholder, s.bundleBase(bundleKey))
+}
+
+// boot is the SDK's boot data for a version with bundle key key ("" for a
+// plain page) served under basename.
+func (s *Server) boot(key, basename string) bootData {
+	b := bootData{Basename: basename}
+	if key != "" {
+		b.Base = s.bundleBase(key)
+	}
+	return b
 }
 
 // handleBundleFile serves one file of a bundle. The files run inside the
@@ -130,8 +141,8 @@ func (s *Server) handleBundleManifest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, fmt.Sprintf(
-			"plugin version %q is too old for this server, which needs %s or later: reinstall @specola/vite-plugin from %s/tools/",
-			req.PluginVersion, minPluginVersion, s.cfg.AppBaseURL), http.StatusBadRequest)
+			"plugin version %q is too old for this server, which needs %s or later: update @specola/vite-plugin with %s",
+			req.PluginVersion, minPluginVersion, plugin.InstallCommand(s.pluginURL())), http.StatusBadRequest)
 		return
 	}
 	missing, err := s.st.SetBundleManifest(r.Context(), chi.URLParam(r, "token"), req.Files)
@@ -228,14 +239,24 @@ func (s *Server) handleCreateBundleUpload(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"uploadUrl": uploadURL,
 		"expiresAt": expires,
-		"command":   publishCommand(uploadURL),
+		"command":   plugin.PublishCommand(uploadURL),
 	})
 }
 
-// publishCommand is the command an agent runs in the project directory to
-// build and upload a bundle through uploadURL.
-func publishCommand(uploadURL string) string {
-	return "npx specola-publish --upload '" + uploadURL + "'"
+// pluginURL is where this instance serves the Vite plugin's npm package.
+func (s *Server) pluginURL() string { return s.cfg.AppBaseURL + plugin.TarballPath() }
+
+// handleTool serves the Vite plugin's npm package, under its versioned name
+// only: the name changes with each version, so it is cached for good.
+func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
+	if chi.URLParam(r, "file") != plugin.TarballName {
+		http.Error(w, "not found: this server has "+s.pluginURL(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("ETag", `"`+plugin.TarballSHA256+`"`)
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(plugin.Tarball()))
 }
 
 // versionFilesResp lists a version's bundle files; base is where they are

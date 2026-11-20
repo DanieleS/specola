@@ -212,7 +212,7 @@ func TestBundleUploadProtocol(t *testing.T) {
 				t.Errorf("%s: %d %s, want 400", name, code, got)
 			}
 		}
-		if _, got := send(t, ts, "POST", path+"/manifest", []byte(app.manifest("0.9.0"))); !strings.Contains(got, "@specola/vite-plugin") {
+		if _, got := send(t, ts, "POST", path+"/manifest", []byte(app.manifest("0.9.0"))); !strings.Contains(got, "@specola/vite-plugin with npm i -D http://test/tools/specola-vite-plugin-") {
 			t.Errorf("old plugin message %q doesn't say what to update", got)
 		}
 
@@ -473,16 +473,19 @@ func TestBundleServing(t *testing.T) {
 	})
 
 	t.Run("placeholder is replaced where the page is served", func(t *testing.T) {
-		want := withSDK(strings.ReplaceAll(index, "__SPECOLA_BASE__/", fr.Base))
-		for _, p := range []string{"/view/" + id, "/view/" + id + "?v=1"} {
-			if res := get(t, ts, "", p, alicesHeaders); readBody(t, res) != want {
+		want := func(basename string) string {
+			return withSDK(strings.ReplaceAll(index, "__SPECOLA_BASE__/", fr.Base), bootData{Base: fr.Base, Basename: basename})
+		}
+		for _, p := range []string{"/view/" + id, "/view/" + id + "?v=1", "/view/" + id + "/deep/path?q=1"} {
+			if res := get(t, ts, "", p, alicesHeaders); readBody(t, res) != want("/view/"+id) {
 				t.Fatalf("%s: body isn't the index with the base replaced", p)
 			}
 		}
 		_, body := call(t, ts, alice, "POST", "/api/pages/"+id+"/links", `{}`)
 		var l struct{ URL string }
 		mustJSON(t, body, &l)
-		if got := readBody(t, get(t, ts, "", strings.TrimPrefix(l.URL, "http://test"), nil)); got != want {
+		linkPath := strings.TrimPrefix(l.URL, "http://test")
+		if got := readBody(t, get(t, ts, "", linkPath+"/deep/path", nil)); got != want(linkPath) {
 			t.Fatalf("public link: %q", got)
 		}
 		// The stored HTML keeps the placeholder.
@@ -515,7 +518,7 @@ func TestBundleServing(t *testing.T) {
 			t.Fatalf("meta after plain version: %s", body)
 		}
 		// A plain page's HTML is served as stored.
-		if got := readBody(t, get(t, ts, "", "/view/"+id, alicesHeaders)); got != withSDK("<p>plain __SPECOLA_BASE__/x</p>") {
+		if got := readBody(t, get(t, ts, "", "/view/"+id, alicesHeaders)); got != served("<p>plain __SPECOLA_BASE__/x</p>", "/view/"+id) {
 			t.Fatalf("plain view: %q", got)
 		}
 
@@ -531,7 +534,7 @@ func TestBundleServing(t *testing.T) {
 				t.Fatalf("restored file %d: %+v, was %+v", i, fr3.Files[i], fr.Files[i])
 			}
 		}
-		want := withSDK(strings.ReplaceAll(index, "__SPECOLA_BASE__/", fr3.Base))
+		want := withSDK(strings.ReplaceAll(index, "__SPECOLA_BASE__/", fr3.Base), bootData{Base: fr3.Base, Basename: "/view/" + id})
 		if got := readBody(t, get(t, ts, "", "/view/"+id, alicesHeaders)); got != want {
 			t.Fatalf("restored view: %q", got)
 		}
@@ -579,18 +582,21 @@ func TestBundleOnViewOrigin(t *testing.T) {
 		t.Fatalf("HEAD on the app origin: %v %v, want 404", res, err)
 	}
 
-	want := withSDK(strings.ReplaceAll(index, "__SPECOLA_BASE__/", fr.Base))
+	want := func(basename string) string {
+		return withSDK(strings.ReplaceAll(index, "__SPECOLA_BASE__/", fr.Base), bootData{Base: fr.Base, Basename: basename})
+	}
 	_, body := call(t, ts, alice, "GET", "/api/pages/"+id, "")
 	var meta struct{ ViewURL string }
 	mustJSON(t, body, &meta)
 	u, _ := url.Parse(meta.ViewURL)
-	if got := readBody(t, get(t, ts, viewHost, u.RequestURI(), nil)); got != want {
+	if got := readBody(t, get(t, ts, viewHost, u.Path+"/deep", nil)); got != want(u.Path) {
 		t.Fatalf("token view: %q", got)
 	}
 	_, body = call(t, ts, alice, "POST", "/api/pages/"+id+"/links", `{}`)
 	var l struct{ URL string }
 	mustJSON(t, body, &l)
-	if got := readBody(t, get(t, ts, viewHost, strings.TrimPrefix(l.URL, viewOrigin), nil)); got != want {
+	linkPath := strings.TrimPrefix(l.URL, viewOrigin)
+	if got := readBody(t, get(t, ts, viewHost, linkPath, nil)); got != want(linkPath) {
 		t.Fatalf("public link: %q", got)
 	}
 }

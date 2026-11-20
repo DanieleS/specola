@@ -64,13 +64,16 @@ func TestSeparateViewOrigin(t *testing.T) {
 		_, body := call(t, ts, user, "GET", "/api/pages/"+id, "")
 		var meta struct{ ViewURL string }
 		mustJSON(t, body, &meta)
+		// The token is in the path, so that an app's pushState keeps it.
 		u, err := url.Parse(meta.ViewURL)
-		if err != nil || u.Scheme+"://"+u.Host != viewOrigin || u.Path != "/view/"+id || u.Query().Get("t") == "" {
+		tok, ok := strings.CutPrefix(u.Path, "/t/")
+		if err != nil || u.Scheme+"://"+u.Host != viewOrigin || !ok || !strings.HasSuffix(tok, "/view/"+id) || u.RawQuery != "" {
 			t.Fatalf("viewUrl = %q", meta.ViewURL)
 		}
 		return u
 	}
 	u := viewURL(alice)
+	tok := strings.TrimSuffix(strings.TrimPrefix(u.Path, "/t/"), "/view/"+id)
 
 	// The app origin no longer serves page HTML, even when signed in.
 	if code, body := call(t, ts, alice, "GET", "/view/"+id, ""); code != http.StatusNotFound || strings.Contains(body, "<p>v") {
@@ -79,7 +82,7 @@ func TestSeparateViewOrigin(t *testing.T) {
 
 	// The view origin serves it with the token, no session needed.
 	res := get(t, ts, viewHost, u.RequestURI(), nil)
-	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != withSDK("<p>v2</p>") {
+	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != served("<p>v2</p>", u.Path) {
 		t.Fatalf("view origin: %d %q", res.StatusCode, b)
 	}
 	// The app may read it too, to keep it for offline viewing.
@@ -89,10 +92,18 @@ func TestSeparateViewOrigin(t *testing.T) {
 	if csp := res.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors https://specola.test") {
 		t.Fatalf("CSP = %q", csp)
 	}
-	q := u.Query()
-	q.Set("v", "1")
-	if b := readBody(t, get(t, ts, viewHost, u.Path+"?"+q.Encode(), nil)); b != withSDK("<p>v1</p>") {
+	if b := readBody(t, get(t, ts, viewHost, u.Path+"?v=1", nil)); b != served("<p>v1</p>", u.Path) {
 		t.Fatalf("v=1: %q", b)
+	}
+	// Any path below the page serves it too, with the same basename.
+	if b := readBody(t, get(t, ts, viewHost, u.Path+"/deep/link?x=1", nil)); b != served("<p>v2</p>", u.Path) {
+		t.Fatalf("deep path: %q", b)
+	}
+	// The older form, with the token in the query, still works.
+	for _, p := range []string{"/view/" + id + "?t=" + tok, "/view/" + id + "/deep?t=" + tok} {
+		if b := readBody(t, get(t, ts, viewHost, p, nil)); b != served("<p>v2</p>", "/view/"+id) {
+			t.Fatalf("%s: %q", p, b)
+		}
 	}
 
 	// The view origin serves nothing else.
@@ -102,8 +113,12 @@ func TestSeparateViewOrigin(t *testing.T) {
 		}
 	}
 
-	// Bad tokens are refused.
-	tok := u.Query().Get("t")
+	// The basename is part of what is sent, so of the ETag.
+	if a, b := get(t, ts, viewHost, u.Path, nil).Header.Get("ETag"), get(t, ts, viewHost, "/view/"+id+"?t="+tok, nil).Header.Get("ETag"); a == "" || a == b {
+		t.Fatalf("ETags of the two forms: %q and %q", a, b)
+	}
+
+	// Bad tokens are refused, in either form.
 	code, body = call(t, ts, alice, "POST", "/api/pages", `{"name":"Q","html":"x"}`)
 	other := createdID(t, code, body)
 	vt := srv.tokens
@@ -116,6 +131,9 @@ func TestSeparateViewOrigin(t *testing.T) {
 		"garbage":       "/view/" + id + "?t=not.a-token",
 		"no signature":  "/view/" + id + "?t=" + strings.Split(tok, ".")[0],
 		"empty payload": "/view/" + id + "?t=." + strings.Split(tok, ".")[1],
+		"path, none":    "/t//view/" + id,
+		"path, other":   "/t/" + tok + "/view/" + other,
+		"path, deep":    "/t/" + tok[:len(tok)-2] + "xx/view/" + id + "/deep",
 	} {
 		if res := get(t, ts, viewHost, path, nil); res.StatusCode != http.StatusForbidden {
 			t.Errorf("%s: %d, want 403", name, res.StatusCode)
