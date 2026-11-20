@@ -18,7 +18,7 @@ import (
 
 func bundleUploadDesc(pluginURL string) string {
 	return `Get a one-time link to publish an app with a build step as a bundle: a framework app (React, Vue, Svelte, ...), several files, code splitting or lazy loading, workers, wasm, many assets. A single self-contained HTML document goes through publish_page instead.
-kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. Steps, in the app's project directory:
+kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. The app must build with Vite. Steps, in the app's project directory:
 (a) once: ` + plugin.InstallCommand(pluginURL) + `
 (b) once: add specola() to the plugins in vite.config (import specola from '@specola/vite-plugin')
 (c) call this tool

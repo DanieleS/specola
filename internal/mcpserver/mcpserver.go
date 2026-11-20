@@ -92,7 +92,7 @@ func instructions(pluginURL string) string {
 
 CHOOSE HOW TO PUBLISH, before writing anything:
 - A single self-contained HTML document (a report, an explainer, a chart, a small tool; inline CSS and JS, imports from public CDNs are fine): publish_page, then new_version for each change. Over ~100 KB, use create_upload_grant and PUT the file with curl instead of inlining it.
-- Anything with a build step: a framework app (React, Vue, Svelte, ...), several source files, code splitting or lazy loading, workers, wasm, many assets. Do NOT inline a build into one HTML file: publish it as a bundle with the Specola Vite plugin. In the project directory:
+- Anything with a build step: a framework app (React, Vue, Svelte, ...), several source files, code splitting or lazy loading, workers, wasm, many assets. Do NOT inline a build into one HTML file: publish it as a bundle with the Specola Vite plugin. The app must build with Vite: start a new app with Vite (npm create vite@latest), and move an app built otherwise to Vite first. In the project directory:
   (a) ` + plugin.InstallCommand(pluginURL) + `
   (b) in vite.config add the plugin: import specola from '@specola/vite-plugin'; then plugins: [/* your framework plugin */, specola()]
   (c) call create_bundle_upload (kind "new" with a title, or kind "version" with the page id)

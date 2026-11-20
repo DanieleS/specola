@@ -82,8 +82,9 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	// The token is the credential: no session needed, so agents can curl it.
 	r.Put("/upload/{token}", s.handleUpload)
 	// The Vite plugin, as an npm package anyone can install.
-	r.Get("/tools/{file}", s.handleTool)
-	r.Head("/tools/{file}", s.handleTool)
+	// Any other path under /tools/ answers 404 rather than the SPA shell.
+	r.Get("/tools/*", s.handleTool)
+	r.Head("/tools/*", s.handleTool)
 	r.Route("/upload/bundle/{token}", func(r chi.Router) {
 		r.Get("/", s.handleBundleUploadInfo)
 		r.Post("/manifest", s.handleBundleManifest)

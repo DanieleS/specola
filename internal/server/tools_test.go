@@ -33,10 +33,11 @@ func TestPluginTarballIsServed(t *testing.T) {
 		t.Fatalf("GET %s: %d, %d bytes (want %d)", path, res.StatusCode, len(body), len(plugin.Tarball()))
 	}
 	for h, want := range map[string]string{
-		"Content-Type":     "application/gzip",
-		"Cache-Control":    "public, max-age=31536000, immutable",
-		"Content-Encoding": "", // already gzip: never compressed again
-		"ETag":             `"` + plugin.TarballSHA256 + `"`,
+		"Content-Type":           "application/gzip",
+		"Cache-Control":          "public, max-age=31536000, immutable",
+		"Content-Encoding":       "", // already gzip: never compressed again
+		"ETag":                   `"` + plugin.TarballSHA256 + `"`,
+		"X-Content-Type-Options": "nosniff",
 	} {
 		if got := res.Header.Get(h); got != want {
 			t.Errorf("%s = %q, want %q", h, got, want)
@@ -44,7 +45,7 @@ func TestPluginTarballIsServed(t *testing.T) {
 	}
 
 	// Only this server's version is served, under its own name.
-	for _, p := range []string{"/tools/specola-vite-plugin-0.0.1.tgz", "/tools/specola-vite-plugin.tgz", "/tools/package.json"} {
+	for _, p := range []string{"/tools/specola-vite-plugin-0.0.1.tgz", "/tools/specola-vite-plugin.tgz", "/tools/package.json", "/tools/", "/tools/a/" + plugin.TarballName} {
 		if res := get(t, ts, "", p, nil); res.StatusCode != http.StatusNotFound {
 			t.Errorf("%s: %d, want 404", p, res.StatusCode)
 		}

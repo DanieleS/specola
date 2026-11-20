@@ -249,11 +249,12 @@ func (s *Server) pluginURL() string { return s.cfg.AppBaseURL + plugin.TarballPa
 // handleTool serves the Vite plugin's npm package, under its versioned name
 // only: the name changes with each version, so it is cached for good.
 func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
-	if chi.URLParam(r, "file") != plugin.TarballName {
+	if chi.URLParam(r, "*") != plugin.TarballName {
 		http.Error(w, "not found: this server has "+s.pluginURL(), http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("ETag", `"`+plugin.TarballSHA256+`"`)
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(plugin.Tarball()))

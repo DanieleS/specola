@@ -253,8 +253,11 @@ using React Router writes `<BrowserRouter basename={window.specola?.basename}>`
 `ETag` also covers the basename, since it is part of what is sent (a deep path
 under the same prefix gets the same tag and the same body).
 
-The SPA's service worker leaves navigations to `/view/…` alone, as before, so
-a reload of a deep path inside the frame reaches the server.
+The SPA's service worker leaves navigations to `/view/…` and `/s/…` alone, as
+before, so a reload of a deep path inside the frame reaches the server; so it
+does for `/b/…` and `/tools/…`, and it only ever keeps an HTML response as the
+app shell (a navigation to the plugin's tarball once replaced the offline
+shell with it).
 
 ## MCP
 
