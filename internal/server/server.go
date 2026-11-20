@@ -131,6 +131,11 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		}
 		r.Route("/api", func(r chi.Router) {
 			r.Get("/me", s.handleMe)
+			r.Get("/me/preferences", s.handlePreferences)
+			r.Put("/me/preferences", s.handleSetPreferences)
+			r.Get("/folders/{id}/conventions", s.handleFolderConventions)
+			r.Put("/folders/{id}/conventions", s.handleSetFolderConventions)
+			r.Delete("/folders/{id}/conventions", s.handleDeleteFolderConventions)
 			r.Get("/tree", s.handleTree)
 			r.Post("/folders", s.handleCreateFolder)
 			r.Post("/pages", s.handleCreatePage)

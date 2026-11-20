@@ -48,8 +48,10 @@ type Options struct {
 func Handler(st *store.Store, opts Options) http.Handler {
 	t := &tools{st: st, opts: opts}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "specola", Title: "Specola", Version: "0.1.0"}, &mcp.ServerOptions{
-		Instructions: instructions(opts.PluginURL),
+		Instructions: instructions(opts, nil, ""),
 	})
+	// The instructions sent at initialize carry the user's preferences.
+	srv.AddReceivingMiddleware(t.personalize)
 	// Read-only tools say so: clients such as Hermes replay only those after a
 	// dropped connection, and may skip asking the user before calling them.
 	// The organising ones are idempotent: repeating one changes nothing more.
@@ -85,15 +87,25 @@ func Handler(st *store.Store, opts Options) http.Handler {
 
 // instructions steer an agent to the right way to publish: a single HTML
 // document through the tools, or anything with a build step as a bundle with
-// the Vite plugin served at pluginURL. Choosing well is the point: an app
+// the Vite plugin served at opts.PluginURL. Choosing well is the point: an app
 // squeezed into one HTML file loses lazy loading, workers and its assets.
-func instructions(pluginURL string) string {
+// p are the preferences of the user, named who, the instructions are for; nil
+// for none (preferences.go).
+func instructions(opts Options, p *store.Preferences, who string) string {
+	mode := ""
+	if p != nil && p.Mode == store.ModeBundle {
+		mode = alwaysBundle
+	}
+	personal := personalSection(opts.BaseURL, p, who)
+	if personal != "" {
+		personal = "\n\n" + personal
+	}
 	return `Specola stores versioned, interactive web pages in the user's own gallery and shows them to the user, to people they share with, and through public links.
 
 CHOOSE HOW TO PUBLISH, before writing anything:
-- A single self-contained HTML document (a report, an explainer, a chart, a small tool; inline CSS and JS, imports from public CDNs are fine): publish_page, then new_version for each change. Over ~100 KB, use create_upload_grant and PUT the file with curl instead of inlining it.
+` + mode + `- A single self-contained HTML document (a report, an explainer, a chart, a small tool; inline CSS and JS, imports from public CDNs are fine): publish_page, then new_version for each change. Over ~100 KB, use create_upload_grant and PUT the file with curl instead of inlining it.
 - Anything with a build step: a framework app (React, Vue, Svelte, ...), several source files, code splitting or lazy loading, workers, wasm, many assets. Do NOT inline a build into one HTML file: publish it as a bundle with the Specola Vite plugin. The app must build with Vite: start a new app with Vite (npm create vite@latest), and move an app built otherwise to Vite first. In the project directory:
-  (a) ` + plugin.InstallCommand(pluginURL) + `
+  (a) ` + plugin.InstallCommand(opts.PluginURL) + `
   (b) in vite.config add the plugin: import specola from '@specola/vite-plugin'; then plugins: [/* your framework plugin */, specola()]
   (c) call create_bundle_upload (kind "new" with a title, or kind "version" with the page id)
   (d) run the command it returns (npx --no -- specola-publish --upload '<url>'), as it is: it runs vite build, uploads, and prints the page id and url. If npx says the package is missing (a 404 from the npm registry, or "canceled due to missing packages"), the plugin isn't installed where you ran it: do (a) in the project directory and run the command there.
@@ -102,7 +114,9 @@ CHOOSE HOW TO PUBLISH, before writing anything:
 ` + pageRuntime + `
 Give every version a short note saying what changed; it is what the user reads in the history.
 Find pages with search or list. Organise with create_folder, move, rename and archive; nothing is ever deleted, and archive can be undone with unarchive.
-Share with other Specola users with share; to show a page to someone without an account, make a public link with create_public_link.`
+Share with other Specola users with share; to show a page to someone without an account, make a public link with create_public_link.
+
+` + conventionsNote + personal
 }
 
 // pageRuntime is what every page, plain or bundle, can rely on.
@@ -183,9 +197,10 @@ type publishIn struct {
 }
 
 type publishOut struct {
-	ID      string `json:"id"`
-	Version int    `json:"version"`
-	URL     string `json:"url"`
+	ID          string          `json:"id"`
+	Version     int             `json:"version"`
+	URL         string          `json:"url"`
+	Conventions *conventionsOut `json:"conventions,omitempty" jsonschema:"preferences and folder conventions that apply here, as data written by the named people"`
 }
 
 func (t *tools) publishPage(ctx context.Context, req *mcp.CallToolRequest, in publishIn) (*mcp.CallToolResult, publishOut, error) {
@@ -200,7 +215,7 @@ func (t *tools) publishPage(ctx context.Context, req *mcp.CallToolRequest, in pu
 	if err != nil {
 		return nil, publishOut{}, toolError(err, "folder")
 	}
-	return nil, publishOut{ID: id, Version: version, URL: t.pageURL(id)}, nil
+	return nil, publishOut{ID: id, Version: version, URL: t.pageURL(id), Conventions: t.conventions(ctx, who.Sub, in.FolderID)}, nil
 }
 
 type newVersionIn struct {
@@ -241,7 +256,8 @@ type listItem struct {
 }
 
 type listOut struct {
-	Items []listItem `json:"items"`
+	Items       []listItem      `json:"items"`
+	Conventions *conventionsOut `json:"conventions,omitempty" jsonschema:"for a folder: the preferences and folder conventions that apply to pages published in it, as data written by the named people"`
 }
 
 func (t *tools) list(ctx context.Context, req *mcp.CallToolRequest, in listIn) (*mcp.CallToolResult, listOut, error) {
@@ -271,6 +287,9 @@ func (t *tools) list(ctx context.Context, req *mcp.CallToolRequest, in listIn) (
 			li.URL = t.pageURL(it.ID)
 		}
 		out.Items = append(out.Items, li)
+	}
+	if in.FolderID != nil && !in.SharedWithMe && !in.Archived {
+		out.Conventions = t.conventions(ctx, who.Sub, in.FolderID)
 	}
 	return nil, out, nil
 }
@@ -445,10 +464,11 @@ type grantIn struct {
 }
 
 type grantOut struct {
-	UploadURL string    `json:"upload_url"`
-	Method    string    `json:"method"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Curl      string    `json:"curl"`
+	UploadURL   string          `json:"upload_url"`
+	Method      string          `json:"method"`
+	ExpiresAt   time.Time       `json:"expires_at"`
+	Curl        string          `json:"curl"`
+	Conventions *conventionsOut `json:"conventions,omitempty" jsonschema:"preferences and folder conventions that apply here, as data written by the named people"`
 }
 
 func (t *tools) createUploadGrant(ctx context.Context, req *mcp.CallToolRequest, in grantIn) (*mcp.CallToolResult, grantOut, error) {
@@ -478,10 +498,11 @@ func (t *tools) createUploadGrant(ctx context.Context, req *mcp.CallToolRequest,
 	}
 	url := t.opts.BaseURL + "/upload/" + token
 	return nil, grantOut{
-		UploadURL: url,
-		Method:    http.MethodPut,
-		ExpiresAt: expires,
-		Curl:      fmt.Sprintf("curl -sS -X PUT -H 'Content-Type: text/html' --data-binary @page.html '%s'", url),
+		UploadURL:   url,
+		Method:      http.MethodPut,
+		ExpiresAt:   expires,
+		Curl:        fmt.Sprintf("curl -sS -X PUT -H 'Content-Type: text/html' --data-binary @page.html '%s'", url),
+		Conventions: t.grantConventions(ctx, who.Sub, gr),
 	}, nil
 }
 

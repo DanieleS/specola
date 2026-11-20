@@ -1,6 +1,8 @@
 # Agent preferences and folder conventions — design
 
-Status: planned, to be implemented after SPA bundles (`docs/spa-bundles.md`).
+Status: implemented (migration `0011_agent_preferences.sql`,
+`internal/store/preferences.go`, `internal/mcpserver/preferences.go`,
+`web/src/lib/Settings.svelte`, `web/src/lib/ConventionsDialog.svelte`).
 Mockup: https://claude.ai/artifact/JyrQM98WsyNK5zd7ikRUom
 
 Agents publishing through the MCP decide stack and style from scratch every
@@ -66,3 +68,38 @@ context of the agent of whoever publishes there (prompt injection). So:
   effective (inherited) conventions and which folder they come from.
 - Storage: `user_preferences(sub PK, mode, text, style_ref_asset_id, updated_at)`
   and `folder_conventions(folder_id PK, text, style_ref_asset_id, updated_by_sub, updated_at)`.
+
+## Implementation notes
+
+Where the sketch above was open, the implementation decided:
+
+- Migration `0011` (`0010` was taken by bundle blob storage). Both tables cap
+  `text` at 4000 characters with a CHECK; style references point at `asset`
+  with `ON DELETE SET NULL`. Empty conventions (no text, no reference) are
+  deleted rather than stored.
+- Per-user instructions: `mcpserver.Handler` serves one stateless
+  `mcp.Server`, so every request, `initialize` included, carries the bearer
+  token. A receiving middleware rewrites the `instructions` of the
+  `initialize` (and `server/discover`, marked `cacheScope: private`) result
+  for that user; no extra tool is needed. The instructions always explain
+  the `conventions` object, precedence and that it is data; with
+  preferences they end with a section naming the user, the mode, the style
+  reference and the Markdown between `<<<BEGIN/END USER PREFERENCES>>>`
+  markers (markers inside the text are removed). Mode `bundle` adds a line
+  at the top of "CHOOSE HOW TO PUBLISH".
+- The `conventions` object is returned whenever something applies (folder
+  conventions in force, or non-default user preferences), also at the
+  user's root for the publishing tools; `list` returns it only for a
+  folder. It adds `about` (how to take it), `folder.id`, `folder.inherited`,
+  `folder.written_by`, `folder.updated_at`, `user.mode`, and
+  `style_reference.url`/`from` (`folder` or `user`: the folder's reference
+  wins if the publisher can see it). For a new version, the page's folder
+  counts. A failure to read conventions never fails the tool call.
+- `folder.path` runs from the top of the tree to the folder the conventions
+  are set on; folders above it the reader can't see are shown as `…`.
+- `GET /api/folders/{id}/conventions` answers `{own, effective, canEdit}`;
+  `PUT` and `DELETE` answer the same. Saving with a style reference left
+  unchanged skips the visibility check, so text can still be saved after the
+  page became invisible (it doesn't count until visible again).
+- Listings flag folders with conventions (`conventions: true`) for the card
+  marker. On a phone the header's Preferences link is an icon.

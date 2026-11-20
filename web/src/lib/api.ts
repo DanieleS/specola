@@ -11,6 +11,8 @@ export type TreeItem = {
   shared: boolean;
   /** Starred by the caller. Absent on search results. */
   favorite?: boolean;
+  /** A folder with conventions for agents set on it. */
+  conventions?: boolean;
 };
 
 export type PageMeta = {
@@ -91,6 +93,48 @@ export type BundleUpload = {
   /** The command that installs this instance's Vite plugin. */
   pluginInstall: string;
 };
+
+/** A page agents take colours, typography and components from. */
+export type StyleRef = { id: string; name: string; version: number; folderId: string | null };
+
+/** How agents publish for this user: they choose, or always a bundle. */
+export type PublishMode = "auto" | "bundle";
+
+/** The user's defaults for agents publishing through the MCP. */
+export type Preferences = {
+  mode: PublishMode;
+  text: string;
+  /** The stored reference; styleRef describes it, null if the page can no longer be seen. */
+  styleRefId: string | null;
+  styleRef: StyleRef | null;
+  updatedAt?: string;
+};
+
+/** The conventions set on one folder. */
+export type Conventions = {
+  folderId: string;
+  folderName: string;
+  /** From the top of the folder's tree; folders the reader can't see are "…". */
+  path: string;
+  text: string;
+  styleRefId: string | null;
+  styleRef: StyleRef | null;
+  /** Who wrote them, by name and email. */
+  updatedBy: string;
+  updatedAt: string;
+};
+
+export type FolderConventions = {
+  /** Set on this folder. */
+  own: Conventions | null;
+  /** In force here: own, or inherited from the nearest folder above. */
+  effective: Conventions | null;
+  /** The caller owns the folder. */
+  canEdit: boolean;
+};
+
+/** Longest text of preferences or conventions, in characters. */
+export const MAX_PREFERENCE_CHARS = 4000;
 
 const aclPath = (kind: ItemKind, id: string) => `/api/${kind}s/${id}/acl`;
 
@@ -178,4 +222,12 @@ export const api = {
   createPublicLink: (id: string, opts: { label?: string; version?: number; expiresInDays?: number }) =>
     req<PublicLink & { url: string }>("POST", `/api/pages/${id}/links`, opts),
   revokePublicLink: (id: string, link: string) => req<void>("DELETE", `/api/pages/${id}/links/${link}`),
+  preferences: () => req<Preferences>("GET", "/api/me/preferences"),
+  setPreferences: (p: { mode: PublishMode; text: string; styleRefId: string | null }) =>
+    req<Preferences>("PUT", "/api/me/preferences", p),
+  folderConventions: (id: string) => req<FolderConventions>("GET", `/api/folders/${id}/conventions`),
+  /** Empty text and no reference remove them. */
+  setFolderConventions: (id: string, text: string, styleRefId: string | null) =>
+    req<FolderConventions>("PUT", `/api/folders/${id}/conventions`, { text, styleRefId }),
+  deleteFolderConventions: (id: string) => req<FolderConventions>("DELETE", `/api/folders/${id}/conventions`),
 };

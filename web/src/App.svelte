@@ -4,16 +4,22 @@
   import Logo from "./lib/Logo.svelte";
   import PageViewer from "./lib/PageViewer.svelte";
   import PublishForm from "./lib/PublishForm.svelte";
+  import Settings from "./lib/Settings.svelte";
   import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
   import * as offline from "./lib/offline.svelte";
   import { resumeWrites } from "./lib/pagedata";
 
-  type Route = { name: "list" } | { name: "new"; folderId: string | null } | { name: "view"; id: string };
+  type Route =
+    | { name: "list" }
+    | { name: "new"; folderId: string | null }
+    | { name: "view"; id: string }
+    | { name: "settings" };
 
   function parseHash(): Route {
     const parts = location.hash.replace(/^#/, "").split("/").filter(Boolean);
     if (parts[0] === "p" && parts[1]) return { name: "view", id: parts[1] };
     if (parts[0] === "new") return { name: "new", folderId: parts[1] ?? null };
+    if (parts[0] === "settings") return { name: "settings" };
     return { name: "list" };
   }
 
@@ -52,14 +58,14 @@
   <Login error={authError} />
 {:else if auth === "in"}
   <div class="min-h-screen flex flex-col">
-    <header class="flex items-center justify-between px-5 h-14 border-b border-white/10">
+    <header class="flex items-center justify-between gap-3 px-4 sm:px-5 h-14 border-b border-white/10">
       <a href="#/" class="flex items-center gap-2 font-semibold tracking-tight text-lg">
         <Logo class="w-5 h-5 text-amber-400" />
         Specola
       </a>
-      <div class="flex items-center gap-4 text-sm">
+      <div class="flex items-center gap-3 sm:gap-4 text-sm">
         {#if offline.net.online}
-          <a href="#/new" class="px-3 py-1.5 rounded-md bg-amber-500 text-black font-medium hover:bg-amber-400">
+          <a href="#/new" class="whitespace-nowrap px-3 py-1.5 rounded-md bg-amber-500 text-black font-medium hover:bg-amber-400">
             New page
           </a>
         {:else}
@@ -69,13 +75,39 @@
           >
         {/if}
         {#if email}<span class="text-white/50 hidden sm:inline">{email}</span>{/if}
-        <a href="/auth/logout" onclick={logout} class="text-white/50 hover:text-white/80">Logout</a>
+        <!-- On a phone the link is an icon, so the header fits. -->
+        <a
+          href="#/settings"
+          class={route.name === "settings" ? "text-white" : "text-white/50 hover:text-white/80"}
+          title="Preferences for agents"
+          aria-label="Preferences"
+          aria-current={route.name === "settings" ? "page" : undefined}
+          ><span class="hidden sm:inline">Preferences</span><span class="sm:hidden"
+            ><svg
+              class="w-5 h-5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              aria-hidden="true"
+              ><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12" /><circle cx="16" cy="6" r="2" /><circle
+                cx="10"
+                cy="12"
+                r="2"
+              /><circle cx="18" cy="18" r="2" /></svg
+            ></span
+          ></a
+        >
+        <a href="/auth/logout" onclick={logout} class="whitespace-nowrap text-white/50 hover:text-white/80">Logout</a>
       </div>
     </header>
 
     <main class="flex-1">
       {#if route.name === "view"}
         <PageViewer id={route.id} />
+      {:else if route.name === "settings"}
+        <Settings />
       {:else if route.name === "new"}
         <PublishForm folderId={route.folderId} />
       {:else}

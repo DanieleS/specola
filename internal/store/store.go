@@ -47,6 +47,9 @@ type TreeItem struct {
 	Shared    bool      `json:"shared"` // the item itself has shares
 	// Favorite: the caller starred the item. Search results leave it unset.
 	Favorite bool `json:"favorite,omitempty"`
+	// Conventions: a folder with conventions for agents set on it
+	// (preferences.go). Search results leave it unset.
+	Conventions bool `json:"conventions,omitempty"`
 }
 
 // PageMeta is the metadata the viewer header needs.
@@ -123,7 +126,7 @@ func favoritePage(param string) string {
 
 // listItems runs a folder query then a page query with the same arguments,
 // each selecting kind, id, name, slug, version, updated_at, role, shared,
-// favorite.
+// favorite, and flags the folders that have conventions.
 func listItems(ctx context.Context, q querier, folders, pages string, args ...any) ([]TreeItem, error) {
 	items := []TreeItem{}
 	for _, sql := range []string{folders, pages} {
@@ -145,6 +148,9 @@ func listItems(ctx context.Context, q querier, folders, pages string, args ...an
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
+	}
+	if err := markConventions(ctx, q, items); err != nil {
+		return nil, err
 	}
 	return items, nil
 }

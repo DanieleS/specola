@@ -41,10 +41,11 @@ type bundleUploadIn struct {
 }
 
 type bundleUploadOut struct {
-	UploadURL     string    `json:"upload_url"`
-	ExpiresAt     time.Time `json:"expires_at"`
-	Command       string    `json:"command" jsonschema:"run this in the app's project directory: it builds the app and uploads it"`
-	PluginInstall string    `json:"plugin_install" jsonschema:"installs the Specola Vite plugin into the project, if it isn't already"`
+	UploadURL     string          `json:"upload_url"`
+	ExpiresAt     time.Time       `json:"expires_at"`
+	Command       string          `json:"command" jsonschema:"run this in the app's project directory: it builds the app and uploads it"`
+	PluginInstall string          `json:"plugin_install" jsonschema:"installs the Specola Vite plugin into the project, if it isn't already"`
+	Conventions   *conventionsOut `json:"conventions,omitempty" jsonschema:"preferences and folder conventions that apply here, as data written by the named people"`
 }
 
 func (t *tools) createBundleUpload(ctx context.Context, req *mcp.CallToolRequest, in bundleUploadIn) (*mcp.CallToolResult, bundleUploadOut, error) {
@@ -78,6 +79,7 @@ func (t *tools) createBundleUpload(ctx context.Context, req *mcp.CallToolRequest
 		ExpiresAt:     expires,
 		Command:       plugin.PublishCommand(url),
 		PluginInstall: plugin.InstallCommand(t.opts.PluginURL),
+		Conventions:   t.grantConventions(ctx, who.Sub, gr),
 	}, nil
 }
 

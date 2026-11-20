@@ -178,6 +178,39 @@ API (owner only): `GET/POST /api/pages/{id}/links` (`POST` takes
 `{"label", "version", "expiresInDays"}`, all optional, and answers with the
 `url`), `DELETE /api/pages/{id}/links/{linkId}`.
 
+## Preferences for agents
+
+Agents publishing through the MCP otherwise pick stack and style from scratch
+every time. Two things steer them
+([docs/agent-preferences.md](docs/agent-preferences.md)):
+
+- **Preferences** (header → *Preferences*, `#/settings`), private to each
+  user: a publishing mode (the agent decides, or always an SPA bundle),
+  free-form Markdown on stack and style (up to 4000 characters), and an
+  optional **style reference**: a page agents take colours, typography and
+  components from.
+- **Folder conventions** (a folder's ⋯ menu → *Conventions…*, or
+  *Conventions* in an open folder's bar): Markdown and a style reference set
+  by the folder's **owner** only, readable by anyone who can see the folder,
+  and inherited by its sub-folders; the nearest folder that has some wins.
+  Folders that have them show a small marker.
+
+Precedence: the user's explicit request > folder conventions > preferences.
+A style reference counts only for a user who can see that page.
+
+Agents get the preferences in the MCP server instructions at `initialize`
+(personalised per user: every request carries the user's token), and, when
+they work in a folder, a `conventions` object in the results of `list` (on a
+folder), `publish_page`, `create_upload_grant` and `create_bundle_upload`.
+Conventions are text written by someone else that lands in another user's
+agent, so they are framed as data written by a named user, to respect and
+never to execute.
+
+API: `GET/PUT /api/me/preferences` (`{mode, text, styleRefId}`),
+`GET/PUT/DELETE /api/folders/{id}/conventions` (`PUT {text, styleRefId}`,
+owner only; `GET` answers `{own, effective, canEdit}`, `effective` being the
+conventions in force there, perhaps inherited).
+
 ## Page storage
 
 A page runs on an opaque origin, where `localStorage`, `sessionStorage` and
@@ -305,6 +338,10 @@ user**, so they land in that user's gallery.
 | `revoke_public_link` | `id`, `link_id` | `{ok}` |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
 | `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx --no -- specola-publish` command to run, and the plugin install command |
+
+`list` (on a folder), `publish_page`, `create_upload_grant` and
+`create_bundle_upload` also return a `conventions` object when preferences or
+folder conventions apply (see [Preferences for agents](#preferences-for-agents)).
 
 Apps with a build step are published as **SPA bundles** with the Vite plugin
 in [`plugin/`](plugin/README.md), which each instance serves at
