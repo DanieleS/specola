@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -52,6 +53,10 @@ type Config struct {
 	RunnerURL   string
 	RunnerToken string
 	SecretsKey  []byte
+	// BackendPurgeAfterDays deletes the backend data of pages dormant (archived,
+	// or whose current version has no backend) for longer than this many
+	// days. 0, the default, never does.
+	BackendPurgeAfterDays int
 }
 
 func Load() (*Config, error) {
@@ -69,6 +74,9 @@ func Load() (*Config, error) {
 	}
 	c.AppBaseURL = strings.TrimRight(c.AppBaseURL, "/")
 	if err := c.loadBackends(); err != nil {
+		return nil, err
+	}
+	if err := c.loadPurge(); err != nil {
 		return nil, err
 	}
 	c.MCPResource = env("SPECOLA_MCP_RESOURCE", c.AppBaseURL+"/mcp")
@@ -129,6 +137,23 @@ func (c *Config) loadBackends() error {
 		return fmt.Errorf("SPECOLA_SECRETS_KEY must be 32 bytes, base64-encoded (e.g. openssl rand -base64 32)")
 	}
 	c.SecretsKey = key
+	return nil
+}
+
+// loadPurge reads SPECOLA_BACKEND_PURGE_AFTER_DAYS. A value that isn't a
+// positive number of days is refused rather than read as "never": whoever
+// set it meant data to be deleted, or meant something else entirely.
+func (c *Config) loadPurge() error {
+	v := strings.TrimSpace(os.Getenv("SPECOLA_BACKEND_PURGE_AFTER_DAYS"))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	// The upper bound keeps the duration in range (about 270 years).
+	if err != nil || n < 1 || n > 100_000 {
+		return fmt.Errorf("SPECOLA_BACKEND_PURGE_AFTER_DAYS must be a positive number of days (leave it unset to never purge), got %q", v)
+	}
+	c.BackendPurgeAfterDays = n
 	return nil
 }
 

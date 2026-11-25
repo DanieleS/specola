@@ -27,6 +27,10 @@ type Runner struct {
 	client *http.Client
 	// probe carries health checks, which must answer quickly.
 	probe *http.Client
+	// slow carries the data routes (data.go), which may work for minutes
+	// before their answer's head (a snapshot of a large page, an import
+	// being checked): each call sets its own deadline instead.
+	slow *http.Client
 
 	available atomic.Bool
 	// version is the runner's own version, from its latest health check.
@@ -56,10 +60,13 @@ func NewRunner(base, token string) *Runner {
 	// The runner is on a private network: the instance's outbound proxy, if
 	// any, is not the way to it.
 	tr.Proxy = nil
+	slow := tr.Clone()
+	slow.ResponseHeaderTimeout = 0
 	r := &Runner{
 		url: base, token: token,
 		client: &http.Client{Transport: tr, CheckRedirect: noRedirects},
 		probe:  &http.Client{Transport: tr, Timeout: 5 * time.Second, CheckRedirect: noRedirects},
+		slow:   &http.Client{Transport: slow, CheckRedirect: noRedirects},
 	}
 	r.version.Store("")
 	return r

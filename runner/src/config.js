@@ -14,8 +14,15 @@ export const DEFAULT_LIMITS = Object.freeze({
   workerConcurrency: 32,
   pageDiskBytes: 1024 * MiB,
   idleMs: 5 * 60_000,
+  // Snapshots kept per page (docs/page-backends.md, "Snapshots"): the last
+  // 5 version ones, 7 daily ones, 5 taken before a restore/import/wipe
+  // (together), and at most 10 manual ones (an 11th is refused).
   versionSnapshotsKept: 5,
+  dailySnapshotsKept: 7,
+  beforeSnapshotsKept: 5,
+  manualSnapshotsMax: 10,
   snapshotDiskBytes: 2048 * MiB,
+  importBytes: 1024 * MiB,
 });
 
 // RUNNER_* variable for each limit.

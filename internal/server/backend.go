@@ -253,10 +253,6 @@ func (b *limitedBody) Read(p []byte) (int, error) {
 // without a CORS preflight, which is never granted, so a page elsewhere
 // can't call a backend with the user's cookie.
 func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
-	// The runner may answer, and its head be relayed, before the page's body
-	// is all here (a handler that refuses early, or streams while it reads).
-	// Over HTTP/1 Go would then cut the body still being forwarded.
-	_ = http.NewResponseController(w).EnableFullDuplex()
 	ctx, sub, id := r.Context(), subOf(r.Context()), chi.URLParam(r, "id")
 	version, err := strconv.Atoi(r.Header.Get("X-Specola-Version"))
 	if err != nil || version < 1 {
@@ -333,6 +329,12 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 	// the user goes away), or after maxCallTime.
 	callCtx, cancel := context.WithTimeout(ctx, maxCallTime)
 	defer cancel()
+	// The runner may answer, and its head be relayed, before the page's body
+	// is all here (a handler that refuses early, or streams while it reads).
+	// Over HTTP/1 Go would then cut the body still being forwarded. Only
+	// now: answering a refusal without reading the body in full-duplex mode
+	// trips Go's server (its background reader reads the body concurrently).
+	_ = http.NewResponseController(w).EnableFullDuplex()
 	body := &limitedBody{r: r.Body, left: maxBackendBody}
 	size := r.ContentLength
 	if r.Body == nil || r.Body == http.NoBody {
@@ -344,6 +346,12 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer res.Body.Close()
+	// The handler answered (whatever its status): the page has data on the
+	// runner, or may have from now on. specola's and the runner's own
+	// errors don't count.
+	if res.Header.Get("X-Specola-Error") == "" {
+		s.markBackendUsed(ctx, t.ID)
+	}
 	relayResponse(w, res)
 }
 

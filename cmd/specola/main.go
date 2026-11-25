@@ -76,6 +76,10 @@ func main() {
 	if cfg.BackendsEnabled() {
 		slog.Info("page backends: enabled", "runner", cfg.RunnerURL)
 		go h.WatchRunner(ctx)
+		if cfg.BackendPurgeAfterDays > 0 {
+			slog.Info("page backends: purging the data of pages dormant for longer than", "days", cfg.BackendPurgeAfterDays)
+			go h.PurgeBackends(ctx)
+		}
 	} else {
 		slog.Info("page backends: disabled (set SPECOLA_RUNNER_URL, SPECOLA_RUNNER_TOKEN and SPECOLA_SECRETS_KEY to enable)")
 	}

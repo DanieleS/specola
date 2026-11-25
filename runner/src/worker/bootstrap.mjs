@@ -3,8 +3,8 @@
 // The runner forks it with Node's permission model on and talks to it over
 // the IPC channel (advanced serialization, so bytes travel as Uint8Array):
 //
-//   runner → worker  init, req, body, bodyEnd, abort, ack, ping, stop
-//   worker → runner  ready, fatal, head, chunk, end, fail, done, log, pong
+//   runner → worker  init, req, body, bodyEnd, abort, ack, ping, forget, stop
+//   worker → runner  ready, fatal, head, chunk, end, fail, done, log, pong, forgot
 //
 // Bodies stream chunk by chunk in both directions. Response chunks are
 // acknowledged by the runner once its HTTP response took them, so a slow
@@ -86,6 +86,24 @@ function userDbFor(sub) {
     userDbs.set(sub, db);
   }
   return db;
+}
+
+// "Delete my data": closes the user's database and deletes its files in one
+// synchronous step, so no call can reopen it in between. The name is the
+// runner's (sha256 hex of the sub), checked anyway since it becomes a path.
+function forgetUser(name) {
+  if (!/^[0-9a-f]{64}$/.test(name)) return;
+  for (const [sub, db] of userDbs) {
+    if (createHash('sha256').update(sub).digest('hex') !== name) continue;
+    try {
+      db.close();
+    } catch {
+      // closed by the handler already
+    }
+    userDbs.delete(sub);
+  }
+  const file = path.join(pageDir, 'users', `${name}.sqlite`);
+  for (const s of ['', '-wal', '-shm', '-journal']) fs.rmSync(file + s, { force: true });
 }
 
 function closeAll() {
@@ -349,6 +367,14 @@ function onMessage(msg) {
       break;
     case 'ping':
       send({ t: 'pong' });
+      break;
+    case 'forget':
+      try {
+        forgetUser(msg.name);
+      } catch (err) {
+        logError('deleting a user\'s data failed', err);
+      }
+      send({ t: 'forgot', fid: msg.fid });
       break;
     case 'stop':
       closeAll();

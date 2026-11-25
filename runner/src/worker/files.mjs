@@ -16,6 +16,23 @@ import { pathProblem } from './paths.mjs';
 
 const MAX_CONTENT_TYPE = 255;
 
+/** The file index's tables (also built by the runner for an import). */
+export const INDEX_SCHEMA = `CREATE TABLE IF NOT EXISTS files (
+    key TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    content_type TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256);`;
+
+/** Why a content type is not acceptable, or null. */
+export function contentTypeProblem(t) {
+  // eslint-disable-next-line no-control-regex
+  if (typeof t !== 'string' || t === '' || t.length > MAX_CONTENT_TYPE || /[\u0000-\u001f\u007f]/.test(t)) return 'is not a valid content type';
+  return null;
+}
+
 /** Thrown by put when the page's data would exceed its disk quota. */
 export class QuotaExceededError extends Error {
   constructor(used, quota) {
@@ -93,14 +110,7 @@ export class FileStore {
     const db = new DatabaseSync(path.join(this.#pageDir, 'files.sqlite'));
     db.exec(`PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS files (
-        key TEXT PRIMARY KEY,
-        sha256 TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        content_type TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256);`);
+      ${INDEX_SCHEMA}`);
     this.#db = db;
     return db;
   }
@@ -119,10 +129,7 @@ export class FileStore {
     if (body === undefined || body === null) throw new TypeError('files.put: body is required');
     let contentType = opts?.contentType ?? (typeof body?.type === 'string' && body.type) ?? '';
     if (!contentType) contentType = 'application/octet-stream';
-    // eslint-disable-next-line no-control-regex
-    if (typeof contentType !== 'string' || contentType.length > MAX_CONTENT_TYPE || /[\u0000-\u001f\u007f]/.test(contentType)) {
-      throw new TypeError('files.put: invalid contentType');
-    }
+    if (contentTypeProblem(contentType)) throw new TypeError('files.put: invalid contentType');
     const stream = new Response(body).body;
 
     const used = await pageUsage(this.#pageDir);

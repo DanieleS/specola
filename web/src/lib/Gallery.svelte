@@ -352,6 +352,13 @@
               <div class="font-medium truncate">{it.name}</div>
               <!-- Room on the right for the star and the ⋯ that sit over this line. -->
               <div class="text-xs text-white/40 mt-1 pr-16">{subtitle(it)}</div>
+              {#if tab === "archived" && it.backendPurgeAt}
+                <!-- Pages dormant long enough lose their backend data (docs/page-backends.md, "Data lifecycle"). -->
+                <div data-purge-notice class="text-xs text-red-300/90 mt-1 pr-16">
+                  {it.kind === "folder" ? "Backend data of pages inside will be deleted from" : "Backend data will be deleted on"}
+                  {new Date(it.backendPurgeAt).toLocaleDateString(undefined, { dateStyle: "long" })}
+                </div>
+              {/if}
             </button>
 
             {#if tab === "offline"}

@@ -5,7 +5,7 @@ import { after, before, describe, test } from 'node:test';
 import { backendHash } from '../src/code.js';
 import { loadConfig, parseListen } from '../src/config.js';
 import { parseInvoke } from '../src/server.js';
-import { TOKEN, backend, invoke, logText, makeCode, startRunner, until } from './helpers.js';
+import { TOKEN, backend, getJSON, invoke, logText, makeCode, startRunner, until } from './helpers.js';
 
 describe('auth and plumbing', () => {
   let r;
@@ -331,6 +331,9 @@ describe('handlers', () => {
     const call = (o) => r.invoke({ ...v, page: 'h-3', ...o });
     const u2 = { sub: 'user-2', email: 'u2@example.com', name: 'Two' };
     assert.deepEqual(await (await call({ path: '/count' })).json(), { shared: 1, mine: 1, wal: 'wal' });
+    // The daily snapshot the first call starts holds no file index: once it
+    // is written, nothing but the live index keeps blobs below.
+    await until(async () => (await getJSON(`${r.url}/pages/h-3/data`)).body.snapshots.some((x) => x.kind === 'daily'));
     assert.deepEqual(await (await call({ path: '/count' })).json(), { shared: 2, mine: 2, wal: 'wal' });
     assert.deepEqual(await (await call({ path: '/count', user: u2, role: 'viewer' })).json(), { shared: 3, mine: 1, wal: 'wal' });
     assert.deepEqual(await (await call({ path: '/count', user: null, role: 'public' })).json(), { shared: 4, mine: null, wal: 'wal' });

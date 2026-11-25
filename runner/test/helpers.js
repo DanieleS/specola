@@ -62,7 +62,11 @@ export async function fakeSpecola() {
   };
 }
 
-export async function startRunner(limits = {}) {
+/**
+ * A runner on a random port. opts.now is its snapshot clock (a function),
+ * for tests that move time.
+ */
+export async function startRunner(limits = {}, opts = {}) {
   const specola = await fakeSpecola();
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'specola-runner-test-'));
   const config = {
@@ -72,7 +76,7 @@ export async function startRunner(limits = {}) {
     dataDir,
     limits: { ...DEFAULT_LIMITS, ...limits },
   };
-  const runner = createRunner(config);
+  const runner = createRunner(config, { now: opts.now });
   const addr = await runner.listen(0, '127.0.0.1');
   const url = `http://127.0.0.1:${addr.port}`;
   let nextVersion = 1;
@@ -91,6 +95,10 @@ export async function startRunner(limits = {}) {
       return invoke(url, o);
     },
     logs: (page, since = 0) => getJSON(`${url}/logs?page=${page}&since=${since}`),
+    /** Calls a /pages/… route: {status, headers, body (parsed JSON, or the bytes)}. */
+    api(method, p, o = {}) {
+      return api(url, method, p, o);
+    },
     async close() {
       await runner.close();
       await specola.close();
@@ -125,6 +133,21 @@ export function invoke(url, o) {
     duplex: 'half',
     signal: o.signal,
   });
+}
+
+/** Calls a runner route; o: {json, body, sub, headers}. */
+export async function api(url, method, p, o = {}) {
+  const headers = { authorization: `Bearer ${TOKEN}`, ...(o.headers ?? {}) };
+  let body = o.body;
+  if (o.json !== undefined) {
+    body = JSON.stringify(o.json);
+    headers['content-type'] = 'application/json';
+  }
+  if (o.sub !== undefined) headers['x-specola-sub'] = o.sub;
+  const res = await fetch(url + p, { method, headers, body, duplex: 'half' });
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const type = res.headers.get('content-type') ?? '';
+  return { status: res.status, headers: res.headers, body: type.startsWith('application/json') ? JSON.parse(bytes.toString('utf8')) : bytes };
 }
 
 export async function getJSON(url) {

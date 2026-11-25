@@ -18,7 +18,11 @@ running it.
   finish what it was doing; an older version answers `409 superseded`.
 - A backend log per page (last 1000 lines, in memory): console output,
   uncaught errors with their stack, crashes, timeouts, worker starts and
-  stops, version switches.
+  stops, version switches, snapshots, restores, imports and wipes.
+- The page's data lifecycle: snapshots (on a version switch, daily after a
+  call, by hand, and before a restore, an import or a wipe), restore,
+  export and import as a zip, wipe, each user's own data (download,
+  delete) and purge.
 
 No npm dependencies and no build step: Node built-ins only (`node:sqlite`,
 `node:http`, `child_process`). Runs on Node ≥ 22.13; the image is
@@ -55,7 +59,7 @@ same `SPECOLA_RUNNER_TOKEN`, and `SPECOLA_SECRETS_KEY` (see
 | `RUNNER_WORKER_CONCURRENCY` | 32 | Requests a worker handles at once (more answer `429`) |
 | `RUNNER_PAGE_DISK_BYTES` | 1 GiB | A page's databases and files, snapshots excluded. Databases get a SQLite `max_page_count` from it (writes past it fail with "database or disk is full"); `files.put` refuses with `QuotaExceededError` |
 | `RUNNER_IDLE_TIMEOUT_MS` | 300000 | An idle worker stops after this |
-| `RUNNER_SNAPSHOT_DISK_BYTES` | 2 GiB | A page's snapshots; past it the oldest go first (the newest is always kept) |
+| `RUNNER_SNAPSHOT_DISK_BYTES` | 2 GiB | A page's snapshots; past it the oldest automatic ones go first (the newest is always kept, manual ones never go: a manual one that does not fit is refused) |
 
 Back up the volume along with Specola's database: page data lives only
 here, and snapshots are on the same volume.
@@ -72,20 +76,64 @@ contract, "Wire formats (exact)"):
 | `GET /logs?page=…&since=…` | The page's backend log, oldest first |
 | `GET /health` | `{"ok":true,"version":…}`; Specola polls it for "available" |
 | runner → `GET {SPECOLA_URL}/internal/runner/code/{versionId}` | A version's `.specola/` files. The runner recomputes their hash, refuses a mismatch, and caches them under `code/{hash}/` |
+| `GET /pages/{id}/data` | `{usage:{pageBytes, pageLimit, snapshotBytes, snapshotLimit}, snapshots}`, newest first |
+| `POST /pages/{id}/snapshots` | `{kind:"manual", label}` → 201 snapshot; 409 `too-many-snapshots` past 10, 409 `snapshot-quota` past the budget |
+| `DELETE /pages/{id}/snapshots/{sid}` | Manual ones only (409 `not-manual`) → 204 |
+| `POST /pages/{id}/snapshots/{sid}/restore` | → `{before}`: the snapshot taken first |
+| `GET /pages/{id}/export` | The zip (`manifest.json`, `shared.sqlite`, `files/index.json`, `files/data/<key>`), streamed |
+| `PUT /pages/{id}/import` | The zip (≤ 1 GiB) → `{before}`; 400 `bad-import` naming what is wrong, nothing changed |
+| `POST /pages/{id}/wipe` | `{scope:"shared"\|"users"}` → `{before}` |
+| `GET` / `DELETE /pages/{id}/my-data` | The `X-Specola-Sub` user's database (404 `no-data`) / delete it → 204 |
+| `DELETE /pages/{id}` | Purge: data, snapshots, state and log → 204, also when there was nothing |
 
-A missing or wrong token answers `401 unauthorized` everywhere.
+A missing or wrong token answers `401 unauthorized` everywhere. Page ids
+and snapshot ids are checked against their exact forms before anything
+becomes a path (400 `bad-request`).
+
+Restore, import, wipe and purge take the page **offline** while they run:
+new calls wait (up to the first-byte timeout, then `503
+backend-unavailable`), the worker drains and stops, the work is done, and
+the next call starts a fresh worker. An import is read, checked and built
+aside first, so a bad zip never takes the page offline. "Delete my data"
+does not take the page offline: the worker closes and deletes that user's
+database itself, in one step, so the other users' calls go on.
+
+A restore marks the page's data as restored (in its state file) until a
+call runs on it. A version switch in between takes no version snapshot:
+that data is not what the leaving version left (its own is in the
+before-restore snapshot). This is what restoring a version with its data
+from the history does: the version first, then its snapshot, before the
+new version's first call.
+
+Node's own time limit for receiving a request is 2 hours, so a 1 GiB import
+uploaded slowly through specola is not cut; calls keep their own limits.
 
 ## Data layout
 
 ```
 /data/code/{codeHash}/…                      extracted .specola/ files, read-only
-/data/state/{pageId}.json                    the version the page runs (outside the page's reach)
+/data/state/{pageId}.json                    the version the page runs, and whether its data was just restored (outside the page's reach)
 /data/pages/{pageId}/shared.sqlite           ctx.db
 /data/pages/{pageId}/users/{sha256(sub)}.sqlite   ctx.userDb
 /data/pages/{pageId}/files.sqlite            ctx.files index
 /data/pages/{pageId}/files/blobs/{sha256}    ctx.files contents
-/data/snapshots/{pageId}/{UTC time}-v{N}/    data as version N left it (last 5 kept; outside the page's reach)
+/data/snapshots/{pageId}/{id}/               a snapshot and its meta.json (outside the page's reach)
+/data/tmp/                                   imports and downloads in progress (emptied at start)
 ```
+
+A snapshot id is `<UTC stamp>-<kind>`, plus `-v<N>` for a version one
+(`20261125T101500Z-version-v3`, `20261126T080000Z-daily`,
+`20261126T091200Z-manual`, `…-before-restore`, `…-before-import`,
+`…-before-wipe`). Kept: the last 5 version snapshots, 7 daily ones, 5 of
+the three before-* kinds together, and up to 10 manual ones. Step 1's
+version snapshots (`20261125T101500.123Z-v3`) are read as version
+snapshots and renamed, with a `meta.json`, at start.
+
+Snapshots hold copies of the databases (and the file index); the file
+store's blobs stay in the page's directory and are deleted only when
+neither the live index nor a snapshot names them. While an export streams,
+a `.tmp-export-*` directory under the page's snapshots holds its copies and
+keeps every blob it names.
 
 A database the page's code broke (one that SQLite says is not a database,
 or malformed) is left out of a snapshot with a warning in the backend log,

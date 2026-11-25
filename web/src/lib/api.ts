@@ -13,6 +13,12 @@ export type TreeItem = {
   favorite?: boolean;
   /** A folder with conventions for agents set on it. */
   conventions?: boolean;
+  /**
+   * Archived list only: when this page's backend data will be purged (RFC
+   * 3339), set from a week ahead (docs/page-backends.md, "Data lifecycle").
+   * On a folder, the first purge among the pages inside it.
+   */
+  backendPurgeAt?: string;
 };
 
 export type PageMeta = {
@@ -33,6 +39,13 @@ export type PageMeta = {
   bundle?: boolean;
   /** The current version has a backend (docs/page-backends.md): only it can be opened. */
   backend?: boolean;
+  /**
+   * The runner holds data for this page (its backend has been called), even
+   * if the current version has no backend: the Backend panel shows it.
+   */
+  backendData?: boolean;
+  /** When that data will be purged, for a dormant page, from a week ahead (RFC 3339). */
+  backendPurgeAt?: string;
   /** Set when this is a copy kept by the service worker, read offline. */
   offline?: boolean;
 };
@@ -99,6 +112,28 @@ export type BackendLogLine = {
   text: string;
   /** Names the line in an error the page got ({"error":"backend-error","ref"}). */
   ref?: string;
+};
+
+/** Why a backend snapshot was taken (docs/page-backends.md, "Snapshots"). */
+export type SnapshotKind = "version" | "daily" | "manual" | "before-restore" | "before-import" | "before-wipe";
+
+/** A copy of all of a page's backend data, which an owner can restore. */
+export type Snapshot = {
+  id: string;
+  kind: SnapshotKind;
+  /** Manual snapshots: what the owner called it. */
+  label?: string;
+  /** Version snapshots: the version that was leaving, whose data this is. */
+  version?: number;
+  /** RFC 3339. */
+  createdAt: string;
+  sizeBytes: number;
+};
+
+/** A page's backend data: how much room it takes, and its snapshots, newest first. */
+export type BackendData = {
+  usage: { pageBytes: number; pageLimit: number; snapshotBytes: number; snapshotLimit: number };
+  snapshots: Snapshot[];
 };
 
 /** A bundle version's files, other than index.html. */
@@ -173,9 +208,66 @@ export class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** The X-Specola-Error code, when the server named one. */
+    readonly code = "",
   ) {
     super(message);
   }
+
+  /** The message of a JSON error ({"error","message"}), else the body as it came. */
+  get detail(): string {
+    try {
+      const j = JSON.parse(this.message);
+      if (j && typeof j.message === "string") return j.message;
+    } catch {
+      // Plain text.
+    }
+    return this.message;
+  }
+}
+
+// What the backend data routes' codes mean to the person who clicked
+// (docs/page-backends.md, "Wire formats for data"). The others say the
+// server's own message.
+const backendCodes: Record<string, string> = {
+  "backend-disabled": "Page backends are not enabled on this instance.",
+  "backend-unavailable": "The backend runner is not available right now. Try again in a moment.",
+  "backend-timeout": "The backend runner took too long to answer. Try again in a moment.",
+  "backend-crashed": "The backend runner failed before answering. Try again in a moment.",
+  "too-many-snapshots": "This page already has 10 manual snapshots: delete one to take another.",
+  "snapshot-quota": "This page's snapshots are over their quota: delete manual snapshots to make room.",
+  "not-manual": "Only manual snapshots can be deleted; the automatic ones go by themselves.",
+  "no-data": "You have no data on this page.",
+  "body-too-large": "The file is too large: an import can be at most 1 GiB.",
+};
+
+/** A readable sentence for an error of a backend data call. */
+export function backendErrorMessage(e: unknown): string {
+  if (e instanceof HttpError) {
+    if (e.code === "bad-import") return `This file can't be imported: ${e.detail.trim().replace(/[.]?$/, ".")}`;
+    if (backendCodes[e.code]) return backendCodes[e.code];
+    // forbidden says who may ("only the page's owners can …"), and the rest
+    // say what is wrong: as a sentence.
+    return sentence(e.detail) || `The server answered ${e.status}.`;
+  }
+  if (e instanceof Unauthorized) return "You're signed out. Sign in again and retry.";
+  return e instanceof Error ? e.message : String(e);
+}
+
+const sentence = (t: string) => {
+  t = t.trim();
+  return t && t[0].toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? "" : ".");
+};
+
+/** Bytes in the units people read: 1.5 MB, 2 GB. */
+export function formatBytes(n: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return i === 0 ? `${n} B` : `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
 }
 
 /** Set by the service worker on an API response served from its cache. */
@@ -186,6 +278,16 @@ export const OFFLINE_HEADER = "X-Specola-Offline";
 // failing login cannot turn into a redirect loop.
 export const UNAUTHORIZED_EVENT = "specola:unauthorized";
 
+function unauthorized(): never {
+  window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  throw new Unauthorized();
+}
+
+async function fail(res: Response): Promise<never> {
+  if (res.status === 401) unauthorized();
+  throw new HttpError(res.status, (await res.text()) || res.statusText, res.headers.get("X-Specola-Error") ?? "");
+}
+
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -193,16 +295,43 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     body: body !== undefined ? JSON.stringify(body) : undefined,
     credentials: "same-origin",
   });
-  if (res.status === 401) {
-    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
-    throw new Unauthorized();
-  }
-  if (!res.ok) throw new HttpError(res.status, (await res.text()) || res.statusText);
+  if (!res.ok) await fail(res);
   const ct = res.headers.get("content-type") ?? "";
   if (!ct.includes("application/json")) return (await res.text()) as T;
   const data = await res.json();
   if (res.headers.has(OFFLINE_HEADER) && data && typeof data === "object" && !Array.isArray(data)) data.offline = true;
   return data as T;
+}
+
+// An upload with progress, which fetch can't report: XMLHttpRequest can.
+// The answer is handled as req() handles one.
+function upload<T>(url: string, body: Blob, onProgress?: (fraction: number) => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("PUT", url);
+    x.withCredentials = true;
+    x.setRequestHeader("Content-Type", "application/zip");
+    if (onProgress) x.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    x.onerror = () => reject(new Error("The upload failed: check the connection and try again."));
+    x.onabort = () => reject(new Error("The upload was cancelled."));
+    x.onload = () => {
+      const res = new Response(x.status === 204 ? null : x.responseText, {
+        status: x.status,
+        statusText: x.statusText,
+        headers: { "X-Specola-Error": x.getResponseHeader("X-Specola-Error") ?? "" },
+      });
+      if (!res.ok) {
+        fail(res).catch(reject);
+        return;
+      }
+      try {
+        resolve(JSON.parse(x.responseText) as T);
+      } catch {
+        resolve(x.responseText as T);
+      }
+    };
+    x.send(body);
+  });
 }
 
 export const api = {
@@ -230,6 +359,33 @@ export const api = {
   /** The backend log lines of page id after since (owners and editors). */
   backendLogs: (id: string, since = 0) =>
     req<{ lines: BackendLogLine[] }>("GET", `/api/pages/${id}/backend/logs?since=${since}`),
+  /** Page id's backend data usage and snapshots (owners and editors). */
+  backendData: (id: string) => req<BackendData>("GET", `/api/pages/${id}/backend/data`),
+  /** A manual snapshot (owners), labelled with 1 to 100 characters. */
+  createSnapshot: (id: string, label: string) =>
+    req<Snapshot>("POST", `/api/pages/${id}/backend/snapshots`, { label }),
+  /** Deletes a manual snapshot (owners). */
+  deleteSnapshot: (id: string, sid: string) =>
+    req<void>("DELETE", `/api/pages/${id}/backend/snapshots/${encodeURIComponent(sid)}`),
+  /** Replaces all of the page's data with a snapshot (owners); before is the one taken first. */
+  restoreSnapshot: (id: string, sid: string) =>
+    req<{ before: Snapshot }>("POST", `/api/pages/${id}/backend/snapshots/${encodeURIComponent(sid)}/restore`),
+  /** Where the export zip downloads from (owners and editors); it can be large, so it isn't read here. */
+  backendExportUrl: (id: string) => `/api/pages/${id}/backend/export`,
+  /** Replaces the page's shared data and files with a zip in the export format (owners). */
+  importBackend: (id: string, zip: Blob, onProgress?: (fraction: number) => void) =>
+    upload<{ before: Snapshot }>(`/api/pages/${id}/backend/import`, zip, onProgress),
+  /** Resets the shared data and files, or every user's own data (owners). */
+  wipeBackend: (id: string, scope: "shared" | "users") =>
+    req<{ before: Snapshot }>("POST", `/api/pages/${id}/backend/wipe`, { scope }),
+  /** The caller's own database on the page; HttpError no-data when they have none. */
+  myData: async (id: string) => {
+    const res = await fetch(`/api/pages/${id}/backend/my-data`, { credentials: "same-origin" });
+    if (!res.ok) await fail(res);
+    return res.blob();
+  },
+  /** Deletes the caller's own database on the page (fine when there is none). */
+  deleteMyData: (id: string) => req<void>("DELETE", `/api/pages/${id}/backend/my-data`),
   /** The user's localStorage for page id; written by pagedata.ts. */
   pageData: (id: string) => req<Record<string, string>>("GET", `/api/pages/${id}/data`),
   rename: (kind: ItemKind, id: string, name: string) => req<void>("PATCH", `/api/${kind}s/${id}`, { name }),

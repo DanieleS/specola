@@ -1,11 +1,13 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { api, Unauthorized, type PageMeta, type VersionInfo } from "./api";
-  import BackendLog from "./BackendLog.svelte";
+  import { api, backendErrorMessage, Unauthorized, type PageMeta, type Snapshot, type VersionInfo } from "./api";
+  import BackendPanel from "./BackendPanel.svelte";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
   import { backends, refreshBackends } from "./backends.svelte";
   import * as offline from "./offline.svelte";
   import { serveStorage, storageName, type Backend } from "./pagedata";
   import ShareDialog from "./ShareDialog.svelte";
+  import { versionSnapshot } from "./snapshots";
 
   let { id }: { id: string } = $props();
 
@@ -13,7 +15,7 @@
   let error = $state("");
   let sharing = $state(false);
   // The side panel open, if any.
-  let panel = $state<"history" | "log" | null>(null);
+  let panel = $state<"history" | "backend" | null>(null);
   let historyOpen = $derived(panel === "history");
   let versions = $state<VersionInfo[]>([]);
   let viewing = $state<number | null>(null); // an older version, or null for current
@@ -21,6 +23,11 @@
   let copied = $state(false);
   // A backend call was refused because a newer version is current.
   let superseded = $state(false);
+  // Restoring a version whose data was kept: asks whether to restore it too.
+  let restoreAsk = $state<{ from: number; snap: Snapshot } | null>(null);
+  let withData = $state(false);
+  // The version was restored but its data wasn't: said until dismissed.
+  let dataFailed = $state("");
   // Bumped to load the frame again when the version shown stays the same.
   let reloads = $state(0);
 
@@ -53,6 +60,11 @@
     return u.toString();
   }
   let canEdit = $derived(meta?.role === "owner" || meta?.role === "editor");
+  // The Backend panel (docs/page-backends.md, "Data lifecycle"): for a page
+  // with a backend, or with data a backend left, while backends may be on.
+  let hasPanel = $derived(
+    !!meta && (!!meta.backend || !!meta.backendData) && !readOffline && (backends.enabled || !backends.known),
+  );
   function isClosed(n: number) {
     if (!meta || n === meta.version) return false;
     const v = versions.find((x) => x.version === n);
@@ -231,17 +243,56 @@
     }
   }
 
+  // Restore makes a new current version from an older one. On a backend
+  // page, an owner may also bring back the data that version left, when a
+  // snapshot of it was kept (docs/page-backends.md, "Versions").
   async function restore() {
-    if (viewing === null) return;
+    if (viewing === null || !meta) return;
+    const from = viewing;
+    let snap: Snapshot | undefined;
     busy = true;
+    if (meta.role === "owner" && (meta.backend || meta.backendData) && backends.enabled) {
+      try {
+        snap = versionSnapshot((await api.backendData(id)).snapshots, from);
+      } catch {
+        // No snapshots to offer: the code can still be restored.
+      }
+    }
+    if (snap) {
+      busy = false;
+      withData = false;
+      restoreAsk = { from, snap };
+      return;
+    }
     try {
-      await api.restoreVersion(id, viewing);
-      viewing = null;
-      load();
+      await restoreVersion(from);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       busy = false;
+    }
+  }
+
+  async function restoreVersion(from: number) {
+    const r = await api.restoreVersion(id, from);
+    viewing = null;
+    load();
+    return r.version;
+  }
+
+  // The dialog's step: the version, then its data if asked. The version stays
+  // restored when the data can't be: that is said apart, not as the dialog's
+  // error, which would read as if nothing had happened.
+  async function restoreWithData() {
+    const a = restoreAsk;
+    if (!a) return;
+    const v = await restoreVersion(a.from);
+    if (!withData) return;
+    try {
+      await api.restoreSnapshot(id, a.snap.id);
+      reloads++;
+    } catch (e) {
+      dataFailed = `Version ${a.from} is restored as v${v}, but its data couldn't be restored: ${backendErrorMessage(e)} The data is as it was; its snapshot can be restored from the Backend panel.`;
     }
   }
 
@@ -330,9 +381,9 @@
       {/if}
       <button class={action} onclick={copyLink}>{copied ? "Copied" : "Copy link"}</button>
       <button class={action} aria-pressed={historyOpen} onclick={toggleHistory}>History</button>
-      {#if meta?.backend && canEdit && !readOffline && (backends.enabled || !backends.known)}
-        <button class={action} aria-pressed={panel === "log"} onclick={() => (panel = panel === "log" ? null : "log")}
-          >Backend log</button
+      {#if hasPanel}
+        <button class={action} aria-pressed={panel === "backend"} onclick={() => (panel = panel === "backend" ? null : "backend")}
+          >Backend</button
         >
       {/if}
       {#if meta?.role === "owner" && !readOffline}
@@ -369,6 +420,25 @@
       <span>A new version is available.</span>
       <button class="px-3 py-1 rounded-md bg-amber-500 text-black font-medium hover:bg-amber-400" onclick={reload}>Reload</button>
     </div>
+  {/if}
+
+  {#if dataFailed}
+    <div
+      data-restore-data-failed
+      role="alert"
+      class="flex items-start justify-between gap-3 px-3 sm:px-5 py-2 text-sm bg-red-500/10 border-b border-red-500/20 text-red-200"
+    >
+      <span class="break-words">{dataFailed}</span>
+      <button class="shrink-0 text-white/60 hover:text-white" aria-label="Dismiss" onclick={() => (dataFailed = "")}>✕</button>
+    </div>
+  {/if}
+
+  {#if meta?.backendPurgeAt && canEdit && !readOffline}
+    <p data-purge-notice class="px-3 sm:px-5 py-1.5 text-xs text-red-300/90 border-b border-white/10">
+      This page's backend data will be deleted on {new Date(meta.backendPurgeAt).toLocaleDateString(undefined, {
+        dateStyle: "long",
+      })}: its current version has no backend. Export it from the Backend panel to keep a copy.
+    </p>
   {/if}
 
   {#if hasBackend && !closed}
@@ -453,12 +523,36 @@
           </ul>
         </aside>
       {/if}
-      {#if panel === "log" && meta?.backend && canEdit && !readOffline}
-        <BackendLog {id} onclose={() => (panel = null)} />
+      {#if panel === "backend" && hasPanel && meta}
+        <BackendPanel page={meta} onclose={() => (panel = null)} ondatachange={() => reloads++} />
       {/if}
     </div>
   {/if}
 </div>
+
+{#if restoreAsk && meta}
+  {@const a = restoreAsk}
+  <ConfirmDialog
+    title="Restore version {a.from}?"
+    confirmLabel="Restore as v{meta.version + 1}"
+    run={restoreWithData}
+    onclose={() => (restoreAsk = null)}
+  >
+    <p>This makes a new current version, v{meta.version + 1}, from version {a.from}'s code.</p>
+    <label class="flex items-start gap-2 pt-1 text-white/90">
+      <input type="checkbox" class="mt-1 accent-amber-500" bind:checked={withData} data-restore-data />
+      <span>Also restore the data as version {a.from} left it ({fmt(a.snap.createdAt)})</span>
+    </label>
+    {#if withData}
+      <p class="text-white/50">
+        That replaces all of the page's backend data, every user's included, with that snapshot's. A snapshot of the data as it
+        is now is taken first, so you can go back.
+      </p>
+    {:else}
+      <p class="text-white/50">The data stays as it is now.</p>
+    {/if}
+  </ConfirmDialog>
+{/if}
 
 {#if sharing && meta}
   <ShareDialog

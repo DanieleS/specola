@@ -15,8 +15,8 @@ scripts can run without being able to touch Specola's session or API.
 > links, favorites,
 > full-text search, offline viewing as an installable PWA, SPA bundles
 > (multi-file apps built with the Specola Vite plugin), optional page
-> backends (server code shipped in a bundle, run by a separate runner; first
-> step: calls, databases, files, logs), and an OAuth-protected MCP endpoint
+> backends (server code shipped in a bundle, run by a separate runner: calls,
+> databases, files, logs, snapshots, export/import), and an OAuth-protected MCP endpoint
 > for agents.
 
 ## Stack
@@ -296,7 +296,7 @@ export default {
   `X-Specola-Error` code and a JSON body; an uncaught exception answers 500
   `backend-error` with a `ref` to the line of the **backend log**
   (`GET /api/pages/{id}/backend/logs?since=`, owners and editors, and the
-  viewer's *Backend log* panel).
+  *Log* tab of the viewer's *Backend* panel).
 - **Only the current version is live.** On a page whose current version has
   a backend, older versions stay in the history (marked *not viewable*) and
   can be restored, but can't be opened: `/view/{id}?v=N`, the token view and
@@ -304,12 +304,35 @@ export default {
   gets 409 `superseded` on its calls and the viewer offers to reload it.
   Public links on a backend page can't be pinned.
 - **Data belongs to the page, not the version.** It survives new versions;
-  the code migrates its own schema. When a new version becomes current the
-  runner first snapshots every database (`VACUUM INTO`, the last 5 kept, on
-  the runner's volume). Restoring a version restores code, not data.
+  the code migrates its own schema. Restoring a version restores code; the
+  viewer offers to restore, too, the data as that version left it.
+- **Data lifecycle**, in the *Data* tab of the viewer's *Backend* panel
+  (`/api/pages/{id}/backend/…`):
+  - **Snapshots** of every database and the file index (`VACUUM INTO`, on
+    the runner's volume), taken when a new version becomes current (the last
+    5 kept), daily when the page is called (7), before every restore,
+    import or reset (5), and by hand by an owner, with a label (up to 10).
+    They have their own budget (2 GiB per page); past it the oldest
+    automatic ones go first. An owner **restores** one: it replaces all of
+    the page's data, every user's included, after a snapshot of what was
+    there.
+  - **Export** (owners and editors): a zip of the shared database and the
+    files, with a `manifest.json`. **Import** (owners) takes such a zip
+    (≤ 1 GiB), checks all of it first and replaces the shared database and
+    the files; users' own databases are never in it.
+  - **Reset** (owners): the shared data and files, or every user's data,
+    each after a snapshot. **My data** (anyone who can view the page):
+    download your own database as a SQLite file, or delete it.
+  - Restore, import, reset and snapshots are UI-only; MCP gets none of them.
   Snapshots protect from bad code, not from losing the volume: **back up the
-  runner's volume** with the database. (Snapshot restore, export, import and
-  wipe come in a later step.)
+  runner's volume** with the database.
+- **Dormant data.** Archiving a page (or a folder above it) keeps its data
+  untouched but out of reach; a page whose current version has no backend
+  keeps it for a later version that has one (its panel keeps the Data tab).
+  With `SPECOLA_BACKEND_PURGE_AFTER_DAYS` set, the data of a page dormant
+  that long is deleted with its snapshots (checked every hour); the panel
+  and the Archived list show the date from 7 days ahead. Unset, nothing is
+  ever purged.
 - **Offline**, a backend page is kept at its current version only, and its
   `specola.fetch` rejects with `BackendUnavailable` (`reason: "offline"`).
 - Not yet: page secrets, the egress allowlist (outbound `fetch` from a
@@ -344,6 +367,10 @@ Set all three on Specola, or none (Specola refuses to start with only some):
 | `SPECOLA_RUNNER_URL` | the runner's base URL on the private network, e.g. `http://runner:8081`; unset = backends disabled |
 | `SPECOLA_RUNNER_TOKEN` | shared bearer for the internal API (the runner needs the same value), at least 16 characters, e.g. `openssl rand -base64 32` |
 | `SPECOLA_SECRETS_KEY` | 32 bytes, base64 (`openssl rand -base64 32`); will encrypt page secrets |
+
+And, optionally, `SPECOLA_BACKEND_PURGE_AFTER_DAYS`: delete the backend data
+of pages dormant (archived, or with no backend in their current version)
+for this many days. Unset, never.
 
 The runner (`node:24-slim` image built from `runner/`, single replica) takes
 `SPECOLA_URL` (Specola's internal base URL, where it fetches code),
@@ -380,6 +407,7 @@ All via environment variables (see [`specola.env.example`](./specola.env.example
 | `SPECOLA_RUNNER_URL` | no | the page backend runner; with `SPECOLA_RUNNER_TOKEN` and `SPECOLA_SECRETS_KEY`, enables [page backends](#page-backends) |
 | `SPECOLA_RUNNER_TOKEN` | with the runner | shared bearer for the internal API (≥ 16 characters) |
 | `SPECOLA_SECRETS_KEY` | with the runner | 32 bytes, base64 |
+| `SPECOLA_BACKEND_PURGE_AFTER_DAYS` | no | delete the backend data of pages dormant this many days (default: never) |
 
 \* Not required when `SPECOLA_DEV_AUTH_EMAIL` is set.
 

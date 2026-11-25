@@ -109,6 +109,8 @@ export class PageWorker {
   #killReason = null;
   #stderrTail = '';
   #startTimer = null;
+  #forgets = new Map(); // id → resolve, for forgetUser
+  #nextForget = 1;
 
   /**
    * @param {object} o
@@ -409,6 +411,11 @@ export class PageWorker {
       this.stop('the backend failed to start');
       return;
     }
+    if (m.t === 'forgot') {
+      const done = this.#forgets.get(m.fid);
+      done?.();
+      return;
+    }
     if (m.t === 'pong') {
       clearTimeout(this.#pingTimer);
       this.#pingTimer = null;
@@ -484,7 +491,35 @@ export class PageWorker {
       }
       this.#settle(call);
     }
+    for (const done of [...this.#forgets.values()]) done();
     this.onGone?.(this);
+  }
+
+  /**
+   * Tells the worker to close a user's database (users/<name>.sqlite) and
+   * delete it, in one step so that no call reopens it in between ("Delete
+   * my data"). A call of that user in flight loses its handle; that is the
+   * user deleting their data while using it. Resolves once done; a worker
+   * that does not answer in time is killed (it might keep writing to the
+   * deleted file and bring the data back on its next open otherwise).
+   */
+  forgetUser(name) {
+    if (this.gone || !this.#child?.connected) return Promise.resolve();
+    const fid = this.#nextForget++;
+    return new Promise((resolve) => {
+      const t = setTimeout(() => {
+        this.#killReason = 'it did not close a user\'s database in time';
+        this.#child?.kill('SIGKILL');
+        finish();
+      }, Math.min(5000, this.limits.firstByteMs));
+      const finish = () => {
+        clearTimeout(t);
+        this.#forgets.delete(fid);
+        resolve();
+      };
+      this.#forgets.set(fid, finish);
+      this.#send({ t: 'forget', fid, name });
+    });
   }
 
   /** Stops taking requests; stops once those in flight are done. */

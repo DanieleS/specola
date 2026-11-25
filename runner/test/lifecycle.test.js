@@ -5,7 +5,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, test } from 'node:test';
 import { backend, logText, startRunner, until } from './helpers.js';
-import { sweepSnapshots, takeVersionSnapshot } from '../src/snapshot.js';
+import { DEFAULT_LIMITS } from '../src/config.js';
+import { sweepSnapshots, takeSnapshot } from '../src/snapshot.js';
 import { FileStore } from '../src/worker/files.mjs';
 
 async function withRunner(limits, fn) {
@@ -464,9 +465,9 @@ describe('versions', () => {
       assert.equal((await stale.json()).error, 'superseded');
 
       const pageDir = path.join(r.dataDir, 'pages', 'v-1');
-      const snaps = await fs.readdir(path.join(r.dataDir, 'snapshots', 'v-1'));
+      const snaps = (await fs.readdir(path.join(r.dataDir, 'snapshots', 'v-1'))).filter((n) => n.includes('-version-'));
       assert.equal(snaps.length, 1);
-      assert.match(snaps[0], /^\d{8}T\d{6}\.\d{3}Z-v1$/);
+      assert.match(snaps[0], /^\d{8}T\d{6}Z-version-v1$/);
       const snap = path.join(r.dataDir, 'snapshots', 'v-1', snaps[0]);
       const rows = (file, table) => {
         const db = new DatabaseSync(file, { readOnly: true });
@@ -534,7 +535,7 @@ describe('versions', () => {
       for (let v = 1; v <= 8; v++) {
         assert.equal(await (await r.invoke({ ...code, page: 'v-3', version: v })).text(), String(v));
       }
-      const snaps = (await fs.readdir(path.join(r.dataDir, 'snapshots', 'v-3'))).sort();
+      const snaps = (await fs.readdir(path.join(r.dataDir, 'snapshots', 'v-3'))).filter((n) => n.includes('-version-')).sort();
       assert.deepEqual(snaps.map((s) => s.replace(/^.*-/, '')), ['v3', 'v4', 'v5', 'v6', 'v7']);
     }));
 });
@@ -564,7 +565,7 @@ describe('snapshots', () => {
       await r.invoke({ ...v1, page: 'snap-1', version: 1, method: 'POST', body: dir });
       const res = await r.invoke({ ...v2, page: 'snap-1', version: 2, method: 'POST', body: dir });
       assert.deepEqual(await res.json(), { list: 'allowed', remove: 'ERR_ACCESS_DENIED', write: 'ERR_ACCESS_DENIED', sqlite: 'ERR_ACCESS_DENIED' });
-      const snaps = await fs.readdir(dir);
+      const snaps = (await fs.readdir(dir)).filter((n) => n.includes('-version-'));
       assert.equal(snaps.length, 1);
       const db = new DatabaseSync(path.join(dir, snaps[0], 'shared.sqlite'), { readOnly: true });
       assert.deepEqual(db.prepare('SELECT v FROM t').all().map((x) => x.v), ['one']);
@@ -591,8 +592,8 @@ describe('snapshots', () => {
       const log = await logText(r, 'snap-2');
       assert.match(log, /\[warn\] snapshot of version 1's data: left out users\/a{64}\.sqlite \(file is not a database\)/);
       const dir = path.join(r.dataDir, 'snapshots', 'snap-2');
-      const [snap] = await fs.readdir(dir);
-      assert.deepEqual((await fs.readdir(path.join(dir, snap), { recursive: true })).sort(), ['shared.sqlite', 'users']);
+      const [snap] = (await fs.readdir(dir)).filter((n) => n.includes('-version-'));
+      assert.deepEqual((await fs.readdir(path.join(dir, snap), { recursive: true })).sort(), ['meta.json', 'shared.sqlite', 'users']);
     }));
 
   test('a failed snapshot leaves nothing behind, and half-written ones are swept', async () => {
@@ -603,14 +604,14 @@ describe('snapshots', () => {
       await fs.mkdir(path.join(pageDir, 'users', 'b'.repeat(64) + '.sqlite'), { recursive: true }); // can't be opened
       new DatabaseSync(path.join(pageDir, 'shared.sqlite')).exec('CREATE TABLE t (v)');
       for (let i = 0; i < 3; i++) {
-        await assert.rejects(takeVersionSnapshot({ pageDir, snapshotsDir, oldVersion: 1, keep: 5, maxBytes: 1e9 }));
+        await assert.rejects(takeSnapshot({ pageDir, snapshotsDir, kind: 'version', version: 1, limits: DEFAULT_LIMITS }));
       }
       assert.deepEqual(await fs.readdir(snapshotsDir), []);
 
-      await fs.mkdir(path.join(snapshotsDir, '.tmp-20261125T000000.000Z-v1', 'users'), { recursive: true });
-      await fs.mkdir(path.join(snapshotsDir, '20261125T000000.000Z-v1'));
+      await fs.mkdir(path.join(snapshotsDir, '.tmp-20261125T000000Z-version-v1', 'users'), { recursive: true });
+      await fs.mkdir(path.join(snapshotsDir, '20261125T000000Z-version-v1'));
       await sweepSnapshots(root);
-      assert.deepEqual(await fs.readdir(snapshotsDir), ['20261125T000000.000Z-v1']);
+      assert.deepEqual(await fs.readdir(snapshotsDir), ['20261125T000000Z-version-v1']);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -626,7 +627,7 @@ describe('snapshots', () => {
       db.exec("CREATE TABLE t (b); INSERT INTO t VALUES (randomblob(100000))");
       db.close();
       for (let v = 1; v <= 4; v++) {
-        await takeVersionSnapshot({ pageDir, snapshotsDir, oldVersion: v, keep: 5, maxBytes: 250_000 });
+        await takeSnapshot({ pageDir, snapshotsDir, kind: 'version', version: v, now: Date.UTC(2026, 10, 25, 0, v), limits: { ...DEFAULT_LIMITS, snapshotDiskBytes: 250_000 } });
       }
       assert.deepEqual((await fs.readdir(snapshotsDir)).map((n) => n.replace(/^.*-/, '')).sort(), ['v3', 'v4']);
     } finally {
@@ -639,7 +640,7 @@ describe('snapshots', () => {
     try {
       const pageDir = path.join(root, 'pages', 'p');
       const snapshotsDir = path.join(root, 'snapshots', 'p');
-      const tmp = path.join(snapshotsDir, '.tmp-20261125T000000.000Z-v1');
+      const tmp = path.join(snapshotsDir, '.tmp-20261125T000000Z-version-v1');
       await fs.mkdir(tmp, { recursive: true });
       await fs.writeFile(path.join(tmp, 'files.sqlite'), ''); // half written
       const store = new FileStore(pageDir, 1e9, snapshotsDir);

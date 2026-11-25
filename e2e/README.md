@@ -36,7 +36,18 @@ the same database, behind a trusted user header) may call the backend with a
 database of their own but gets 403 on the log. Then it publishes version 2
 and checks that version 1 answers 410 and is no longer viewable, that the
 frame still showing it gets `superseded` and the viewer's reload notice, that
-the data survived and that the runner snapshotted it. Last, it restarts
+the data survived and that the runner snapshotted it. Then the data
+lifecycle, through the viewer's Backend panel: a manual snapshot restored
+after the data changed, an export, a reset of the shared data and the export
+imported back byte for byte, a path-traversal zip refused with `bad-import`
+and nothing changed, an editor who may export but gets 403 on restore,
+import and reset, a viewer who downloads their own data (a SQLite file with
+their rows), deletes it and then gets 404 `no-data`, and version 1 restored
+from the history with its data. Then it restarts Specola with
+`SPECOLA_BACKEND_PURGE_AFTER_DAYS`, archives the page, moves its archive
+date back in the database, and checks the Archived list shows the purge
+date and that the purge (its first round, a minute after start) deletes the
+runner's data. Last, it restarts
 Specola without the backend variables and checks that `/api/me`, the MCP
 instructions, the upload grant, the CLI and the manifest step all say
 backends are disabled, and that the page still opens with the disabled

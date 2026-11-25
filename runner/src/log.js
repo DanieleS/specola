@@ -40,6 +40,11 @@ export class Logs {
     return line;
   }
 
+  /** Forgets a page's lines (its data was purged). */
+  delete(pageId) {
+    this.#pages.delete(pageId);
+  }
+
   /** Lines with seq > since, oldest first. */
   since(pageId, since = 0) {
     const p = this.#pages.get(pageId);

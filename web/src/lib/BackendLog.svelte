@@ -1,11 +1,12 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { api, HttpError, type BackendLogLine } from "./api";
+  import { api, backendErrorMessage, type BackendLogLine } from "./api";
 
   // The backend log of a page (docs/page-backends.md, "Observability"), for
   // its owners and editors: what the runner keeps of its console output,
-  // uncaught errors and crashes, polled while the panel is open.
-  let { id, onclose }: { id: string; onclose: () => void } = $props();
+  // uncaught errors and crashes, polled while it is shown (the Log tab of
+  // the Backend panel).
+  let { id }: { id: string } = $props();
 
   const EVERY = 3000;
   const MAX = 1000; // as many as the runner keeps
@@ -41,7 +42,7 @@
           }
         } catch (e) {
           if (!live) return;
-          error = describe(e);
+          error = backendErrorMessage(e);
         }
       }
       if (live) timer = window.setTimeout(poll, EVERY);
@@ -52,20 +53,6 @@
       clearTimeout(timer);
     };
   });
-
-  // Specola's errors are JSON ({"error","message"}); say the message.
-  function describe(e: unknown): string {
-    if (e instanceof HttpError) {
-      try {
-        const j = JSON.parse(e.message);
-        if (j && typeof j.message === "string") return j.message;
-      } catch {
-        // Plain text.
-      }
-      return e.message;
-    }
-    return e instanceof Error ? e.message : String(e);
-  }
 
   const time = (s: string) => {
     const d = new Date(s);
@@ -79,20 +66,12 @@
   };
 </script>
 
-<!-- Beside the page from sm up; over it, full width, below. -->
-<aside
-  data-backend-log
-  class="absolute inset-y-0 right-0 z-10 w-full sm:w-[28rem] max-w-full flex flex-col bg-[#0b0d12] shadow-xl sm:static sm:shadow-none shrink-0 border-l border-white/10"
-  aria-label="Backend log"
->
-  <div class="flex items-center justify-between gap-3 px-4 pt-4 pb-2">
-    <h2 class="text-sm font-semibold">Backend log</h2>
-    <div class="flex items-center gap-3 text-sm">
-      <button class="text-white/50 hover:text-white/90 disabled:opacity-40" disabled={!lines.length} onclick={() => (lines = [])}
-        >Clear</button
-      >
-      <button class="text-white/50 hover:text-white/90" aria-label="Close the backend log" onclick={onclose}>✕</button>
-    </div>
+<div data-backend-log class="flex flex-col flex-1 min-h-0">
+  <div class="flex items-center justify-between gap-3 px-4 pb-2 text-sm">
+    <p class="text-xs text-white/40">Console output and errors of the backend, newest at the bottom.</p>
+    <button class="shrink-0 text-white/50 hover:text-white/90 disabled:opacity-40" disabled={!lines.length} onclick={() => (lines = [])}
+      >Clear</button
+    >
   </div>
   {#if error}
     <p class="px-4 pb-2 text-sm text-red-400 break-words">{error}</p>
@@ -113,4 +92,4 @@
       {/if}
     {/each}
   </ol>
-</aside>
+</div>

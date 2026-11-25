@@ -88,3 +88,23 @@ func TestBackends(t *testing.T) {
 		})
 	}
 }
+
+func TestBackendPurgeAfterDays(t *testing.T) {
+	for v, want := range map[string]int{"": 0, "30": 30, " 7 ": 7, "0": -1, "-3": -1, "1.5": -1, "a week": -1, "100001": -1} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("SPECOLA_DATABASE_URL", "postgres://x")
+			t.Setenv("SPECOLA_DEV_AUTH_EMAIL", "dev@example.com")
+			t.Setenv("SPECOLA_BACKEND_PURGE_AFTER_DAYS", v)
+			c, err := Load()
+			if want < 0 {
+				if err == nil || !strings.Contains(err.Error(), "SPECOLA_BACKEND_PURGE_AFTER_DAYS") {
+					t.Fatalf("err = %v", err)
+				}
+				return
+			}
+			if err != nil || c.BackendPurgeAfterDays != want {
+				t.Fatalf("days = %d, err = %v", c.BackendPurgeAfterDays, err)
+			}
+		})
+	}
+}

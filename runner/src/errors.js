@@ -11,7 +11,7 @@ export class RunnerError extends Error {
   }
 }
 
-export function sendError(res, status, code, message, ref) {
+export function sendError(res, status, code, message, ref, headers = {}) {
   if (res.headersSent || res.destroyed) {
     res.destroy();
     return;
@@ -24,6 +24,7 @@ export function sendError(res, status, code, message, ref) {
     'Content-Length': Buffer.byteLength(body),
     'X-Specola-Error': code,
     'Cache-Control': 'no-store',
+    ...headers,
   });
   res.end(body);
 }

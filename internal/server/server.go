@@ -53,13 +53,20 @@ type Server struct {
 	runner *backend.Runner
 	// calls counts the backend calls running per user and page.
 	calls callLimiter
+	// usedMarks holds when this process last recorded, per page id, that
+	// the runner holds data for it (backenddata.go).
+	usedMarks sync.Map
+	// now and purgeEvery drive the purge of dormant backend data; tests
+	// change them.
+	now        func() time.Time
+	purgeEvery time.Duration
 }
 
 // New builds the server. a is nil unless Specola runs its own OIDC login.
 // tokens verifies MCP access tokens and is required when cfg.MCPMode() is
 // "oauth"; it is ignored otherwise.
 func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.TokenVerifier) *Server {
-	s := &Server{cfg: cfg, st: st, auth: a}
+	s := &Server{cfg: cfg, st: st, auth: a, now: time.Now, purgeEvery: purgeEvery}
 	if cfg.BackendsEnabled() {
 		s.runner = backend.NewRunner(cfg.RunnerURL, cfg.RunnerToken)
 	}
@@ -163,6 +170,15 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.HandleFunc("/pages/{id}/x", s.handleBackendCall)
 			r.HandleFunc("/pages/{id}/x/*", s.handleBackendCall)
 			r.Get("/pages/{id}/backend/logs", s.handleBackendLogs)
+			r.Get("/pages/{id}/backend/data", s.handleBackendDataInfo)
+			r.Post("/pages/{id}/backend/snapshots", s.handleCreateSnapshot)
+			r.Delete("/pages/{id}/backend/snapshots/{sid}", s.handleDeleteSnapshot)
+			r.Post("/pages/{id}/backend/snapshots/{sid}/restore", s.handleRestoreSnapshot)
+			r.Get("/pages/{id}/backend/export", s.handleBackendExport)
+			r.Put("/pages/{id}/backend/import", s.handleBackendImport)
+			r.Post("/pages/{id}/backend/wipe", s.handleBackendWipe)
+			r.Get("/pages/{id}/backend/my-data", s.handleMyData)
+			r.Delete("/pages/{id}/backend/my-data", s.handleDeleteMyData)
 			r.Get("/pages/{id}/data", s.handlePageData)
 			r.Patch("/pages/{id}/data", s.handleUpdatePageData)
 			r.Delete("/pages/{id}/data", s.handleClearPageData)
@@ -212,8 +228,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A byte range is of the stored representation: compressing the part
 	// would make it meaningless, so ranges are answered uncompressed.
 	// A backend call is streamed through chunk by chunk, and a compressor
-	// would hold chunks back; the handler may compress its own answer.
-	if r.Header.Get("Range") != "" || isBackendCall(r.URL.Path) {
+	// would hold chunks back; the handler may compress its own answer. So
+	// are the backend data downloads.
+	if r.Header.Get("Range") != "" || isBackendCall(r.URL.Path) || isBackendDownload(r.URL.Path) {
 		r.Header.Del("Accept-Encoding")
 	}
 	if s.viewMux != nil && strings.EqualFold(r.Host, s.viewHost) {
@@ -436,10 +453,13 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 // pageMetaResp adds where to load the rendered page from: /view/{id} on the
-// app origin, or a token URL on the separate view origin.
+// app origin, or a token URL on the separate view origin; whether the page
+// has backend data, and when it will be purged if that is within a week.
 type pageMetaResp struct {
 	*store.PageMeta
-	ViewURL string `json:"viewUrl"`
+	ViewURL        string     `json:"viewUrl"`
+	BackendData    bool       `json:"backendData"`
+	BackendPurgeAt *time.Time `json:"backendPurgeAt,omitempty"`
 }
 
 func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
@@ -448,7 +468,10 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, pageMetaResp{PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID)})
+	writeJSON(w, http.StatusOK, pageMetaResp{
+		PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID),
+		BackendData: meta.BackendData, BackendPurgeAt: s.backendPurgeAt(meta.BackendDormantSince),
+	})
 }
 
 func (s *Server) viewURL(sub, id string) string {
@@ -556,13 +579,55 @@ func (s *Server) handleUnarchive(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// archivedItem is an archived item, with when its backend data will be
+// purged if that is within a week; for a folder, the first purge among the
+// pages inside it.
+type archivedItem struct {
+	store.TreeItem
+	BackendPurgeAt *time.Time `json:"backendPurgeAt,omitempty"`
+}
+
 func (s *Server) handleArchived(w http.ResponseWriter, r *http.Request) {
 	items, err := s.st.Archived(r.Context(), subOf(r.Context()))
 	if err != nil {
 		httpError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, items)
+	out := make([]archivedItem, len(items))
+	var pages, folders []string
+	for i, it := range items {
+		out[i].TreeItem = it
+		if it.Kind == "page" {
+			pages = append(pages, it.ID)
+		} else {
+			folders = append(folders, it.ID)
+		}
+	}
+	// Only worth asking when something is ever purged here.
+	if s.runner != nil && s.cfg.BackendPurgeAfterDays > 0 {
+		dormant, err := s.st.BackendDormancy(r.Context(), pages)
+		if err != nil {
+			httpError(w, err)
+			return
+		}
+		// Pages inside an archived folder are purged too, but they are not
+		// listed and can't be opened: their folder carries the first date.
+		inFolders, err := s.st.BackendFolderDormancy(r.Context(), folders)
+		if err != nil {
+			httpError(w, err)
+			return
+		}
+		for i, it := range out {
+			since, ok := dormant[it.ID]
+			if it.Kind != "page" {
+				since, ok = inFolders[it.ID]
+			}
+			if ok {
+				out[i].BackendPurgeAt = s.backendPurgeAt(&since)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request) {

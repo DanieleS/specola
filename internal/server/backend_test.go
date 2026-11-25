@@ -34,6 +34,7 @@ type fakeRunner struct {
 	arrived chan struct{} // a /slow call arrived
 	release chan struct{} // closed: /slow calls answer
 	gone    chan struct{} // a /slow call saw its caller go away
+	data    fakeData      // the data routes (backenddata_test.go)
 }
 
 type runnerCall struct {
@@ -44,6 +45,7 @@ type runnerCall struct {
 func newFakeRunner(t *testing.T) *fakeRunner {
 	t.Helper()
 	fr := &fakeRunner{next: make(chan struct{}), arrived: make(chan struct{}, 100), release: make(chan struct{}), gone: make(chan struct{}, 100)}
+	fr.data.init()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"ok":true,"version":"test"}`)
@@ -53,6 +55,7 @@ func newFakeRunner(t *testing.T) *fakeRunner {
 		fmt.Fprintf(w, `{"lines":[{"seq":7,"time":"2026-01-01T00:00:00Z","level":"log","text":"page=%s since=%s"}]}`,
 			r.URL.Query().Get("page"), r.URL.Query().Get("since"))
 	})
+	mux.HandleFunc("/pages/", fr.serveData)
 	mux.HandleFunc("POST /invoke", func(w http.ResponseWriter, r *http.Request) {
 		var c runnerCall
 		raw, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Specola-Invoke"))
