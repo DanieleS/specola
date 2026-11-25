@@ -27,6 +27,10 @@ type VersionInfo struct {
 	Note         *string   `json:"note,omitempty"`
 	// Bundle: the version is an SPA bundle (see bundles.go).
 	Bundle bool `json:"bundle"`
+	// Backend: the version has a backend; Viewable: it can be opened, which
+	// on a backend page only the current version can (see backend.go).
+	Backend  bool `json:"backend"`
+	Viewable bool `json:"viewable"`
 }
 
 // Versions lists a page's versions, newest first. sub must be able to see it.
@@ -36,8 +40,11 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT v.version, v.size_bytes, v.created_at, COALESCE(u.email, v.edited_by_sub, ''), v.restored_from_version, v.note,
-		       v.bundle_key IS NOT NULL
-		FROM asset_version v LEFT JOIN app_user u ON u.sub = v.edited_by_sub
+		       v.bundle_key IS NOT NULL, v.backend IS NOT NULL, `+viewable+`
+		FROM asset_version v
+		JOIN asset a ON a.id = v.asset_id
+		JOIN asset_version cur ON cur.asset_id = a.id AND cur.version = a.current_version
+		LEFT JOIN app_user u ON u.sub = v.edited_by_sub
 		WHERE v.asset_id = $1::uuid
 		ORDER BY v.version DESC`, id)
 	if err != nil {
@@ -47,7 +54,7 @@ func (s *Store) Versions(ctx context.Context, sub, id string) ([]VersionInfo, er
 	out := []VersionInfo{}
 	for rows.Next() {
 		var v VersionInfo
-		if err := rows.Scan(&v.Version, &v.SizeBytes, &v.CreatedAt, &v.EditedBy, &v.RestoredFrom, &v.Note, &v.Bundle); err != nil {
+		if err := rows.Scan(&v.Version, &v.SizeBytes, &v.CreatedAt, &v.EditedBy, &v.RestoredFrom, &v.Note, &v.Bundle, &v.Backend, &v.Viewable); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -107,9 +114,12 @@ func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int, no
 			return err
 		}
 		if key != "" {
-			return copyBundleFiles(ctx, tx, id, from, version)
+			if err := copyBundleFiles(ctx, tx, id, from, version); err != nil {
+				return err
+			}
 		}
-		return nil
+		// The restored version's scheduled jobs replace the page's (cron.go).
+		return syncBackendCron(ctx, tx, id, time.Now())
 	})
 	return version, err
 }

@@ -18,6 +18,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/danieles/specola/internal/backend"
+
 	"github.com/jackc/pgx/v5"
 )
 
@@ -140,10 +142,39 @@ func ValidateManifest(files []BundleFile) error {
 	if !hasIndex {
 		return &ErrInvalid{"a bundle needs an index.html at its root"}
 	}
+	if err := checkBackendLayout(files); err != nil {
+		return err
+	}
 	if total > MaxBundleBytes {
 		return &ErrInvalid{fmt.Sprintf("a bundle can be at most %d bytes in all, this one is %d", MaxBundleBytes, total)}
 	}
 	return nil
+}
+
+// checkBackendLayout checks the reserved .specola/ directory of a bundle
+// (docs/page-backends.md, "Bundle layout and manifest"): files there need a
+// backend.json, which is small. Its content is checked at commit, once it is
+// uploaded.
+func checkBackendLayout(files []BundleFile) error {
+	var hasCode bool
+	for _, f := range files {
+		if !backend.IsBackendPath(f.Path) {
+			continue
+		}
+		hasCode = true
+		if f.Path == backend.ManifestPath && f.Size > backend.MaxManifestBytes {
+			return &ErrInvalid{fmt.Sprintf("%s can be at most %d bytes", backend.ManifestPath, backend.MaxManifestBytes)}
+		}
+	}
+	if hasCode && !HasBackend(files) {
+		return &ErrInvalid{fmt.Sprintf("files under %s need a %s describing the backend", backend.Prefix, backend.ManifestPath)}
+	}
+	return nil
+}
+
+// HasBackend reports whether a bundle manifest has a backend manifest.
+func HasBackend(files []BundleFile) bool {
+	return slices.ContainsFunc(files, func(f BundleFile) bool { return f.Path == backend.ManifestPath })
 }
 
 func validSHA256(s string) bool {
@@ -449,8 +480,10 @@ func (s *Store) PutBundleBlob(ctx context.Context, token, sum string, body io.Re
 // minting user, whose access is checked again. note, when not empty,
 // replaces the grant's. Every blob of the manifest must have been uploaded,
 // else it returns *ErrMissingBlobs. Everything happens in one transaction,
-// which also consumes the grant.
-func (s *Store) CommitBundle(ctx context.Context, token, note string) (id string, version int, err error) {
+// which also consumes the grant. backends is whether this instance runs page
+// backends: without, a bundle with one is refused (ErrBackendDisabled), even
+// if its manifest was posted while they were enabled.
+func (s *Store) CommitBundle(ctx context.Context, token, note string, backends bool) (id string, version int, err error) {
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
 		g, err := openBundleGrant(ctx, tx, token, true)
 		if err != nil {
@@ -512,6 +545,18 @@ func (s *Store) CommitBundle(ctx context.Context, token, note string) (id string
 			html = string(b)
 		}
 
+		// The backend's manifest, now that its content is here.
+		var manifest []byte
+		var codeHash string
+		if HasBackend(files) {
+			if !backends {
+				return ErrBackendDisabled
+			}
+			if manifest, codeHash, err = readBackendManifest(ctx, tx, files); err != nil {
+				return err
+			}
+		}
+
 		if g.kind == GrantUploadNew {
 			id, version, err = createPage(ctx, tx, g.folderID, *g.name, html, g.note, g.sub)
 		} else {
@@ -542,6 +587,16 @@ func (s *Store) CommitBundle(ctx context.Context, token, note string) (id string
 			versionID, paths, sums, types, sizes); err != nil {
 			return err
 		}
+		if manifest != nil {
+			if _, err := tx.Exec(ctx, `UPDATE asset_version SET backend = $2, backend_hash = $3 WHERE id = $1::uuid`,
+				versionID, manifest, codeHash); err != nil {
+				return err
+			}
+		}
+		// The new version's scheduled jobs replace the page's (cron.go).
+		if err := syncBackendCron(ctx, tx, id, time.Now()); err != nil {
+			return err
+		}
 		_, err = tx.Exec(ctx, `UPDATE asset_grant SET consumed_at = now() WHERE id = $1::uuid`, g.id)
 		return err
 	})
@@ -549,6 +604,33 @@ func (s *Store) CommitBundle(ctx context.Context, token, note string) (id string
 		return "", 0, err
 	}
 	return id, version, nil
+}
+
+// readBackendManifest reads and validates the backend.json of a bundle being
+// committed, and returns it normalised, as stored, with the code's hash.
+func readBackendManifest(ctx context.Context, tx pgx.Tx, files []BundleFile) (manifest []byte, codeHash string, err error) {
+	paths := make([]string, 0, len(files))
+	sums := make(map[string]string, len(files))
+	var sum string
+	for _, f := range files {
+		paths = append(paths, f.Path)
+		sums[f.Path] = f.SHA256
+		if f.Path == backend.ManifestPath {
+			sum = f.SHA256
+		}
+	}
+	var content []byte
+	if err := tx.QueryRow(ctx, `SELECT content FROM bundle_blob WHERE sha256 = $1`, sum).Scan(&content); err != nil {
+		return nil, "", err
+	}
+	m, err := backend.ParseManifest(content, paths)
+	if err != nil {
+		return nil, "", &ErrInvalid{err.Error()}
+	}
+	if manifest, err = json.Marshal(m); err != nil {
+		return nil, "", err
+	}
+	return manifest, backend.CodeHash(sums), nil
 }
 
 // makeBundle gives a just-inserted version a new bundle key, marking it as a
@@ -567,10 +649,17 @@ func makeBundle(ctx context.Context, tx pgx.Tx, assetID string, version int) (st
 }
 
 // copyBundleFiles makes version to of a page a bundle with the same files as
-// version from, under a new key. Used when restoring a bundle version.
+// version from, under a new key, and the same backend, if it has one. Used
+// when restoring a bundle version.
 func copyBundleFiles(ctx context.Context, tx pgx.Tx, assetID string, from, to int) error {
 	versionID, err := makeBundle(ctx, tx, assetID, to)
 	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE asset_version t SET backend = f.backend, backend_hash = f.backend_hash
+		FROM asset_version f
+		WHERE t.id = $1::uuid AND f.asset_id = $2::uuid AND f.version = $3`, versionID, assetID, from); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `
@@ -615,6 +704,10 @@ type BundleFileInfo struct {
 // The content is read separately (ReadBundleBlob), so a HEAD, a conditional
 // request or a small range doesn't cost a read of the whole file.
 func (s *Store) BundleFileInfo(ctx context.Context, key, path string) (*BundleFileInfo, error) {
+	// A backend's code is for the runner only (BackendCode).
+	if backend.IsBackendPath(path) {
+		return nil, ErrNotFound
+	}
 	var f BundleFileInfo
 	err := s.pool.QueryRow(ctx, `
 		SELECT f.sha256, f.content_type, f.size_bytes
@@ -670,8 +763,9 @@ func (s *Store) ReadBundleBlob(ctx context.Context, sum string, off, n int64) ([
 // database so far (for tests and monitoring).
 func (s *Store) BundleBytesRead() int64 { return s.blobBytes.Load() }
 
-// VersionFiles returns the bundle key and files (index.html aside) of one
-// version of a page sub can see. A plain version has key "" and no files.
+// VersionFiles returns the bundle key and files (index.html and the
+// backend's .specola/ files aside) of one version of a page sub can see. A
+// plain version has key "" and no files.
 func (s *Store) VersionFiles(ctx context.Context, sub, id string, version int) (key string, files []VersionFile, err error) {
 	if err := checkPage(ctx, s.pool, id, sub, RoleViewer); err != nil {
 		return "", nil, err
@@ -691,8 +785,8 @@ func (s *Store) VersionFiles(ctx context.Context, sub, id string, version int) (
 	rows, err := s.pool.Query(ctx, `
 		SELECT f.path, f.size_bytes, f.content_type, f.sha256
 		FROM asset_version_file f JOIN asset_version v ON v.id = f.asset_version_id
-		WHERE v.bundle_key = $1
-		ORDER BY f.path`, *k)
+		WHERE v.bundle_key = $1 AND NOT starts_with(f.path, $2)
+		ORDER BY f.path`, *k, backend.Prefix)
 	if err != nil {
 		return "", nil, err
 	}

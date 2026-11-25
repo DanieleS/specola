@@ -118,7 +118,7 @@ func TestPageDataQuota(t *testing.T) {
 }
 
 func TestWithSDK(t *testing.T) {
-	boot := bootData{Base: "https://v.test/b/k/", Basename: "/view/x"}
+	boot := bootData{Base: "https://v.test/b/k/", Basename: "/view/x", Backend: true}
 	tag := sdkTag(boot)
 	for in, want := range map[string]string{
 		"<p>hi</p>":                       tag + "<p>hi</p>",
@@ -135,7 +135,7 @@ func TestWithSDK(t *testing.T) {
 	if strings.Contains(tag, "\n//") || !strings.HasPrefix(tag, "<script>((boot) => {") {
 		t.Fatalf("sdkTag not stripped of comments: %.80q", tag)
 	}
-	if !strings.HasSuffix(tag, `})({"base":"https://v.test/b/k/","basename":"/view/x"});`+"\n</script>") {
+	if !strings.HasSuffix(tag, `})({"base":"https://v.test/b/k/","basename":"/view/x","backend":true});`+"\n</script>") {
 		t.Fatalf("sdkTag doesn't end with the boot data: %q", tag[len(tag)-120:])
 	}
 	// Boot data can't close the script.

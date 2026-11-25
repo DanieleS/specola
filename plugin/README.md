@@ -17,7 +17,7 @@ The contract between the plugin, the CLI and the server is
 The plugin is served by your Specola instance (Node ≥ 18, Vite ≥ 5):
 
 ```sh
-npm i -D https://<your-specola>/tools/specola-vite-plugin-1.0.0.tgz
+npm i -D https://<your-specola>/tools/specola-vite-plugin-1.1.0.tgz
 ```
 
 ## Configure
@@ -48,7 +48,7 @@ What the plugin does on `vite build`:
 - rewrites the references in `index.html` to the bundle's files as
   `__SPECOLA_BASE__/assets/…`: the server replaces the placeholder with the
   bundle's file URL when it serves the page;
-- adds `<meta name="generator" content="specola-vite-plugin/1.0.0">` and, with
+- adds `<meta name="generator" content="specola-vite-plugin/1.1.0">` and, with
   `searchText`, a `<noscript data-specola-search>` element;
 - fails the build when it exceeds the limits or emits an HTML file other
   than `index.html`, and warns when JS or CSS refers to a `public/` file by a
@@ -57,8 +57,8 @@ What the plugin does on `vite build`:
   which can't load in a bundle (see SVG icons).
 
 On `vite dev` it provides a stand-in `window.specola`
-(`{ base: "/", basename: "", persistent: false, flush }`) so the app runs
-locally unchanged.
+(`{ base: "/", basename: "", persistent: false, flush, fetch, backend }`) so
+the app runs locally unchanged.
 
 ## Publish
 
@@ -98,6 +98,249 @@ directory (or build yourself and pass `--no-build --dir <dir>`). Symbolic
 links in the output are followed only while they point inside it. If the
 connection drops during the final commit and the retry reports the link as
 used, the page was most likely published: check it before publishing again.
+
+## Backend
+
+An app can have server-side code: a **page backend**, built from the same
+project, published with the same command, and reached from the app with
+`specola.fetch`. It runs in Node on the instance's backend runner, with
+SQLite databases and a file store of its own. Backends are optional on a
+Specola instance: `specola-publish` refuses a bundle with a backend where
+they are not enabled (the MCP tool `create_bundle_upload` says whether they
+are). The contract is [`docs/page-backends.md`](../docs/page-backends.md).
+
+### Add one
+
+```js
+// vite.config.js
+specola({
+  server: 'server/index.ts',
+  backend: {
+    secrets: ['OPENAI_API_KEY'], // names the code expects; the page's owner sets the values
+  },
+});
+```
+
+The `backend` option (or a `specola.backend.json` next to `vite.config`,
+not both) is the manifest: `public`, `egress`, `secrets`, `cron`, `topics`
+(see the contract). The build fails on a manifest the server would refuse.
+
+```ts
+// server/index.ts
+import type { Handler } from '@specola/vite-plugin/server';
+
+export default {
+  async fetch(request, ctx) {
+    const url = new URL(request.url); // https://page.invalid/<path>?<query>
+    ctx.db.exec('CREATE TABLE IF NOT EXISTS votes (sub TEXT PRIMARY KEY, choice TEXT)');
+    if (request.method === 'POST' && url.pathname === '/api/vote') {
+      const { choice } = await request.json();
+      ctx.db.prepare('INSERT OR REPLACE INTO votes VALUES (?, ?)').run(ctx.user!.sub, choice);
+      return Response.json({ ok: true });
+    }
+    return new Response('not found', { status: 404 });
+  },
+} satisfies Handler;
+```
+
+`fetch(request, ctx)` takes a standard `Request` and returns a `Response`
+(a router such as Hono works as is). Treat every request as untrusted:
+anyone who can open the page can send anything; decide with `ctx.user` and
+`ctx.role`. `ctx` has:
+
+| | |
+| --- | --- |
+| `user`, `role`, `link`, `page` | who is calling (`owner`, `editor`, `viewer`…) and the page |
+| `db` | SQLite (`node:sqlite`) shared by everyone on the page, opened on first use |
+| `userDb` | SQLite private to `ctx.user` (`null` without a user) |
+| `files` | a file store: `put(key, body, {contentType})`, `get(key)`, `delete(key)`, `list(prefix)` |
+| `secrets` | the declared secrets that are set (see Secrets) |
+| `publish(topic, data, {to})` | push to the open pages subscribed to `topic` (see Push) |
+| `waitUntil(p)`, `log` | keep working after responding; `console` for the backend log |
+
+Data belongs to the page, not to a version: migrate the schema in code
+(`PRAGMA user_version` is the usual way). Types are in
+`@specola/vite-plugin/server` (they need `@types/node` 22.13 or newer).
+
+In the app:
+
+```js
+const res = await specola.fetch('/api/vote', { method: 'POST', body: JSON.stringify({ choice: 'a' }) });
+```
+
+Same signature as `fetch`, with a path starting with `/` (or a `URL` or
+`Request` on the page's own origin); the response
+streams (LLM output, long exports). It rejects with an error named
+`BackendUnavailable` (`err.reason`: `disabled`, `unavailable`, `superseded`
+when a newer version of the page is current, `offline`);
+`specola.backend` (`{enabled, available}`) lets the app degrade. Only the
+current version of a page with a backend can be opened.
+
+### What the build does
+
+After the app, `vite build` builds the server entry with Vite's SSR build
+(target Node 22, ES module, every dependency bundled in) into
+`dist/.specola/server/index.mjs`, and writes the manifest to
+`dist/.specola/backend.json`. Specola never serves `.specola/`; only the
+runner reads it. The build fails when:
+
+- the app imports the server entry, or anything in its directory: that code
+  would be served to every viewer (keep shared code outside `server/`);
+- the backend imports a native addon (`.node`, or a loader such as
+  `bindings`): use a pure-JavaScript or WebAssembly package (`node:sqlite`
+  is built in);
+- the app itself puts files under `.specola/` (say, in `public/`).
+
+### Secrets
+
+List the names in the manifest (`secrets: ['OPENAI_API_KEY']`); the code
+reads `ctx.secrets.OPENAI_API_KEY`. The values are set by the page's
+owners in Specola, in the viewer's **Backend** panel, never in code or in
+the bundle: they are stored encrypted, nobody can read one back, and
+`ctx.secrets` only has the declared names that are set (check, and answer
+something useful when one is missing). An agent can see which are missing
+(`list_secrets`, and `get_page`'s `backend.secrets_missing`) but cannot set
+one: ask the page's owner to. A secret is a name of `A`–`Z`, digits and
+`_`, starting with a letter.
+
+### Outbound HTTP (egress)
+
+The backend calls other services with the global `fetch`, but only the
+hosts in the manifest's `egress` (`"api.openai.com"`, or `"*.googleapis.com"`
+for any subdomain; ports 443 and 80 only, no IP addresses):
+
+```js
+specola({ server: 'server/index.ts', backend: { egress: ['api.openai.com'], secrets: ['OPENAI_API_KEY'] } });
+```
+
+```ts
+const res = await fetch('https://api.openai.com/v1/models', {
+  headers: { authorization: `Bearer ${ctx.secrets.OPENAI_API_KEY}` },
+});
+```
+
+On the runner every worker's HTTP goes through Specola's egress proxy: a
+host not listed, or one that resolves to a private, loopback or link-local
+address, makes `fetch` fail, and the backend log says
+`egress refused: <host>:<port> (<reason>)`. Raw sockets (`node:net`,
+`node:tls`) bypass the proxy; an instance that must close them does it with
+a network policy on the runner's container (see the runner's README).
+
+### Push
+
+The backend pushes to the pages open on it; the app subscribes:
+
+```ts
+// server: after a change
+ctx.publish('scores', { team: 'a', score: 3 });
+ctx.publish('inbox', { unread: 2 }, { to: someone.sub }); // only that user's pages
+```
+
+```js
+// app
+const unsubscribe = specola.subscribe('scores', (data, topic) => render(data));
+```
+
+A topic is 1 to 128 of letters, digits and `_.:/-`; `data` is anything
+JSON can carry, at most 7 KiB serialised (a bad topic or data throws a
+`TypeError`); at most 50 pushes a second per page. Several subscriptions to
+one topic share one stream; a page listens to at most 20 topics at once.
+It is **best effort**: there is no replay, so a push sent while a page was
+not connected (offline, reloading, the stream reopening) is not seen. Send
+small notices and let the app reload what it shows with `specola.fetch`
+(on each notice, or when the tab becomes visible again) rather than
+pushing the state itself. Viewers of an older version get no pushes (only
+the current version is live).
+
+### Scheduled jobs (cron)
+
+```js
+backend: { cron: [{ name: 'nightly', schedule: '0 3 * * *' }] }
+```
+
+```ts
+export default {
+  async fetch(request, ctx) { /* … */ },
+  async scheduled(event, ctx) {
+    // event: {name: 'nightly', scheduledTime: <ms>}
+    if (event.name === 'nightly') ctx.db.exec("DELETE FROM sessions WHERE expires < unixepoch()");
+  },
+} satisfies Handler;
+```
+
+Up to 10 jobs, five-field cron schedules **in UTC**, at most once a minute
+(no `@daily`-style macros). Specola runs them while the page is not
+archived: one `scheduled` handler gets every job (tell them apart by
+`event.name`), with `ctx.role` `"cron"`, no user (`ctx.user` and
+`ctx.userDb` are `null`), the secrets and `ctx.publish`, for at most 5
+minutes. A run missed while Specola or the runner was down is not caught
+up. The **Backend** panel shows each job's next and last run and its
+outcome; failures are in the backend log.
+
+### Public routes
+
+A public link (`/s/<token>`) to a page with a backend opens it for anyone
+with the link, without signing in, and lets them call only the routes the
+manifest lists in `public`:
+
+```js
+backend: {
+  public: ['GET /api/stats', 'POST /api/votes', 'GET /api/public/*'], // "*" as the last segment: any rest of the path
+  topics: { public: ['scoreboard'] }, // topics a public visitor may subscribe to
+}
+```
+
+Any other route answers 403 `not-public` without reaching the backend. On
+a public call `ctx.user` and `ctx.userDb` are `null`, `ctx.role` is
+`"public"` and `ctx.link` is `{id, label}` of the link: treat those calls as
+coming from anyone on the internet (validate everything, keep them cheap).
+Public calls are rate-limited (60 a minute per link and visitor, 600 a
+minute per link), public visitors only get the `topics.public` topics and
+never targeted pushes, and revoking the link stops them at once. Links to a
+backend page always open its current version.
+
+### Under `vite dev`
+
+The handler runs inside the dev server at `/__specola/x/…`, reloaded when
+you edit it, and `specola.fetch` goes there:
+
+- `ctx.user` is `SPECOLA_DEV_USER` (`me@example.com` or
+  `Name <me@example.com>`; default `dev@localhost`), with the role `owner`;
+- the databases and files live in `.specola-dev/` in the project: add it
+  to `.gitignore`, delete it to start over;
+- `ctx.secrets` come from the environment and `.env` files, only the
+  declared names;
+- `ctx.publish` reaches the dev pages' `specola.subscribe` (through the
+  event stream at `/__specola/events`); a push `to` a user other than the
+  dev user reaches nobody;
+- scheduled jobs don't run on their schedule: the dev server lists them
+  when it starts, and `POST /__specola/cron/<name>` runs one now (with
+  `role: "cron"` and no user), answering `{"status":"ok"|"no-handler"|"error"|"timeout"}`
+  and logging the outcome in the terminal:
+
+  ```sh
+  curl -X POST http://localhost:5173/__specola/cron/nightly
+  ```
+
+Not simulated: public links (every dev call is the owner's: try public
+routes on the published page, through a public link) and the `egress`
+allowlist (the dev backend's `fetch` reaches any host from your machine;
+the runner enforces the list, so test the published page too).
+
+### Testing a published backend (agents)
+
+Specola's MCP server has tools to check a backend once it is published,
+each acting as the signed-in user with the same access rules as the app:
+
+| Tool | |
+| --- | --- |
+| `call_backend(id, method, path, body?, headers?)` | calls the current version as `specola.fetch` would; returns status, headers and up to 64 KiB of body |
+| `backend_logs(id, since?)` | the backend log: console output, errors with their `ref`, egress refusals, cron outcomes (owners and editors) |
+| `backend_query(id, sql, params?)` | one read-only SQL statement on the shared database (`ctx.db`), up to 1000 rows (owners and editors) |
+| `list_secrets(id)` | the declared secrets and whether each is set; owners set values in the UI only |
+
+A failed call answers `{"error":"backend-error","ref":"…"}`: look the `ref`
+up in `backend_logs`.
 
 ## Writing the app
 
@@ -201,7 +444,15 @@ origin.
 | one file | 25 MiB |
 | `index.html` | 5 MiB |
 | whole bundle | 100 MiB |
+| backend request body | 25 MiB |
+| backend response | 100 MiB, streamed |
+| backend request time | 30 s to the response, 5 min in all |
+| backend data (databases and files) | 1 GiB per page |
+| backend push (`ctx.publish`) | 7 KiB of JSON, 50 a second per page |
+| backend cron jobs | 10 per page, at most once a minute, 5 min per run |
+| backend public calls | 60 a minute per link and visitor, 600 per link |
 
+The backend's files under `.specola/` count toward the bundle limits.
 Paths must not contain `?`, `#`, `%`, `\` or control characters, and
 `index.html` must be the only HTML file. The build fails early when a rule is
 broken; `specola({ limits: { … } })` can lower the limits to fail even
@@ -213,8 +464,9 @@ earlier.
 - Module workers (a worker is built and run as a classic script),
   SharedWorkers, service workers.
 - External SVG sprites (`<use href="icons.svg#id">`): inline them.
-- Server-side rendering, API routes, or anything that needs a server: a
-  bundle is static files.
+- Server-side rendering. Server code is a page backend (see Backend), on
+  instances that enable them; elsewhere a bundle is static files.
+- Native addons in a backend.
 - Building on the server: bundles are built on your machine and uploaded.
 
 ## Developing the plugin

@@ -68,6 +68,15 @@ type PageMeta struct {
 	Public bool `json:"public"`
 	// Bundle: the current version is an SPA bundle (see bundles.go).
 	Bundle bool `json:"bundle"`
+	// Backend: the current version has a backend (see backend.go).
+	Backend bool `json:"backend"`
+	// BackendData: the runner holds backend data for the page
+	// (asset.backend_used_at is set). BackendDormantSince is when that data
+	// stopped being reachable (backend_dormant_since), nil while it is live
+	// or when there is none. The server decides what to tell from them, so
+	// they are not serialised as they are.
+	BackendData         bool       `json:"-"`
+	BackendDormantSince *time.Time `json:"-"`
 }
 
 // querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
@@ -201,8 +210,11 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, note, sub string)
 		return 0, err
 	}
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		version, err = addVersion(ctx, tx, assetID, html, n, sub, nil)
-		return err
+		if version, err = addVersion(ctx, tx, assetID, html, n, sub, nil); err != nil {
+			return err
+		}
+		// A plain version: the page's scheduled jobs end (cron.go).
+		return syncBackendCron(ctx, tx, assetID, time.Now())
 	})
 	return version, err
 }
@@ -314,12 +326,14 @@ func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error)
 		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
 		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`,
 		       r.level = 3 AND `+hasPublicLinks+`,
-		       EXISTS (SELECT 1 FROM asset_version v
-		               WHERE v.asset_id = a.id AND v.version = a.current_version AND v.bundle_key IS NOT NULL)
+		       cur.bundle_key IS NOT NULL, cur.backend IS NOT NULL, a.backend_used_at IS NOT NULL,
+		       CASE WHEN a.backend_used_at IS NOT NULL THEN backend_dormant_since(a.id) END
 		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
+		JOIN asset_version cur ON cur.asset_id = a.id AND cur.version = a.current_version
 		WHERE a.id = $1::uuid AND r.level > 0
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public, &m.Bundle)
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public, &m.Bundle, &m.Backend,
+			&m.BackendData, &m.BackendDormantSince)
 	m.Role = r.String()
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound

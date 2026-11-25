@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Specola</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; }
+  iframe { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
+  #notice {
+    position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%);
+    max-width: calc(100% - 32px); box-sizing: border-box;
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #f8fafc; background: rgba(15, 23, 42, 0.92); border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); z-index: 1;
+  }
+  #notice[hidden] { display: none; }
+  #notice button {
+    font: inherit; color: #0f172a; background: #f59e0b; border: 0;
+    border-radius: 6px; padding: 3px 10px; cursor: pointer;
+  }
+  #notice .close { color: inherit; background: none; padding: 0 2px; }
+</style>
+</head>
+<body>
+<div id="notice" role="status" hidden><span></span><button type="button" class="reload">Reload</button><button type="button" class="close" aria-label="Dismiss">&#x2715;</button></div>
+<script>
+"use strict";
+// The public-link shell (docs/page-backends.md, "Public links"): a public link
+// to a page with a backend serves this document, which frames the page (same
+// sandbox as the viewer: opaque origin, so it can't reach Specola) and plays
+// the viewer's side of the port, as web/src/lib/pagedata.ts does in the app,
+// for an anonymous visitor:
+// - the first hello from the framed document gets the port, with the backend
+//   state of the boot data; a later hello (the frame reloaded or navigated)
+//   is refused, as in the viewer: one port per frame load;
+// - no localStorage data is handed over (the frame has no name), so the
+//   page's storage stays in memory, as on any public link; a write that
+//   reaches the port anyway is refused;
+// - fetch goes to ANY /p/{token}/x/{path} with X-Specola-Version and
+//   X-Specola-Headers, streamed back as head, chunks and end; abort cancels;
+//   backend-disabled, backend-unavailable and superseded become a
+//   BackendUnavailable;
+// - sub/unsub keep one EventSource on /p/{token}/events for the frame's
+//   topics, reopened 100 ms after the set changes.
+// Superseded (a newer version is current) shows a small notice offering to
+// reload this document, which serves the new version in a new frame.
+// Everything is inline: the shell's CSP allows its own origin and nothing
+// else.
+(function (boot) {
+  var token = String(boot.token || "");
+  var version = Number(boot.version);
+  var state = boot.backend || {};
+  var backend = { enabled: !!state.enabled, available: !!state.available };
+  var pageSrc = String(boot.pageSrc || "");
+  var tokenPath = "/" + encodeURIComponent(token);
+  // Only the page this link serves is framed, whatever the boot data says.
+  if (pageSrc.indexOf("/s" + tokenPath + "/~page") !== 0) pageSrc = "/s" + tokenPath + "/~page";
+
+  var UNAVAILABLE = { "backend-disabled": "disabled", "backend-unavailable": "unavailable", superseded: "superseded" };
+  var GONE = { "not-found": 1, "link-expired": 1 };
+  var TOPIC = /^[A-Za-z0-9_.:/-]{1,128}$/;
+  var MAX_TOPICS = 20;
+  var PLACEHOLDER = "https://page.invalid";
+
+  // The notice: one line, at the bottom, over the page.
+  var notice = document.getElementById("notice");
+  notice.querySelector(".reload").onclick = function () { location.reload(); };
+  notice.querySelector(".close").onclick = function () { notice.hidden = true; };
+  function tell(text, reload) {
+    notice.querySelector("span").textContent = text;
+    notice.querySelector(".reload").hidden = !reload;
+    notice.hidden = false;
+  }
+  var superseded = false;
+  function onSuperseded() {
+    if (superseded) return;
+    superseded = true;
+    tell("A new version is available — reload to see it.", true);
+  }
+  function onGone(code) {
+    tell(code === "link-expired" ? "This link has expired." : "This link has been revoked.", false);
+  }
+
+  var frame = document.createElement("iframe");
+  frame.title = "page";
+  frame.referrerPolicy = "no-referrer";
+  // As the viewer frames pages: no allow-same-origin.
+  frame.setAttribute("sandbox", "allow-scripts allow-popups allow-forms allow-modals");
+  frame.src = pageSrc;
+  document.body.insertBefore(frame, notice);
+
+  var port = null;
+  var calls = new Map(); // id -> AbortController
+  var push = null;
+
+  addEventListener("message", function (e) {
+    if (e.source !== frame.contentWindow || !e.data || e.data.specola !== "hello") return;
+    var page = e.source;
+    if (port) {
+      page.postMessage({ specola: "refused", error: "the page navigated; reload this link" }, "*");
+      return;
+    }
+    var ch = new MessageChannel();
+    var p = (port = ch.port1);
+    p.onmessage = function (m) {
+      var d = m.data;
+      if (!d) return;
+      if (d.op === "fetch") relay(p, d);
+      else if (d.op === "abort") {
+        var ac = calls.get(d.id);
+        if (ac) ac.abort();
+        calls.delete(d.id);
+      } else if (d.op === "sub" || d.op === "unsub") {
+        if (typeof d.topic !== "string") return;
+        if (!push) push = pushStream(p);
+        if (d.op === "sub") push.sub(d.topic);
+        else push.unsub(d.topic);
+      } else if (d.op === "write") {
+        p.postMessage({ ok: false, error: "a public link keeps localStorage in memory only" });
+      }
+    };
+    page.postMessage({ specola: "port", backend: backend }, "*", [ch.port2]);
+  });
+
+  // The URL of a backend path under /p/{token}/x, or null. Normalised on a
+  // placeholder origin first, so dot segments can't climb out of it.
+  function backendURL(path) {
+    if (typeof path !== "string" || path[0] !== "/") return null;
+    var u;
+    try {
+      u = new URL(path, PLACEHOLDER);
+    } catch (err) {
+      return null;
+    }
+    if (u.origin !== PLACEHOLDER) return null;
+    var prefix = "/p" + tokenPath + "/x";
+    var out = new URL(prefix + u.pathname + u.search, location.href);
+    return out.pathname.indexOf(prefix + "/") === 0 ? out.href : null;
+  }
+
+  // X-Specola-Headers: base64url of the JSON [[name, value]...].
+  function encodeHeaders(h) {
+    var bin = "";
+    var bytes = new TextEncoder().encode(JSON.stringify(h));
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function whole(v) {
+    if (v.byteOffset === 0 && v.byteLength === v.buffer.byteLength && v.buffer instanceof ArrayBuffer) return v.buffer;
+    return v.slice().buffer;
+  }
+
+  // relay makes the page's call and sends the answer back over p: head, the
+  // body's chunks as they come (transferred), end; or an error.
+  async function relay(p, m) {
+    function fail(name, message, reason) {
+      p.postMessage({ op: "error", id: m.id, name: name, message: message, reason: reason });
+    }
+    var url = backendURL(m.path);
+    if (!url) return fail("NetworkError", "not a backend path: " + m.path);
+    if (calls.has(m.id)) return fail("NetworkError", "this request id is in use");
+    var ac = new AbortController();
+    calls.set(m.id, ac);
+    function live() { return calls.get(m.id) === ac; }
+    try {
+      var headers = new Headers();
+      var list = Array.isArray(m.headers) ? m.headers : [];
+      for (var i = 0; i < list.length; i++) {
+        var k = list[i] && list[i][0], v = list[i] && list[i][1];
+        if (/^x-specola-/i.test(k)) continue;
+        try {
+          headers.append(k, v);
+        } catch (err) {
+          // A header fetch can't send: dropped, as a browser would.
+        }
+      }
+      // Only the page's own headers reach its backend, listed apart from
+      // what the browser or a proxy adds.
+      headers.set("X-Specola-Headers", encodeHeaders(Array.from(headers)));
+      headers.set("X-Specola-Version", String(version));
+      var method = String(m.method || "GET").toUpperCase();
+      var res;
+      try {
+        res = await fetch(url, {
+          method: method,
+          headers: headers,
+          body: method === "GET" || method === "HEAD" ? undefined : m.body,
+          // Anonymous: whatever session this origin may hold stays out.
+          credentials: "omit",
+          cache: "no-store",
+          redirect: "manual",
+          signal: ac.signal,
+        });
+      } catch (err) {
+        if (!live()) return;
+        if (!navigator.onLine) return fail("BackendUnavailable", "offline: the page's backend can't be reached", "offline");
+        return fail("NetworkError", "can't reach Specola");
+      }
+      if (!live()) return;
+      if (res.type === "opaqueredirect") return fail("NetworkError", "the backend answered with a redirect, which Specola doesn't follow");
+      var code = res.headers.get("X-Specola-Error") || "";
+      var reason = UNAVAILABLE[code];
+      if (reason) {
+        var message = res.statusText;
+        try {
+          message = (await res.json()).message || message;
+        } catch (err) {
+          // Not Specola's JSON: the status says enough.
+        }
+        if (reason === "superseded") onSuperseded();
+        if (live()) fail("BackendUnavailable", message, reason);
+        return;
+      }
+      if (GONE[code] && (res.status === 404 || res.status === 410)) onGone(code);
+      p.postMessage({ op: "head", id: m.id, status: res.status, headers: Array.from(res.headers) });
+      if (res.body) {
+        var reader = res.body.getReader();
+        try {
+          for (;;) {
+            var r = await reader.read();
+            if (r.done || !live()) break;
+            var buf = whole(r.value);
+            p.postMessage({ op: "chunk", id: m.id, data: buf }, [buf]);
+          }
+        } catch (err) {
+          if (live()) fail("NetworkError", "the answer was cut short");
+          return;
+        } finally {
+          if (!live()) reader.cancel().catch(function () {});
+        }
+      }
+      if (live()) p.postMessage({ op: "end", id: m.id });
+    } finally {
+      if (live()) calls.delete(m.id);
+    }
+  }
+
+  // The frame's pushes: one EventSource for its current topics, reopened
+  // 100 ms after the set last changed. superseded and forbidden end it; a
+  // stream that fails to open is asked about once with a plain request (an
+  // EventSource can't see the status) and retried with a growing delay unless
+  // the answer is final. Best effort: no replay.
+  function pushStream(p) {
+    var topics = new Set();
+    var es = null, openFor = "", timer = 0, probe = null, backoff = 0, stopped = false;
+    var FINAL = { forbidden: 1, "not-found": 1, "link-expired": 1, "no-backend": 1, "backend-disabled": 1, "bad-request": 1, "not-public": 1 };
+
+    function changed() {
+      if (stopped) return;
+      clearTimeout(timer);
+      timer = setTimeout(reopen, 100);
+    }
+    function shut() {
+      if (es) es.close();
+      es = null;
+      openFor = "";
+      if (probe) probe.abort();
+      probe = null;
+    }
+    function stop() {
+      stopped = true;
+      clearTimeout(timer);
+      shut();
+    }
+    function reopen() {
+      timer = 0;
+      if (stopped) return;
+      var list = Array.from(topics).sort();
+      var key = list.join("\n");
+      if ((es || probe) && key === openFor) return;
+      shut();
+      if (!list.length || !backend.enabled) return;
+      openFor = key;
+      var q = new URLSearchParams({ v: String(version) });
+      list.forEach(function (t) { q.append("topic", t); });
+      var s = (es = new EventSource("/p" + tokenPath + "/events?" + q));
+      s.onopen = function () { if (es === s) backoff = 0; };
+      s.addEventListener("message", function (e) {
+        if (es !== s) return;
+        var msg;
+        try {
+          msg = JSON.parse(e.data);
+        } catch (err) {
+          return;
+        }
+        if (msg && typeof msg.topic === "string" && topics.has(msg.topic)) p.postMessage({ op: "event", topic: msg.topic, data: msg.data });
+      });
+      s.addEventListener("superseded", function () {
+        if (es !== s) return;
+        stop();
+        onSuperseded();
+      });
+      s.addEventListener("forbidden", function () {
+        if (es === s) stop();
+      });
+      s.onerror = function () {
+        if (es !== s || s.readyState !== EventSource.CLOSED) return;
+        es = null;
+        refused(s.url, key);
+      };
+    }
+    async function refused(href, key) {
+      var ac = (probe = new AbortController());
+      var code = "", status = 0;
+      try {
+        var res = await fetch(href, { credentials: "omit", cache: "no-store", signal: ac.signal });
+        status = res.status;
+        code = res.headers.get("X-Specola-Error") || "";
+        ac.abort();
+      } catch (err) {
+        // Unreachable: retried below.
+      }
+      if (probe !== ac || stopped) return;
+      probe = null;
+      if (code === "superseded") {
+        stop();
+        onSuperseded();
+        return;
+      }
+      if (FINAL[code]) {
+        if (GONE[code]) onGone(code);
+        console.warn("specola: pushes for this page stopped: " + code);
+        stop();
+        return;
+      }
+      backoff = Math.min(Math.max(1000, backoff * 2), 60000);
+      openFor = key;
+      timer = setTimeout(function () {
+        openFor = "";
+        reopen();
+      }, backoff);
+    }
+    return {
+      sub: function (topic) {
+        if (stopped || !TOPIC.test(topic) || topics.has(topic)) return;
+        if (topics.size >= MAX_TOPICS) {
+          console.warn("specola: a page takes at most " + MAX_TOPICS + " push topics at once; " + topic + " is left out");
+          return;
+        }
+        topics.add(topic);
+        changed();
+      },
+      unsub: function (topic) {
+        if (topics.delete(topic)) changed();
+      },
+    };
+  }
+})(SPECOLA_SHELL_BOOT);
+</script>
+</body>
+</html>

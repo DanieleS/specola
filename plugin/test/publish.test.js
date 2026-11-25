@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_LIMITS, bundleProblems, compareVersions } from '../lib/rules.js';
-import { PublishError, publish } from '../lib/publish.js';
+import { BACKEND_DISABLED, PublishError, publish } from '../lib/publish.js';
 import { VERSION } from '../lib/version.js';
 
 const bin = fileURLToPath(new URL('../bin/specola-publish.js', import.meta.url));
@@ -195,7 +195,7 @@ test('a plugin older than minPluginVersion is refused before building', async ()
   try {
     const r = await run(['--upload', srv.url]);
     assert.equal(r.code, 1);
-    assert.match(r.stderr, /needs @specola\/vite-plugin 99\.0\.0 or newer, but 1\.0\.0 is installed/);
+    assert.ok(r.stderr.includes(`needs @specola/vite-plugin 99.0.0 or newer, but ${VERSION} is installed`), r.stderr);
     assert.match(r.stderr, /npm i -D http:\/\/127\.0\.0\.1:\d+\/tools\/specola-vite-plugin-99\.0\.0\.tgz/);
   } finally {
     await srv.close();
@@ -363,6 +363,100 @@ test('a file that changes after hashing is not uploaded', async () => {
     assert.ok(!srv.state.puts.includes(sha256('after')) && !srv.state.puts.includes(sha256('before')));
     assert.equal(srv.state.commit, null);
   } finally {
+    await srv.close();
+  }
+});
+
+// Page backends (docs/page-backends.md): .specola/ travels as bundle files,
+// and only to an instance that runs backends.
+const MANIFEST = JSON.stringify({ version: 1, entry: 'server/index.mjs', public: [], egress: [], secrets: [], cron: [], topics: { public: [] } });
+const backendDist = (name, extra = {}) =>
+  makeDist(name, {
+    'index.html': INDEX,
+    '.specola/backend.json': MANIFEST,
+    '.specola/server/index.mjs': 'export default { fetch: () => new Response("ok") };',
+    ...extra,
+  });
+
+test('a bundle with a backend is uploaded, .specola/ included, where backends are enabled', async () => {
+  const dist = backendDist('backend-ok');
+  const srv = await fakeServer({ grant: { backend: { enabled: true, available: false } } });
+  try {
+    const r = await run(['--upload', srv.url, '--dir', dist, '--no-build']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(srv.state.manifest.files.map((f) => f.path), ['.specola/backend.json', '.specola/server/index.mjs', 'index.html']);
+    assert.match(r.stderr, /warning: the backend runner is not answering right now/);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('a bundle with a backend is refused before uploading where backends are off', async () => {
+  const dist = backendDist('backend-off');
+  // An older Specola says nothing about backends: it can't run one either.
+  for (const grant of [{ backend: { enabled: false, available: false } }, {}]) {
+    const srv = await fakeServer({ grant });
+    try {
+      const r = await run(['--upload', srv.url, '--dir', dist, '--no-build']);
+      assert.equal(r.code, 1, JSON.stringify(grant));
+      assert.ok(r.stderr.includes(BACKEND_DISABLED), r.stderr);
+      assert.match(r.stderr, /it has no backend runner/);
+      assert.deepEqual(srv.state.calls, ['GET /upload/bundle/tok123456789'], 'nothing was sent');
+    } finally {
+      await srv.close();
+    }
+  }
+  // A static bundle is not affected.
+  const srv = await fakeServer({ grant: { backend: { enabled: false, available: false } } });
+  try {
+    const r = await run(['--upload', srv.url, '--dir', makeDist('static-off', { 'index.html': INDEX }), '--no-build']);
+    assert.equal(r.code, 0, r.stderr);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('a backend bundle is checked like the server checks it', async () => {
+  const srv = await fakeServer({ grant: { backend: { enabled: true, available: true } } });
+  try {
+    let r = await run(['--upload', srv.url, '--dir', backendDist('bad-manifest', { '.specola/backend.json': '{"version":1,"secrets":["x"]}' }), '--no-build']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /\.specola\/backend\.json: "secrets"\[0\] "x": a name is an upper-case letter/);
+
+    r = await run(['--upload', srv.url, '--dir', makeDist('no-manifest', { 'index.html': INDEX, '.specola/server/index.mjs': 'x' }), '--no-build']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /files under \.specola\/ need a \.specola\/backend\.json describing the backend/);
+    assert.equal(srv.state.manifest, null, 'nothing was sent');
+  } finally {
+    await srv.close();
+  }
+});
+
+test("the server's JSON errors are shown with their message", async () => {
+  const dist = backendDist('server-refuses');
+  const srv = await fakeServer({
+    grant: { backend: { enabled: true, available: true } },
+    rejectManifest: { error: 'backend-disabled', message: 'page backends are not enabled on this Specola instance' },
+  });
+  try {
+    const r = await run(['--upload', srv.url, '--dir', dist, '--no-build']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /400 Bad Request — page backends are not enabled on this Specola instance/);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('builds a project with a backend, then publishes it', async () => {
+  const project = fileURLToPath(new URL('./fixture-backend', import.meta.url));
+  const srv = await fakeServer({ grant: { backend: { enabled: true, available: true } } });
+  try {
+    const r = await run(['--upload', srv.url], { cwd: project });
+    assert.equal(r.code, 0, r.stderr);
+    const paths = srv.state.manifest.files.map((f) => f.path);
+    assert.ok(paths.includes('.specola/backend.json') && paths.includes('.specola/server/index.mjs') && paths.includes('index.html'), paths.join(', '));
+  } finally {
+    rmSync(join(project, 'dist'), { recursive: true, force: true });
     await srv.close();
   }
 });

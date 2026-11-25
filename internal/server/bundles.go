@@ -58,14 +58,25 @@ func (s *Server) pageHTML(html, bundleKey string) string {
 	return strings.ReplaceAll(html, basePlaceholder, s.bundleBase(bundleKey))
 }
 
-// boot is the SDK's boot data for a version with bundle key key ("" for a
-// plain page) served under basename.
-func (s *Server) boot(key, basename string) bootData {
-	b := bootData{Basename: basename}
-	if key != "" {
-		b.Base = s.bundleBase(key)
+// boot is the SDK's boot data for a version served under basename. Backend
+// says the page can reach its backend: the version has one and backends are
+// enabled (docs/page-backends.md, "Boot data").
+func (s *Server) boot(sv *store.ServedVersion, basename string) bootData {
+	b := bootData{Basename: basename, Backend: sv.Backend && s.runner != nil}
+	if sv.BundleKey != "" {
+		b.Base = s.bundleBase(sv.BundleKey)
 	}
 	return b
+}
+
+// bootBackendTag tells apart, in a current version's ETag, the boot data of
+// an instance with backends enabled from one without: it changes what is
+// sent for a backend version.
+func (s *Server) bootBackendTag() string {
+	if s.runner != nil {
+		return "b"
+	}
+	return "s"
 }
 
 // handleBundleFile serves one file of a bundle. The files run inside the
@@ -157,6 +168,9 @@ type bundleUploadInfo struct {
 	*store.BundleUpload
 	Limits           bundleLimits `json:"limits"`
 	MinPluginVersion string       `json:"minPluginVersion"`
+	// Backend lets the CLI refuse a bundle with a backend before building
+	// it, when the instance can't take one.
+	Backend backendState `json:"backend"`
 }
 
 func (s *Server) handleBundleUploadInfo(w http.ResponseWriter, r *http.Request) {
@@ -167,6 +181,7 @@ func (s *Server) handleBundleUploadInfo(w http.ResponseWriter, r *http.Request) 
 	}
 	writeJSON(w, http.StatusOK, bundleUploadInfo{
 		BundleUpload: u,
+		Backend:      s.backendState(),
 		Limits: bundleLimits{
 			MaxFiles:       store.MaxBundleFiles,
 			MaxFileBytes:   store.MaxBundleFileBytes,
@@ -217,6 +232,13 @@ func (s *Server) handleBundleManifest(w http.ResponseWriter, r *http.Request) {
 			req.PluginVersion, minPluginVersion, plugin.InstallCommand(s.pluginURL())), http.StatusBadRequest)
 		return
 	}
+	if s.runner == nil && store.HasBackend(req.Files) {
+		if s.grantError(w, r) {
+			return
+		}
+		backendError(w, http.StatusBadRequest, "backend-disabled", store.ErrBackendDisabled.Error())
+		return
+	}
 	missing, err := s.st.SetBundleManifest(r.Context(), chi.URLParam(r, "token"), req.Files)
 	if err != nil {
 		httpError(w, err)
@@ -263,7 +285,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	id, version, err := s.st.CommitBundle(r.Context(), chi.URLParam(r, "token"), req.Note)
+	id, version, err := s.st.CommitBundle(r.Context(), chi.URLParam(r, "token"), req.Note, s.runner != nil)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -320,6 +342,7 @@ func (s *Server) handleCreateBundleUpload(w http.ResponseWriter, r *http.Request
 		"command":   plugin.PublishCommand(uploadURL),
 		// For the app's hint: the plugin must be installed once first.
 		"pluginInstall": plugin.InstallCommand(s.pluginURL()),
+		"backend":       s.backendUploadState(),
 	})
 }
 

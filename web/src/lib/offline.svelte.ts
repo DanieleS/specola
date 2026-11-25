@@ -13,6 +13,9 @@ import { api, HttpError, type PageMeta, type Role, type VersionFiles } from "./a
 // pinned: never evicted, and brought up to its current version each time the
 // app starts online.
 //
+// A page whose current version has a backend (docs/page-backends.md) keeps
+// only that version: older ones can't be opened, and a newer one replaces it.
+//
 // Everything is per user: it is wiped on logout and when someone else signs
 // in on this browser.
 
@@ -26,6 +29,8 @@ export type OfflinePage = {
   bundles?: number[];
   /** What each kept version takes up, files included, for eviction. */
   sizes?: Record<number, number>;
+  /** The current version had a backend when last kept: only it is kept. */
+  backend?: boolean;
   /** Kept on purpose: never evicted, synced to the current version. */
   pinned: boolean;
   updatedAt: string;
@@ -134,6 +139,8 @@ async function fetchHTML(viewUrl: string, v: number, bundle = false): Promise<Re
  */
 export async function keep(meta: PageMeta, v: number, pin = false) {
   if (!supported || !index.owner) return;
+  // An older version of a backend page can't be opened, so isn't kept.
+  if (meta.backend && v !== meta.version) return;
   const owner = index.owner;
   let stored: Stored | null = null;
   if (!index.pages[meta.id]?.versions.includes(v)) {
@@ -153,14 +160,25 @@ export async function keep(meta: PageMeta, v: number, pin = false) {
     }
   }
   const old = index.pages[meta.id];
-  const versions = [...new Set([...(old?.versions ?? []), v])].sort((a, b) => a - b);
+  let versions = [...new Set([...(old?.versions ?? []), v])].sort((a, b) => a - b);
+  // A backend page keeps its current version alone.
+  const stale = meta.backend ? versions.filter((x) => x !== v) : [];
+  if (stale.length) {
+    await drop(await caches.open(PAGES), meta.id, stale);
+    versions = [v];
+  }
   index.pages[meta.id] = {
     id: meta.id,
     name: meta.name,
     role: meta.role,
     versions,
-    bundles: [...new Set([...(old?.bundles ?? []), ...(stored?.bundle ? [v] : [])])].sort((a, b) => a - b),
-    sizes: stored ? { ...old?.sizes, [v]: stored.bytes } : old?.sizes,
+    bundles: [...new Set([...(old?.bundles ?? []), ...(stored?.bundle ? [v] : [])])]
+      .filter((x) => versions.includes(x))
+      .sort((a, b) => a - b),
+    sizes: Object.fromEntries(
+      Object.entries(stored ? { ...old?.sizes, [v]: stored.bytes } : (old?.sizes ?? {})).filter(([x]) => versions.includes(Number(x))),
+    ),
+    backend: !!meta.backend,
     pinned: pin || (old?.pinned ?? false),
     updatedAt: meta.updatedAt,
     usedAt: new Date().toISOString(),

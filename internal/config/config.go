@@ -2,10 +2,13 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -43,6 +46,33 @@ type Config struct {
 	// DevAuthEmail bypasses auth entirely and treats every request as this
 	// user. For local development only; never set in production.
 	DevAuthEmail string
+
+	// Page backends (docs/page-backends.md). RunnerURL is the runner's base
+	// URL; unset, backends are disabled. RunnerToken is the bearer both
+	// directions of the internal API carry, and SecretsKey (32 bytes) encrypts
+	// page secrets. The three come together or not at all.
+	RunnerURL   string
+	RunnerToken string
+	SecretsKey  []byte
+	// TrustForwarded makes the first X-Forwarded-For hop the client's IP
+	// for the public links' rate limits (SPECOLA_TRUST_FORWARDED=1); set it
+	// only behind a proxy that sets the header. Otherwise the IP is the
+	// connection's.
+	TrustForwarded bool
+	// BackendPurgeAfterDays deletes the backend data of pages dormant (archived,
+	// or whose current version has no backend) for longer than this many
+	// days. 0, the default, never does.
+	BackendPurgeAfterDays int
+
+	// Test hooks, for end-to-end tests only (e2e/backends.mjs), honoured
+	// only with SPECOLA_DEV_AUTH_EMAIL (a dev bypass is never production):
+	// TestCronEvery (SPECOLA_TEST_CRON_EVERY, a Go duration) replaces the
+	// scheduled jobs' 30 s tick, and TestClockOffset
+	// (SPECOLA_TEST_CLOCK_OFFSET) moves the server's scheduling clock
+	// (scheduled jobs and the purge) ahead, so a job due a minute from now
+	// runs at once.
+	TestCronEvery   time.Duration
+	TestClockOffset time.Duration
 }
 
 func Load() (*Config, error) {
@@ -57,8 +87,18 @@ func Load() (*Config, error) {
 		TrustedUserHeader: os.Getenv("SPECOLA_TRUSTED_USER_HEADER"),
 		DevAuthEmail:      os.Getenv("SPECOLA_DEV_AUTH_EMAIL"),
 		ViewOrigin:        strings.TrimRight(os.Getenv("SPECOLA_VIEW_ORIGIN"), "/"),
+		TrustForwarded:    os.Getenv("SPECOLA_TRUST_FORWARDED") == "1",
 	}
 	c.AppBaseURL = strings.TrimRight(c.AppBaseURL, "/")
+	if err := c.loadBackends(); err != nil {
+		return nil, err
+	}
+	if err := c.loadPurge(); err != nil {
+		return nil, err
+	}
+	if err := c.loadTestHooks(); err != nil {
+		return nil, err
+	}
 	c.MCPResource = env("SPECOLA_MCP_RESOURCE", c.AppBaseURL+"/mcp")
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("SPECOLA_DATABASE_URL is required")
@@ -84,6 +124,91 @@ func Load() (*Config, error) {
 	}
 	return c, nil
 }
+
+// loadBackends reads the runner settings: all of them or none. A partial
+// setup is refused rather than run with backends quietly off, since pages
+// published with a backend would stop working without anyone noticing why.
+func (c *Config) loadBackends() error {
+	vars := []string{"SPECOLA_RUNNER_URL", "SPECOLA_RUNNER_TOKEN", "SPECOLA_SECRETS_KEY"}
+	var missing []string
+	for _, k := range vars {
+		if strings.TrimSpace(os.Getenv(k)) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == len(vars) {
+		return nil
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("page backends need SPECOLA_RUNNER_URL, SPECOLA_RUNNER_TOKEN and SPECOLA_SECRETS_KEY together; missing: %s", strings.Join(missing, ", "))
+	}
+	c.RunnerURL = strings.TrimRight(strings.TrimSpace(os.Getenv("SPECOLA_RUNNER_URL")), "/")
+	if _, err := hostOf(c.RunnerURL); err != nil {
+		return fmt.Errorf("SPECOLA_RUNNER_URL: %w", err)
+	}
+	c.RunnerToken = strings.TrimSpace(os.Getenv("SPECOLA_RUNNER_TOKEN"))
+	// The runner refuses to start with less (runner/src/config.js): accepting
+	// it here would leave backends on with a runner that never answers.
+	if len(c.RunnerToken) < 16 {
+		return fmt.Errorf("SPECOLA_RUNNER_TOKEN must be at least 16 characters (e.g. openssl rand -base64 32)")
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(os.Getenv("SPECOLA_SECRETS_KEY")))
+	if err != nil || len(key) != 32 {
+		return fmt.Errorf("SPECOLA_SECRETS_KEY must be 32 bytes, base64-encoded (e.g. openssl rand -base64 32)")
+	}
+	c.SecretsKey = key
+	return nil
+}
+
+// loadPurge reads SPECOLA_BACKEND_PURGE_AFTER_DAYS. A value that isn't a
+// positive number of days is refused rather than read as "never": whoever
+// set it meant data to be deleted, or meant something else entirely.
+func (c *Config) loadPurge() error {
+	v := strings.TrimSpace(os.Getenv("SPECOLA_BACKEND_PURGE_AFTER_DAYS"))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	// The upper bound keeps the duration in range (about 270 years).
+	if err != nil || n < 1 || n > 100_000 {
+		return fmt.Errorf("SPECOLA_BACKEND_PURGE_AFTER_DAYS must be a positive number of days (leave it unset to never purge), got %q", v)
+	}
+	c.BackendPurgeAfterDays = n
+	return nil
+}
+
+// loadTestHooks reads the SPECOLA_TEST_* variables. They are refused
+// without the dev auth bypass rather than ignored, so a test that sets them
+// against the wrong setup fails loudly instead of waiting for a tick that
+// never comes.
+func (c *Config) loadTestHooks() error {
+	for _, h := range []struct {
+		name string
+		dst  *time.Duration
+		min  time.Duration
+	}{
+		{"SPECOLA_TEST_CRON_EVERY", &c.TestCronEvery, 100 * time.Millisecond},
+		{"SPECOLA_TEST_CLOCK_OFFSET", &c.TestClockOffset, 0},
+	} {
+		v := strings.TrimSpace(os.Getenv(h.name))
+		if v == "" {
+			continue
+		}
+		if c.DevAuthEmail == "" {
+			return fmt.Errorf("%s is a test hook and needs SPECOLA_DEV_AUTH_EMAIL; unset it", h.name)
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil || d < h.min {
+			return fmt.Errorf("%s must be a duration of at least %v (e.g. 1s), got %q", h.name, h.min, v)
+		}
+		*h.dst = d
+	}
+	return nil
+}
+
+// BackendsEnabled reports whether page backends are configured. Whether the
+// runner answers is another matter (see the server's health check).
+func (c *Config) BackendsEnabled() bool { return c.RunnerURL != "" }
 
 // OIDCConfigured reports whether OIDC client credentials are present.
 func (c *Config) OIDCConfigured() bool {

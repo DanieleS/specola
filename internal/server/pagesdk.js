@@ -26,7 +26,12 @@
 // window.specola.base is the URL a bundle's files are served under, ending in
 // "/" ("" for a plain page); window.specola.basename is the path the page is
 // served under, for a client-side router (<BrowserRouter basename=…>). The
-// server passes both as boot, in place of SPECOLA_BOOT at the end.
+// server passes both as boot, in place of SPECOLA_BOOT at the end, with
+// backend: whether the page has a backend it can call.
+//
+// - specola.fetch(input, init) calls the page's backend, and
+//   specola.subscribe(topic, onMessage) hears what it pushes: see "Backend"
+//   and "Push" below.
 ((boot) => {
   if (window.specola) return;
   const MAX_BYTES = 1 << 20;
@@ -174,12 +179,38 @@
   // them in its hello whether or not localStorage reaches the server.
   const offline = !!boot.base && location.protocol === "blob:";
 
-  if (persistent || offline) {
+  // A page with a backend reaches it over the same port (see "Backend"
+  // below), so it says hello even when localStorage stays in memory.
+  const framed = window.parent !== window;
+  const wantsBackend = !!boot.backend && framed && !offline;
+  // The backend bridge's state, used by the hello below; see "Backend".
+  const PLACEHOLDER = "https://page.invalid";
+  const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+  const BACKEND_OPS = new Set(["head", "chunk", "end", "error"]);
+  class BackendUnavailable extends Error {
+    constructor(reason, message) {
+      super(message);
+      this.name = "BackendUnavailable";
+      this.reason = reason;
+    }
+  }
+  let backendState = Object.freeze({ enabled: false, available: false });
+  let viewerOffline = false;
+  // "waiting" for the port, "ready", or the BackendUnavailable every call gets.
+  let bridge = framed ? "waiting" : new BackendUnavailable("unavailable", "this page reaches its backend only when opened from Specola");
+  let bridgeTimer = 0;
+  const queued = []; // [message, transfer] made before the port came
+  const calls = new Map(); // id -> {resolve, reject, method, signal, onAbort, ctrl, headed}
+  let lastId = 0;
+
+
+  if (persistent || offline || wantsBackend) {
     addEventListener("message", function hello(e) {
       if (e.source !== window.parent || !e.data || typeof e.data.specola !== "string") return;
       removeEventListener("message", hello);
       if (e.data.specola !== "port" || !e.ports[0]) {
         if (offline) console.error("specola: this bundle's files weren't handed over:", e.data.error);
+        noBridge(e.data.error || "Specola refused this frame");
         if (!persistent) return;
         persistent = false;
         pending = null;
@@ -188,9 +219,19 @@
         return;
       }
       port = e.ports[0];
-      port.onmessage = (m) => (m.data && m.data.op === "files" ? loadOffline(m.data.files) : reply(m.data));
+      port.onmessage = (m) => {
+        const d = m.data;
+        if (d && d.op === "files") loadOffline(d.files);
+        else if (d && BACKEND_OPS.has(d.op)) backendMessage(d);
+        else if (d && d.op === "event") pushMessage(d);
+        else reply(d);
+      };
+      bridgeReady(e.data);
       schedule(0);
     });
+    // Specola's viewer answers at once; anything else framing the page never
+    // will, and calls waiting for the port must not wait forever.
+    if (wantsBackend) bridgeTimer = setTimeout(() => noBridge("Specola didn't answer: open this page from Specola"), 10_000);
     window.parent.postMessage({ specola: "hello", v: 1, files: offline }, "*");
     // A write made while leaving (say, in beforeunload) can't wait for a timer.
     addEventListener("pagehide", () => {
@@ -455,6 +496,225 @@ importScripts(${JSON.stringify(href)});`;
     };
   }
 
+  // Backend (docs/page-backends.md, "Transport"). specola.fetch has fetch's
+  // signature and answers a real Response, but goes to the page's backend:
+  // the request crosses the port to the viewer, which calls Specola as the
+  // signed-in user and sends the answer back as a head, chunks of the body as
+  // they arrive (so a streamed answer streams here too) and an end. Only
+  // paths are accepted ("/api/x"), resolved against the backend. Request
+  // bodies go whole, serialised by new Request first, so a FormData's
+  // multipart boundary or a string's content type come out right.
+  // Calls made before the port arrives wait for it. Without a viewer to
+  // relay them (opened raw, offline, the page has no backend) they reject
+  // with a BackendUnavailable error carrying a reason; so do calls the
+  // viewer refuses because backends are off, or because a newer version of
+  // the page has replaced this one ("superseded").
+  function bridgeReady(hello) {
+    clearTimeout(bridgeTimer);
+    const b = hello.backend;
+    viewerOffline = !!hello.offline;
+    if (b && typeof b === "object") {
+      backendState = Object.freeze({ enabled: !!b.enabled, available: !!b.available && !viewerOffline });
+    }
+    bridge = "ready";
+    for (const [m, t] of queued.splice(0)) port.postMessage(m, t);
+  }
+  function noBridge(why) {
+    clearTimeout(bridgeTimer);
+    if (bridge !== "waiting") return;
+    bridge = new BackendUnavailable("unavailable", String(why));
+    queued.splice(0);
+    for (const id of [...calls.keys()]) finish(id, bridge);
+  }
+  function unavailable() {
+    if (!boot.backend) return new BackendUnavailable("disabled", "this page has no backend, or page backends are not enabled on this instance");
+    if (offline || viewerOffline) return new BackendUnavailable("offline", "offline: the page's backend can't be reached");
+    return bridge instanceof Error ? bridge : null;
+  }
+  function relay(m, transfer = []) {
+    if (bridge === "ready") port.postMessage(m, transfer);
+    else if (bridge === "waiting") queued.push([m, transfer]);
+  }
+
+  // The path a backend call goes to: "/x?y" as given, or the path of a URL
+  // or Request on the page's own origin (new Request("/x") resolves there).
+  function backendPath(input) {
+    const bad = () => new TypeError(`specola.fetch takes a path starting with "/" (got ${String(input)})`);
+    let u;
+    if (typeof input === "string") {
+      if (input[0] !== "/") throw bad();
+      u = new URL(input, PLACEHOLDER);
+      // "//host/x" or "/\\host" would name another host.
+      if (u.origin !== PLACEHOLDER) throw bad();
+    } else if (input instanceof URL || input instanceof Request) {
+      u = new URL(input instanceof Request ? input.url : input.href);
+      if (u.origin !== PLACEHOLDER && u.origin !== location.origin) throw bad();
+    } else {
+      throw bad();
+    }
+    return u.pathname + u.search;
+  }
+
+  async function backendFetch(input, init) {
+    const path = backendPath(input);
+    const req = new Request(input instanceof Request ? input : PLACEHOLDER + path, init);
+    const { signal } = req;
+    const aborted = () => signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+    if (signal.aborted) throw aborted();
+    let why = unavailable();
+    if (why) throw why;
+    const body = req.body ? await req.arrayBuffer() : null;
+    if (signal.aborted) throw aborted();
+    why = unavailable();
+    if (why) throw why;
+    return new Promise((resolve, reject) => {
+      const id = ++lastId;
+      const c = { resolve, reject, method: req.method, signal, ctrl: null, headed: false };
+      c.onAbort = () => {
+        const i = queued.findIndex(([m]) => m.id === id);
+        if (i >= 0) queued.splice(i, 1);
+        else if (calls.has(id)) relay({ op: "abort", id });
+        finish(id, aborted());
+      };
+      signal.addEventListener("abort", c.onAbort, { once: true });
+      calls.set(id, c);
+      const m = { op: "fetch", id, method: req.method, path, headers: [...req.headers] };
+      if (body) m.body = body;
+      relay(m, body ? [body] : []);
+    });
+  }
+
+  // finish ends call id with err (or cleanly, without), rejecting its
+  // promise or erroring its body.
+  function finish(id, err) {
+    const c = calls.get(id);
+    if (!c) return;
+    calls.delete(id);
+    c.signal.removeEventListener("abort", c.onAbort);
+    if (!err) {
+      if (c.ctrl) c.ctrl.close();
+      else if (!c.headed) c.reject(new TypeError("specola.fetch: the answer ended before it began"));
+    } else if (c.ctrl) {
+      c.ctrl.error(err);
+    } else {
+      c.reject(err);
+    }
+  }
+
+  function backendError(d) {
+    const msg = typeof d.message === "string" && d.message ? d.message : "";
+    if (d.name === "BackendUnavailable") return new BackendUnavailable(d.reason || "unavailable", msg || "the page's backend is unavailable");
+    if (d.name === "AbortError") return new DOMException(msg || "The operation was aborted.", "AbortError");
+    // As fetch does on a network failure.
+    return new TypeError(msg || "Failed to fetch");
+  }
+
+  function backendMessage(d) {
+    const c = calls.get(d.id);
+    if (!c) return;
+    if (d.op === "head") {
+      if (c.headed) return;
+      c.headed = true;
+      let stream = null;
+      if (!NULL_BODY.has(d.status) && c.method !== "HEAD") {
+        stream = new ReadableStream({
+          start: (ctrl) => void (c.ctrl = ctrl),
+          // The page stopped reading: the viewer may stop too.
+          cancel: () => {
+            if (calls.get(d.id) !== c) return;
+            calls.delete(d.id);
+            c.signal.removeEventListener("abort", c.onAbort);
+            relay({ op: "abort", id: d.id });
+          },
+        });
+      }
+      let res;
+      try {
+        res = new Response(stream, { status: d.status, headers: d.headers });
+      } catch (err) {
+        c.ctrl = null;
+        relay({ op: "abort", id: d.id });
+        finish(d.id, err);
+        return;
+      }
+      c.resolve(res);
+    } else if (d.op === "chunk") {
+      if (c.ctrl && d.data instanceof ArrayBuffer) c.ctrl.enqueue(new Uint8Array(d.data));
+    } else if (d.op === "end") {
+      finish(d.id);
+    } else if (d.op === "error") {
+      finish(d.id, backendError(d));
+    }
+  }
+
+  // Push (docs/page-backends.md, "Realtime push"). specola.subscribe(topic,
+  // onMessage) hears what the page's backend publishes on topic with
+  // ctx.publish, as onMessage(data, topic), until the unsubscribe function it
+  // returns is called. Subscriptions to one topic share it: the viewer is
+  // told {op:"sub", topic} for the first and {op:"unsub", topic} after the
+  // last, and keeps one event stream for the frame's current topics.
+  // Delivery is best effort: there is no replay, so a message published while
+  // the stream is down or reopening (the topic set changed, the network
+  // dropped) is not seen; an app that must not miss anything reloads its
+  // state with specola.fetch, say on each message or when it becomes visible
+  // again. Without a viewer relaying (opened raw, offline, no backend)
+  // subscribing works but nothing arrives. A callback that throws is
+  // reported, and the others still run.
+  const TOPIC = /^[A-Za-z0-9_.:/-]{1,128}$/;
+  const MAX_TOPICS = 20; // the most an event stream takes
+  const topics = new Map(); // topic -> Set of {onMessage}, one per subscription
+  let warnedPush = false;
+
+  function subscribe(topic, onMessage) {
+    if (typeof topic !== "string" || !TOPIC.test(topic)) {
+      throw new TypeError(`specola.subscribe: a topic is 1 to 128 letters, digits, _, ., :, / or - (got ${String(topic)})`);
+    }
+    if (typeof onMessage !== "function") throw new TypeError("specola.subscribe: onMessage must be a function");
+    let subs = topics.get(topic);
+    if (!subs) {
+      if (topics.size >= MAX_TOPICS) throw new TypeError(`specola.subscribe: at most ${MAX_TOPICS} topics at once`);
+      subs = new Set();
+      topics.set(topic, subs);
+      const why = unavailable();
+      if (!why) relay({ op: "sub", topic });
+      else if (!warnedPush) {
+        warnedPush = true;
+        console.warn("specola.subscribe: no pushes will arrive:", why.message);
+      }
+    }
+    // An object per call, so the same function subscribed twice is two
+    // subscriptions, each with its own unsubscribe.
+    const entry = { onMessage };
+    subs.add(entry);
+    let done = false;
+    return function unsubscribe() {
+      if (done) return;
+      done = true;
+      subs.delete(entry);
+      if (subs.size || topics.get(topic) !== subs) return;
+      topics.delete(topic);
+      relay({ op: "unsub", topic });
+    };
+  }
+
+  function pushMessage(d) {
+    const subs = typeof d.topic === "string" && topics.get(d.topic);
+    if (!subs) return;
+    // A copy: a callback may unsubscribe, itself or others, as it runs. One
+    // removed meanwhile is not called.
+    for (const entry of [...subs]) {
+      if (!subs.has(entry)) continue;
+      try {
+        entry.onMessage(d.data, d.topic);
+      } catch (err) {
+        // Reported as uncaught (the console, window.onerror), without
+        // keeping the next subscriber from its message.
+        if (typeof reportError === "function") reportError(err);
+        else setTimeout(() => { throw err; });
+      }
+    }
+  }
+
   define(
     window,
     "specola",
@@ -464,6 +724,11 @@ importScripts(${JSON.stringify(href)});`;
       get persistent() {
         return persistent;
       },
+      get backend() {
+        return backendState;
+      },
+      fetch: backendFetch,
+      subscribe,
       flush() {
         if (!persistent) return Promise.resolve();
         return new Promise((resolve, reject) => {

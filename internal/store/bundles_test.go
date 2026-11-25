@@ -147,7 +147,7 @@ func uploadBundle(t *testing.T, st *Store, token string, b bundle, note string) 
 			}
 		}
 	}
-	id, v, err := st.CommitBundle(ctx, token, note)
+	id, v, err := st.CommitBundle(ctx, token, note, true)
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestBundleUpload(t *testing.T) {
 			t.Fatalf("missing = %v, %v; want 4 distinct blobs", missing, err)
 		}
 		// Committing before uploading lists what is missing.
-		_, _, err = st.CommitBundle(ctx, token, "")
+		_, _, err = st.CommitBundle(ctx, token, "", true)
 		var mb *ErrMissingBlobs
 		if !errors.As(err, &mb) || !slices.Equal(mb.Missing, missing) {
 			t.Fatalf("early commit: %v, want missing %v", err, missing)
@@ -243,7 +243,7 @@ func TestBundleUpload(t *testing.T) {
 		if _, err := st.SetBundleManifest(ctx, token, app.manifest()); !errors.Is(err, ErrGrantGone) {
 			t.Fatalf("manifest after commit: %v, want ErrGrantGone", err)
 		}
-		if _, _, err := st.CommitBundle(ctx, token, ""); !errors.Is(err, ErrGrantGone) {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); !errors.Is(err, ErrGrantGone) {
 			t.Fatalf("second commit: %v, want ErrGrantGone", err)
 		}
 	})
@@ -323,7 +323,7 @@ func TestBundleUpload(t *testing.T) {
 			t.Fatal(err)
 		}
 		var invalid *ErrInvalid
-		if _, _, err := st.CommitBundle(ctx, token, ""); !errors.As(err, &invalid) {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); !errors.As(err, &invalid) {
 			t.Fatalf("commit: %v, want ErrInvalid", err)
 		}
 	})
@@ -336,7 +336,7 @@ func TestBundleUpload(t *testing.T) {
 		if _, err := st.BundleUploadInfo(ctx, token); !errors.Is(err, ErrGrantGone) {
 			t.Fatalf("info: %v, want ErrGrantGone", err)
 		}
-		if _, _, err := st.CommitBundle(ctx, token, ""); !errors.Is(err, ErrGrantGone) {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); !errors.Is(err, ErrGrantGone) {
 			t.Fatalf("commit: %v, want ErrGrantGone", err)
 		}
 	})
@@ -355,7 +355,7 @@ func TestBundleUpload(t *testing.T) {
 		if err := st.Unshare(ctx, "alice", KindFolder, folder, "bob"); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := st.CommitBundle(ctx, token, ""); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("commit: %v, want ErrNotFound", err)
 		}
 	})
@@ -549,7 +549,7 @@ func TestBundleBlobSizesAndClaims(t *testing.T) {
 		}
 		// Another upload stores the real blob.
 		uploadBundle(t, st, mint("Other"), bundle{"index.html": "<p>other</p>", "late.js": "uploaded by someone else"}, "")
-		if _, _, err := st.CommitBundle(ctx, token, ""); !errors.As(err, &invalid) {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); !errors.As(err, &invalid) {
 			t.Fatalf("commit: %v, want ErrInvalid", err)
 		}
 	})
@@ -575,14 +575,14 @@ func TestBundleBlobSizesAndClaims(t *testing.T) {
 			t.Fatal(err)
 		}
 		var mb *ErrMissingBlobs
-		if _, _, err := st.CommitBundle(ctx, token, ""); !errors.As(err, &mb) || !slices.Equal(mb.Missing, []string{s}) {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); !errors.As(err, &mb) || !slices.Equal(mb.Missing, []string{s}) {
 			t.Fatalf("commit without sending it: %v, want it missing", err)
 		}
 		// Sending the bytes proves she has them.
 		if err := st.PutBundleBlob(ctx, token, s, strings.NewReader(secret)); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := st.CommitBundle(ctx, token, ""); err != nil {
+		if _, _, err := st.CommitBundle(ctx, token, "", true); err != nil {
 			t.Fatalf("commit after sending it: %v", err)
 		}
 

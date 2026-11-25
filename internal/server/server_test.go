@@ -62,10 +62,13 @@ func TestMe(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("me: %d %s", code, body)
 	}
-	var me map[string]string
+	var me struct {
+		Sub, Email string
+		Backends   struct{ Enabled, Available bool }
+	}
 	mustJSON(t, body, &me)
-	if me["sub"] != "alice@example.com" || me["email"] != "alice@example.com" {
-		t.Fatalf("me = %v", me)
+	if me.Sub != "alice@example.com" || me.Email != "alice@example.com" || me.Backends.Enabled || me.Backends.Available {
+		t.Fatalf("me = %+v", me)
 	}
 
 	if code, _ := call(t, ts, "", "GET", "/api/me", ""); code != http.StatusUnauthorized {
