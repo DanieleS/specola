@@ -3,33 +3,41 @@
 Status: design. Nothing here is implemented yet.
 
 A **page app** is one page installed on its own as a Progressive Web App: its
-own icon on the home screen or in the dock, its own window, its own name, and
-none of Specola's chrome around it. Any page can be installed, by anyone who
-can see it:
+own icon on the home screen or in the dock, its own window and name, and none
+of Specola's chrome around it. Any page can be installed, by anyone who can
+see it:
 
-- **signed-in**, from `/app/{id}/`, by anyone with at least `VIEWER` on it;
-- **public**, from `/app/s/{token}/`, by anyone holding a public link, with no
-  account (a dashboard shared with a client, a tool handed to a team).
+- **signed in**, from `/app/{id}/` on the app origin, by anyone with at least
+  `VIEWER` on it;
+- **public**, from the public link itself, `/s/{token}`, by anyone holding
+  it, with no account. The shareable URL doesn't change: every public link is
+  installable.
 
 The page's author (its editors) decides how the app looks: name, colors,
-display mode and icon. Without settings, everything has a sensible default.
+display mode and icon. Unset, everything has a default.
 
-This document is the contract between the server, the SPA and the service
-worker. Keep it in sync with the code.
+Public visitors get an **anonymous identity**, one per link and device, so a
+public page keeps its `localStorage` and, with a backend, its `userDb`,
+across loads, like a signed-in user's.
+
+This document is the contract between the server, the runner, the SPA, the
+public shell and the service workers. Keep it in sync with the code.
 
 ## Goals and non-goals
 
-- One installable app per page, distinct from Specola and from every other
-  page app, on the same origin as Specola.
-- Same security model as the viewer: the page runs in a sandboxed iframe on an
-  opaque origin, served from the view origin when there is one.
-- Same features as the viewer: page storage, bundles, offline.
-- Public links installable with no account, and an app stops working as soon
-  as its link is revoked or expires.
-- Author-controlled appearance, settable from the SPA and the MCP tools.
-- Non-goals (v1): push notifications, share targets, file handlers, shortcuts,
-  pinning a version for a signed-in app (public links can already pin one),
-  storage that survives reloads in public apps (see "Open questions").
+- One installable app per page (signed in) and per public link, distinct from
+  Specola and from each other.
+- Same security model as today: the page runs on an opaque origin in a
+  sandboxed iframe, served from the view origin when there is one.
+- **One shell per kind, no duplicates**: the viewer's port code (`pagedata.ts`)
+  for signed-in apps, the existing public shell (`publicshell.html`) for public
+  links. Public apps don't get a second shell.
+- **One data path, no duplicates**: anonymous visitors' `localStorage` lives in
+  `page_data` and their backend data in the runner's per-user databases, with
+  the same code and limits as signed-in users'.
+- Non-goals (v1): push notifications, share targets, shortcuts, pinning a
+  version in a signed-in app, a visitor's "download my data", moving a
+  visitor's data into an account.
 
 ## Browser facts this relies on
 
@@ -43,46 +51,33 @@ Verified in Chromium 158 (headless, `Page.getAppManifest` over CDP):
 | Same, with `crossorigin="use-credentials"` | fetched with cookies, parsed |
 | Manifests with `id`/`scope` `/app/x/` and `/app/y/` on an origin whose own manifest has scope `/` | each parsed with its own `id` and scope |
 
-Hence: a public link (`/s/{token}`) can't itself be the app, so a
-non-sandboxed shell on the app origin frames it, as the viewer already does.
-The signed-in manifest is linked with `crossorigin="use-credentials"`.
+Hence: the page itself can never be the app, a non-sandboxed shell around it
+is (the viewer, or the public shell); and the signed-in manifest is linked
+with `crossorigin="use-credentials"`.
 
-Known, to be checked by hand on real devices (headless can't install):
+To check by hand on real devices (headless can't install):
 
-- Chrome/Edge desktop and Android install apps with nested scopes separately,
-  and a navigation goes to the app with the most specific scope.
+- Chrome/Edge desktop and Android install nested-scope apps separately, and a
+  navigation goes to the app with the most specific scope.
 - iOS/iPadOS read the title and `apple-touch-icon` from the HTML at "Add to
-  Home Screen", not from the manifest, and give **each home screen app its own
-  cookies and storage**, apart from Safari and from each other.
+  Home Screen", and give **each home screen app its own cookies and
+  storage**: a separate sign-in per signed-in app, a separate visitor per
+  public app.
 
-## URLs
+## Signed-in apps
 
-All on the **app origin** (`SPECOLA_BASE_URL`), never on the view origin: the
-app needs the service worker and, when signed in, the session.
+On the **app origin** only (session and service worker live there).
 
 | URL | Auth | What |
 | --- | --- | --- |
-| `GET /app/{id}/` | session | The app shell for page `{id}`. No session: `302` to `/auth/login?next=/app/{id}/`. |
-| `GET /app/{id}/manifest.webmanifest` | session | Its manifest. `404` without access, as everywhere. |
-| `GET /app/s/{token}/` | the token | The app shell for a public link. |
-| `GET /app/s/{token}/manifest.webmanifest` | the token | Its manifest. |
-| `GET /app/s/{token}/info` | the token | JSON the public shell needs (below). |
-| `GET /app-icons/{sha256}.png` | none | An uploaded icon. The hash is the capability, as a bundle key is. |
-| `GET /app-icons/g/{rrggbb}/{letter}/{size}.png` | none | A generated icon (below). Reveals nothing that isn't in its URL. |
-| `GET/PUT/DELETE /api/pages/{id}/app` | session, editor to change | The page's app settings. |
-| `PUT /api/pages/{id}/app/icon` | session, editor | Upload the icon (raw PNG body). |
+| `GET /app/{id}/` | session | The shell. No session: `302` to `/auth/login?next=/app/{id}/`. |
+| `GET /app/{id}/manifest.webmanifest` | session | Its manifest; `404` without access. |
 
-Any other path under `/app/` answers `404`, not the SPA shell. `{id}` is a
-UUID, so `/app/s/...` never collides with it.
+Any other path under `/app/` answers `404`. Both are `Cache-Control:
+no-cache`.
 
-Shell responses (`/app/...` HTML, manifests, `info`) are `Cache-Control:
-no-cache`. Public ones add `Referrer-Policy: no-referrer` and `X-Robots-Tag:
-noindex, nofollow`, as `/s/{token}` does. Icons are `immutable` for a year.
-
-### The shell
-
-`/app/{id}/` and `/app/s/{token}/` serve the SPA's `index.html` with its
-`<head>` rewritten:
+`/app/{id}/` is the SPA's `index.html` with its head rewritten: Specola's
+manifest link and title replaced by
 
 ```html
 <link rel="manifest" href="/app/{id}/manifest.webmanifest" crossorigin="use-credentials">
@@ -90,16 +85,44 @@ noindex, nofollow`, as `/s/{token}` does. Icons are `immutable` for a year.
 <meta name="theme-color" content="{theme_color}">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="{short_name}">
-<link rel="apple-touch-icon" href="{icon 512}">
+<link rel="apple-touch-icon" href="{icon}">
 ```
 
-(The public shell links its manifest without `crossorigin`: the token is the
-credential, so cookies aren't needed.) Specola's own manifest link and title
-are removed. Nothing else is injected: the SPA reads the page id or token from
-`location.pathname`, so a cached shell for one app also works offline for
-another.
+Nothing else is injected: the SPA reads the id from `location.pathname`, so a
+cached shell works offline for any app.
 
-### The manifest
+`/auth/login` takes `next`: a local path (starts with `/`, not `//` or `/\`,
+no scheme), kept in the state cookie; the callback redirects there instead of
+`/`, anything else is ignored.
+
+## Public apps
+
+The public shell (`publicshell.html`, docs/page-backends.md, "Public links")
+becomes the shell of **every** public link, with or without a backend:
+
+- `/s/{token}` and `/s/{token}/*` serve the shell; it frames
+  `/s/{token}/~page/…`, which serves the page as `/s/{token}` does today
+  (basename `/s/{token}/~page`). `~page` stops answering 404 for pages
+  without a backend. A page without a backend gets the port too (storage),
+  with `backend.available = false`.
+- Its head gains the same tags as a signed-in shell, with the manifest at
+  `/s/{token}/manifest.webmanifest` (no `crossorigin`: the token is the
+  credential), and its `<title>` becomes the app's name.
+- Its CSP gains `manifest-src 'self'; img-src 'self'; worker-src 'self'`.
+- It registers the public service worker (below).
+- It hands the page its data (see "Anonymous visitors") instead of answering
+  "a public link keeps localStorage in memory only".
+
+Served on the same origin as today (the view origin when there is one), so
+`/s/`, `/p/` and the shell stay together and need no CORS. Responses keep
+`no-store`, `no-referrer` and `noindex`.
+
+| URL | What |
+| --- | --- |
+| `GET /s/{token}/manifest.webmanifest` | The manifest; `404`/`410` as the link. Doesn't count as a view. |
+| `GET /public-sw.js` | The public service worker, scope `/s/`. `no-cache`. |
+
+## Manifest
 
 ```json
 {
@@ -119,39 +142,36 @@ another.
 }
 ```
 
-The public form uses `/app/s/{token}/` for `id`, `start_url` and `scope`. `id`
-never changes for a page, so renaming it or changing its settings updates the
-installed app rather than making a new one. A public link is a different app
-from the page's signed-in app, and from every other link to the same page.
-
-The `maskable` entry is listed only when the icon is maskable (generated icons
-are; an uploaded icon is when its author says so).
+Public: `id` and `start_url` are `/s/{token}/`, `scope` is `/s/{token}`.
+`id` never changes, so renaming or restyling updates the installed app rather
+than making a new one. Each public link is its own app. The `maskable` entry
+is listed only when the icon is maskable.
 
 ### Defaults
 
-Every field the author leaves unset is derived:
-
 | Field | Default |
 | --- | --- |
-| `name` | The page's title. |
+| `name` | The page's name. |
 | `short_name` | `name`, cut at 12 characters on a word boundary. |
 | `display` | `standalone` |
 | `orientation` | left out (`any`) |
-| `theme_color` | `<meta name="theme-color">` of the current version (the version the link shows, for public apps), else Specola's `#0b0d12`. |
+| `theme_color` | `<meta name="theme-color">` of the version shown, else `#0b0d12`. |
 | `background_color` | `theme_color` |
-| icon | Generated: the first letter of `name` in white on a color picked from the page id, so two apps on one device are told apart. |
+| icon | Generated: the first letter of `name` in white on a color picked from the page id (maskable). |
 
-### Generated icons
+### Icons
 
-`/app-icons/g/{rrggbb}/{letter}/{size}.png`: `{letter}` is one Unicode letter or
-digit (URL-escaped), `{size}` is `192` or `512`, the color is one of a fixed
-palette of 12 (other values `404`). Drawn in Go with the standard library and a
-small embedded font, square, with the letter inside the maskable safe zone (the
-central 80%). Memoised in memory: at most 12 × 2 per letter in use.
+Served on both origins, no auth, `immutable`:
 
-## Data
+- `/app-icons/{sha256}.png`: an uploaded icon; the hash is the capability.
+- `/app-icons/g/{rrggbb}/{letter}/{size}.png`: generated, `{size}` 192 or
+  512, the color one of a fixed palette of 12 (others `404`). Drawn in Go with
+  the standard library and an embedded font, letter inside the maskable safe
+  zone, memoised.
 
-Migration `0012_page_app.sql`:
+## Author settings
+
+Migration `0016_page_app.sql`:
 
 ```sql
 CREATE TABLE page_app (
@@ -169,173 +189,203 @@ CREATE TABLE page_app (
 );
 ```
 
-- One row per page, not per version: an installed app doesn't change name each
-  time a version is published. `NULL` means "use the default".
-- The icon is stored in `bundle_blob`, deduplicated like bundle files. The
-  sweep of unused blobs counts `page_app.icon_sha256` as a use.
-- Archiving a page leaves its row; deleting it removes it.
+Per page, not per version. `NULL` means the default. Icons live in
+`bundle_blob`; the blob sweep counts `page_app.icon_sha256` as a use.
 
-## API
+| API | Who | What |
+| --- | --- | --- |
+| `GET /api/pages/{id}/app` | viewer | `{settings, effective, url}` |
+| `PUT /api/pages/{id}/app` | editor | Any of `name`, `shortName`, `display`, `orientation`, `themeColor`, `backgroundColor`, `iconMaskable`; `null` resets one. `400` when invalid. |
+| `DELETE /api/pages/{id}/app` | editor | Reset everything. |
+| `PUT /api/pages/{id}/app/icon` | editor | PNG body, ≤ 1 MiB, square, ≥ 512×512, decoded server-side. |
+| `DELETE /api/pages/{id}/app/icon` | editor | Back to the generated icon. |
 
-`GET /api/pages/{id}/app` (viewer): the settings as stored, the values in
-effect (defaults filled in) and the app's URL:
+`GET /api/pages/{id}` gains `appUrl`.
 
-```json
-{
-  "settings": { "name": null, "themeColor": "#1e40af", "display": null, "iconMaskable": false, "icon": null },
-  "effective": { "name": "Budget 2027", "shortName": "Budget 2027", "display": "standalone",
-                 "themeColor": "#1e40af", "backgroundColor": "#1e40af",
-                 "icon": "/app-icons/g/1e40af/B/512.png", "iconMaskable": true },
-  "url": "/app/{id}/"
-}
+## Anonymous visitors
+
+### Identity
+
+- A **visitor** is created on a public link's first write: the first
+  `PATCH /p/{token}/data` or the first backend call
+  (`/p/{token}/x/…`). Reading creates nothing, so plain views and crawlers
+  leave no trace.
+- Its secret is 32 random bytes in a cookie `specola_v`: `HttpOnly`,
+  `Secure`, `SameSite=Strict`, `Path=/p/{token}/`, a year, renewed on use.
+  Only its sha256 is stored. The cookie is per link: two links, two
+  visitors, even on one device.
+- Requests carrying it must come from the shell: `/p/` refuses an `Origin`
+  other than its own (a sandboxed page's `null` included).
+
+```sql
+-- 0017_public_visitors.sql
+CREATE TABLE public_visitor (
+  link_id      uuid NOT NULL REFERENCES public_link(id) ON DELETE CASCADE,
+  visitor_hash text NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (link_id, visitor_hash)
+);
+
+ALTER TABLE page_data
+  ADD COLUMN link_id uuid,
+  ADD COLUMN visitor_hash text,
+  ADD CONSTRAINT page_data_visitor_ck CHECK (
+    (link_id IS NULL AND visitor_hash IS NULL AND user_sub NOT LIKE 'anon:%') OR
+    (link_id IS NOT NULL AND visitor_hash IS NOT NULL AND user_sub = 'anon:' || visitor_hash)),
+  ADD CONSTRAINT page_data_visitor_fk FOREIGN KEY (link_id, visitor_hash)
+    REFERENCES public_visitor (link_id, visitor_hash) ON DELETE CASCADE;
+
+CREATE INDEX page_data_link_idx ON page_data (link_id) WHERE link_id IS NOT NULL;
 ```
 
-`PUT /api/pages/{id}/app` (editor): any of `name`, `shortName`, `display`,
-`orientation`, `themeColor`, `backgroundColor`, `iconMaskable`; `null` resets a
-field to its default. Invalid values answer `400`.
+A visitor's subject is `anon:{visitor_hash}`: it can never collide with an
+OIDC `sub`, and it is what the existing data code keys on. `page_data` keeps
+one row shape and one code path; `link_id`/`visitor_hash` only tie the row to
+its visitor so revocation and cleanup cascade. A row's `asset_id` is the
+link's page.
 
-`PUT /api/pages/{id}/app/icon` (editor): a PNG body, at most 1 MiB, square, at
-least 512×512 (larger is fine: the browser scales). Anything else answers
-`400` naming the problem. Its stored copy is the uploaded bytes, unchanged.
-`DELETE /api/pages/{id}/app/icon` goes back to the generated icon.
-`DELETE /api/pages/{id}/app` resets everything.
+Anything that reads `page_data` "per user" (export, cleanup on unshare,
+statistics) must filter `link_id IS NULL`; a store test checks that visitors'
+rows never appear in a signed-in user's reads.
 
-`GET /app/s/{token}/info` (public): what the public shell needs to show and
-keep the page:
+### `localStorage`
 
-```json
-{ "title": "Budget 2027", "version": 7, "bundle": false, "url": "https://view.example.com/s/{token}" }
-```
+`GET/PATCH/DELETE /p/{token}/data`: same bodies and answers as
+`/api/pages/{id}/data`. `store.PageData`/`UpdatePageData` split into a shared
+core on an authorised `(asset, sub)` (lock, quota, upsert, unchanged) and two
+entries: today's, which checks access with `checkPage`, and the public one,
+which checks the link as serving it does (exists, not expired, creator still
+owner) and resolves the visitor.
 
-`404` when the link doesn't exist or has been revoked, `410` when it has
-expired, exactly as `/s/{token}`. Neither `info` nor the manifest counts as a
-view; loading the page in the frame does.
+The public shell uses the same protocol as the viewer: data loaded before
+the page and passed in the frame's `name`, writes batched and retried,
+unsaved writes kept in the shell's own `localStorage` (the shell is on a real
+origin). `window.specola.persistent` is `true`.
 
-Page metadata (`GET /api/pages/{id}`) gains `appUrl`.
+### Backend
 
-### Changes to public links
+The runner head of a public call gains `visitor: {"id": "<visitor_hash>"}`
+when the caller has one. In the handler:
 
-So the public shell can frame and keep them, `/s/{token}` responses (on
-whichever origin serves them) change:
+- `ctx.user` stays `null` and `ctx.role` stays `"public"`: being anonymous
+  doesn't change.
+- `ctx.visitor` is `{ id }`, stable per link and device, or `null` (no
+  visitor yet, or over the cap).
+- `ctx.userDb` is the visitor's own database, kept as a user's is, under the
+  subject `anon:{visitor_hash}`. `null` when `ctx.visitor` is.
 
-- `frame-ancestors` goes from `'none'` to the app origin (`'self'` without a
-  view origin). Only Specola's own shell can frame a public page.
-- `Access-Control-Allow-Origin: {app origin}`, as `/view/{id}` already sends on
-  the view origin, so the shell can fetch the HTML for offline.
-- A link's URL is still only given when it is created. The dialog then shows
-  both the page URL (`/s/{token}`) and the app URL (`/app/s/{token}/`), and
-  `create_public_link` returns both (`url`, `appUrl`).
+So "Reset every user's data" covers visitors, and cleanup uses the runner's
+existing "Delete my data" path for that subject.
 
-## Login
+docs/page-backends.md, "Handler contract" and "Public links", are updated to
+match (`userDb` is no longer always `null` for `role: "public"`).
 
-`/auth/login` takes `next`: a path on the app origin (starts with `/`, not
-`//`, no scheme), kept in the state cookie. The callback redirects there
-instead of `/`. Anything else is ignored. This also lets a signed-out visit to
-any deep link come back to it.
+### Limits and cleanup
+
+| Limit | Default |
+| --- | --- |
+| Visitors per link | 1000 (`SPECOLA_PUBLIC_VISITORS_PER_LINK`) |
+| New visitors per link and client IP | 10 a minute |
+| `localStorage` per visitor | as a user's: 1000 keys, 1 MB |
+| `userDb` per visitor | 16 MiB (SQLite `max_page_count`), within the page's disk quota |
+
+Past a cap, no visitor is created: storage works in memory and `ctx.visitor`
+and `userDb` are `null`, as public links behave today; the shell shows
+nothing, `specola.persistent` tells the page.
+
+A visitor is deleted, with its `page_data` (cascade) and its `userDb`
+(runner), when its link is revoked, and when unused for 90 days
+(`last_seen_at`, swept with the bundle blobs). The links dialog shows, per
+link, how many visitors keep data and how much; never the data.
+
+## Offline
+
+- **App origin**: `/sw.js` treats navigations under `/app/` network-first,
+  keeping each in a `specola-apps` cache under its URL; offline it serves
+  that copy, else the Specola shell. `/app-icons/` is cache-first. A
+  signed-in app running installed (`display-mode` not `browser`, or on
+  `appinstalled`) pins its page in the existing offline store and syncs it on
+  each start online; a `404` drops it. Logout wipes it, as today.
+- **View origin**: `/public-sw.js` (scope `/s/`) keeps the shell and the
+  page (`~page` and, for bundles, its files) of each link it serves, network
+  first; `404`/`410` deletes that link's copies. It never handles `/p/`,
+  `/view/` or `/b/` requests from pages, and the pages, being opaque, are
+  never its clients. Visitor data waits in the shell as described above.
+- **Pages with a backend**: calls need the network. Offline,
+  `specola.backend.available` is `false` and `specola.fetch` rejects with
+  `BackendUnavailable` (`reason: "offline"`); **the page decides what to
+  show**. Specola queues nothing. Page authors are told so in the plugin
+  README and the MCP description.
+- A newer version while an app is open uses the reload notice both shells
+  already have; an app never reloads by itself.
 
 ## SPA
 
-- `main.ts` picks the root component from the path: `/app/s/{token}/` →
-  `PublicAppShell`, `/app/{id}/` → `AppShell`, anything else → `App`.
-- The iframe, view token, page storage and offline fallback move out of
-  `PageViewer` into a `PageFrame` component. `PageViewer` keeps the toolbar,
-  history, sharing and the rest, and uses `PageFrame`. Both shells are a
-  full-viewport `PageFrame` and an install banner, nothing else.
-- **Install banner**: on `beforeinstallprompt`, an "Install" button that calls
-  `prompt()`. On iOS/iPadOS Safari, a short "Share → Add to Home Screen" hint
-  instead. Hidden when `display-mode` is `standalone`, `fullscreen` or
-  `minimal-ui`, and once dismissed (remembered in `localStorage`).
-- **Viewer**: "Install as app" in the ⋯ menu opens `/app/{id}/` in a new tab
-  (`beforeinstallprompt` only fires on the page that links the manifest).
-- **App settings** dialog for editors (⋯ → "App"): fields above, icon upload
-  with a preview of the icon both plain and masked, and a preview of the
-  theme color. Viewers see "Install as app" only.
-- Errors in a shell are full-screen and plain: "You don't have access to this
-  page" (with a sign-in button when signed out), "This link has been revoked",
-  "This link has expired".
-
-## Offline and the service worker
-
-`/sw.js` (scope `/`) stays the only service worker. It serves page apps too:
-
-- Navigations under `/app/` are network-first. Each response is kept in a
-  `specola-apps` cache under its URL. Offline, the cached copy of that URL is
-  served, else the cached Specola shell (the SPA reads the id or token from the
-  path, so it still works, only without the app's head). `/app-icons/` is
-  cache-first.
-- **Signed-in apps** use the offline store that exists today
-  (`offline.svelte.ts`). When a shell runs as an installed app (`display-mode`
-  not `browser`), or on `appinstalled`, it **pins** its page. On each start
-  online it brings that page up to its current version, as Specola does for
-  every pinned page. A `404` drops it and shows the access error. Logout and
-  signing in as someone else wipe it, as today.
-- **Public apps** keep their page in a separate store, keyed by the sha256 of
-  the token, holding only that page (the version `info` reports, and its
-  bundle files). It isn't tied to a user, so logout and `claim(sub)` leave it
-  alone. A `404` or `410` from `info` deletes it and shows the error. Offline,
-  the page is shown from a `blob:` URL in the same sandboxed iframe, as in the
-  viewer.
-- When a newer version arrives while an app is open, a small "Updated to
-  version N — reload" toast; the app never reloads on its own.
+- `main.ts`: `/app/{id}/` → `AppShell`, anything else → `App`.
+- The frame, view token, port (storage, `specola.fetch`, events, reload
+  notice) and offline fallback move from `PageViewer` into `PageFrame`.
+  `PageViewer` keeps its toolbar and panels around it; `AppShell` is a
+  full-viewport `PageFrame` and the install banner.
+- **Install banner** (both shells): `beforeinstallprompt` → "Install"; iOS
+  Safari → "Share → Add to Home Screen"; hidden in standalone and once
+  dismissed.
+- Viewer ⋯: "Install as app" (opens `/app/{id}/`), and "App…" for editors:
+  the settings with an icon preview, plain and masked.
+- Links dialog: "Install" hint next to each new URL, visitor counts per link.
 
 ## MCP
 
-- `set_page_app` (editor): the fields of `PUT /api/pages/{id}/app`, and `icon`
-  as base64 PNG (at most 1 MiB decoded, same checks). Returns `effective` and
-  `url`.
-- `get_page` and the publishing tools return `appUrl`.
-- `create_public_link` returns `appUrl` next to `url`.
+- `set_page_app` (editor): the settings, and `icon` as base64 PNG (same
+  checks). Returns `effective` and `url`.
+- `get_page` and the publishing tools return `appUrl`; `create_public_link`
+  says the link is installable.
+- The backend description mentions `ctx.visitor` and offline handling.
 
 ## Security notes
 
-- The page still runs on an opaque origin in a sandboxed iframe: installing it
-  gives its scripts nothing they didn't have in the viewer. The shell's HTML
-  comes from Specola, never from the page.
-- Signed-in manifests and shells need the session and answer `404` without
-  access, so a page id reveals nothing. Public ones need the token, which is
-  already the credential for the page; the manifest exposes only the title and
-  theme color, which the page itself shows.
-- The token of an installed public app is kept on the device (manifest `id`,
-  `start_url`, the shell cache), as a bookmark would be. Revoking the link
-  ends the app at its next online start.
-- Uploaded icons are served by content hash only, as `image/png` with
-  `nosniff`, after decoding them as PNG server-side.
-- `next` on login is restricted to local paths: no open redirect.
+- Pages still run on an opaque origin; installing gives their scripts
+  nothing new. Shells come from Specola, never from the page.
+- Signed-in shells and manifests need the session and answer `404` without
+  access. Public ones need the token, already the page's credential; the
+  manifest shows only the name and theme color.
+- A visitor cookie is `HttpOnly`, per link path, and only accepted from the
+  shell's origin: a page (any page, on the shared view origin) can't use or
+  read another visitor's identity. It authorises nothing but that visitor's
+  own data on that link.
+- Visitor caps and per-IP creation limits bound what an anonymous caller can
+  store; the page's disk quota still bounds the runner.
+- An installed public app keeps its token on the device, as a bookmark does.
+  Revoking the link ends it, and deletes its visitors' data.
+- Uploaded icons are served by hash, `image/png`, `nosniff`, after decoding.
+- `next` on login is local paths only.
 
 ## Tests
 
-- Go: shell head rewriting (manifest link and `crossorigin`, title,
-  `apple-touch-icon`); manifests' fields and defaults (title, theme color
-  from the version, generated icon); `404` without access, signed-out redirect
-  with `next`; public `404`/`410`; `info` and the manifest don't count views;
-  `/s/{token}` `frame-ancestors` and CORS on both origin setups; settings
-  validation and editor-only changes; icon checks; the blob sweep keeps icons;
-  `next` rejects `//host`, `https://host`, `\host`; MCP `set_page_app`.
-- e2e (Playwright, `e2e/page-apps.mjs`): `Page.getAppManifest` parses each
-  app's manifest with its `id` and scope, signed-in and public; the public
-  shell shows a page from the view origin; an installed-mode signed-in app and
-  a public app reload offline and show their page; a revoked link shows the
-  error and drops the kept copy.
-- By hand, on real devices: install from Chrome desktop and Android next to
-  Specola itself, from iOS Safari (separate sign-in per app), rename and
-  restyle and see the installed app update.
+- Go: signed-in shell head, manifest fields and defaults, `404` and the
+  signed-out redirect; `next` rejects `//h`, `/\h`, `https://h`; public shell
+  for a page without a backend (`~page`, port, storage), its CSP and
+  manifest, `404`/`410`, no view counted; settings validation, editor-only,
+  icon checks, blob sweep keeps icons; visitors: created on first write only,
+  cookie attributes, `Origin` check, caps and rate limit, revoke and 90-day
+  cleanup cascade, visitor rows never in a user's reads; the runner head
+  carries `visitor`; MCP `set_page_app`.
+- Runner: `ctx.visitor`, a visitor's `userDb`, its size cap, deletion.
+- e2e (`e2e/page-apps.mjs`): each manifest parses with its `id` and scope;
+  a public page keeps `localStorage` across reloads and a backend page its
+  `userDb`, per visitor (two browser contexts); offline reload of a signed-in
+  and a public app; revoking a link shows the error and drops kept copies.
+- By hand: install on Chrome desktop and Android next to Specola, on iOS
+  Safari; rename and restyle and see the installed app update.
 
 ## Order of work
 
-1. `next` on login; routes, shells and manifests with defaults; generated
-   icons; `PageFrame`; both shells with the install banner; service worker and
-   offline for both; public link `frame-ancestors`/CORS and `appUrl`.
-2. `page_app` with the API, icon upload and the blob sweep; the "App" dialog;
-   `set_page_app` and `appUrl` in MCP.
-3. README ("Page apps", the iOS caveat) and this document's status.
-
-## Open questions
-
-- **Storage in public apps.** Public pages keep `localStorage` in memory only,
-  so an installed public tool forgets everything when closed. Keeping it on
-  the device (IndexedDB on the app origin, handed to the page SDK as signed-in
-  pages' data is) would make public apps far more useful; it needs a decision
-  on whether that's wanted, and is left out of v1.
-- **Opting out.** Every page and every public link is installable. A per-page
-  switch could be added later if an author needs to prevent it, though anyone
-  who can see a page can already bookmark it.
+1. `next` on login; `/app/{id}/`, manifests with defaults, generated icons;
+   `PageFrame` and `AppShell`; app-origin service worker.
+2. Public shell for every link: `~page`, manifest, install banner,
+   `public-sw.js`.
+3. Visitors: tables, `/p/{token}/data`, the shell's storage, `ctx.visitor`
+   and `userDb` in the runner, limits and cleanup.
+4. `page_app`: API, icon upload, "App…" dialog, MCP.
+5. README ("Page apps", the iOS caveat, offline with a backend), the backend
+   doc's public-link section, this document's status.
