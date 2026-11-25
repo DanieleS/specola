@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, type BundleUpload } from "./api";
+  import { backends } from "./backends.svelte";
 
   let { folderId = null }: { folderId?: string | null } = $props();
 
@@ -94,6 +95,18 @@
           >{uploading ? "Getting a link…" : "Get the commands"}</button
         >
       </p>
+      {#if backends.known && !backends.enabled}
+        <p class="mt-2" data-backends-off>
+          Page backends are not enabled on this instance: bundles are static, and a project with <code class="text-white/70"
+            >server/</code
+          > code can't be published.
+        </p>
+      {:else if backends.known && !backends.available}
+        <p class="mt-2" data-backends-off>
+          The backend runner can't be reached right now: an app with a backend still publishes, but its calls fail until the
+          runner is back.
+        </p>
+      {/if}
       {#if shownUpload}
         <p class="mt-2">In the project, once:</p>
         {@render command(shownUpload.pluginInstall)}

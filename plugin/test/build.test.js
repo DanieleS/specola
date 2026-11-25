@@ -147,7 +147,9 @@ test('the dev server provides a stand-in window.specola', async () => {
   try {
     const html = await server.transformIndexHtml('/index.html', readFileSync(join(fixture, 'index.html'), 'utf8'));
     const head = html.slice(0, html.indexOf('</head>'));
-    assert.match(head, /if \(typeof window\.specola === "undefined"\) \{ window\.specola = \{ base: "\/", basename: "", persistent: false, flush: async \(\) => \{\} \}; \}/);
+    assert.match(head, /if \(typeof window\.specola === "undefined"\) \{/);
+    assert.match(head, /window\.specola = \{ base: "\/", basename: "", persistent: false, flush: async \(\) => \{\}, backend,/);
+    assert.match(head, /const backend = Object\.freeze\(\{ enabled: false, available: false \}\)/, 'no server option: no backend');
     assert.ok(html.indexOf('window.specola') < html.indexOf('main.js'), 'before the app script');
     assert.doesNotMatch(html, /__SPECOLA_BASE__|specola-vite-plugin\//, 'no build-time rewriting in dev');
   } finally {

@@ -45,3 +45,45 @@ func TestViewOrigin(t *testing.T) {
 		})
 	}
 }
+
+func TestBackends(t *testing.T) {
+	key := "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" // 32 bytes
+	for name, tc := range map[string]struct {
+		url, token, secrets string
+		wantErr             string
+		enabled             bool
+	}{
+		"none":        {},
+		"all":         {url: "http://runner:8090/", token: "t", secrets: key, enabled: true},
+		"url only":    {url: "http://runner:8090", wantErr: "missing: SPECOLA_RUNNER_TOKEN, SPECOLA_SECRETS_KEY"},
+		"no key":      {url: "http://runner:8090", token: "t", wantErr: "missing: SPECOLA_SECRETS_KEY"},
+		"no url":      {token: "t", secrets: key, wantErr: "missing: SPECOLA_RUNNER_URL"},
+		"short key":   {url: "http://runner", token: "t", secrets: "c2hvcnQ=", wantErr: "32 bytes"},
+		"bad url":     {url: "runner:8090", token: "t", secrets: key, wantErr: "SPECOLA_RUNNER_URL"},
+		"not base64!": {url: "http://runner", token: "t", secrets: "!!!", wantErr: "32 bytes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("SPECOLA_DATABASE_URL", "postgres://x")
+			t.Setenv("SPECOLA_DEV_AUTH_EMAIL", "dev@example.com")
+			t.Setenv("SPECOLA_RUNNER_URL", tc.url)
+			t.Setenv("SPECOLA_RUNNER_TOKEN", tc.token)
+			t.Setenv("SPECOLA_SECRETS_KEY", tc.secrets)
+			c, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.BackendsEnabled() != tc.enabled {
+				t.Fatalf("enabled = %v", c.BackendsEnabled())
+			}
+			if tc.enabled && (c.RunnerURL != "http://runner:8090" || c.RunnerToken != "t" || len(c.SecretsKey) != 32) {
+				t.Fatalf("config = %+v", c)
+			}
+		})
+	}
+}

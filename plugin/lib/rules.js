@@ -3,6 +3,8 @@
 // ("Paths in a bundle", "Limits") so a bad bundle fails on the author's
 // machine with a precise message instead of as a 400 halfway through an upload.
 
+import { BACKEND_PREFIX, MANIFEST_PATH, MAX_MANIFEST_BYTES } from './manifest.js';
+
 const MiB = 1024 * 1024;
 
 /** The server's limits. A grant reports the authoritative values; these are
@@ -54,7 +56,8 @@ const JUNK_DIRS = new Set(['__MACOSX', '.git']);
 /**
  * Reports whether path is OS or VCS junk that must not be uploaded. The
  * server does not know about junk (it only validates paths), so the plugin
- * and the CLI drop it.
+ * and the CLI drop it. Only these names are junk, not every dot-file: the
+ * page backend travels under .specola/ (docs/page-backends.md).
  */
 export function isJunk(path) {
   const segs = path.split('/');
@@ -71,7 +74,14 @@ export function bundleProblems(files, limits = DEFAULT_LIMITS) {
   const seen = new Set();
   let total = 0;
   let hasIndex = false;
+  let hasManifest = false;
+  let hasBackendFiles = false;
   for (const { path, size } of files) {
+    if (path.startsWith(BACKEND_PREFIX)) hasBackendFiles = true;
+    if (path === MANIFEST_PATH) {
+      hasManifest = true;
+      if (size > MAX_MANIFEST_BYTES) problems.push(`${MANIFEST_PATH} can be at most ${MAX_MANIFEST_BYTES} bytes`);
+    }
     const why = pathProblem(path);
     if (why) problems.push(`${JSON.stringify(path)}: ${why}`);
     if (seen.has(path)) problems.push(`${JSON.stringify(path)}: duplicate path`);
@@ -87,6 +97,7 @@ export function bundleProblems(files, limits = DEFAULT_LIMITS) {
     }
   }
   if (!hasIndex) problems.push('index.html is missing at the root of the bundle');
+  if (hasBackendFiles && !hasManifest) problems.push(`files under ${BACKEND_PREFIX} need a ${MANIFEST_PATH} describing the backend`);
   if (files.length > limits.maxFiles) {
     problems.push(`the bundle has ${files.length} files (max ${limits.maxFiles}, index.html included)`);
   }

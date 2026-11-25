@@ -38,10 +38,12 @@ var (
 // bootData tells the SDK where the page is served (docs/spa-bundles.md, "Page
 // SDK additions"): Base is the bundle's file URL ending in "/" ("" for a plain
 // page) and Basename the path prefix the page is served under, for an app's
-// client-side router.
+// client-side router. Backend: the page has a backend it can call
+// (docs/page-backends.md, "Boot data").
 type bootData struct {
 	Base     string `json:"base"`
 	Basename string `json:"basename"`
+	Backend  bool   `json:"backend"`
 }
 
 // sdkTag is the SDK's script element with boot passed in. json.Marshal

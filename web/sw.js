@@ -5,7 +5,8 @@
 //   the cached copy as the offline fallback for every SPA navigation.
 // - /assets/ files carry a content hash: cache-first.
 // - GET /api reads are network-first and kept for offline use; a copy served
-//   from the cache is marked with OFFLINE_HEADER so the app can tell.
+//   from the cache is marked with OFFLINE_HEADER so the app can tell. Backend
+//   calls (/api/pages/{id}/x/…) and logs are left alone.
 // - Rendered pages (/view, and public links at /s) are left alone: the app stores the pages it keeps
 //   for offline itself (src/lib/offline.svelte.ts), since they may come from
 //   another origin and are shown in a sandboxed frame. So are bundle files
@@ -18,6 +19,10 @@ const OFFLINE_HEADER = "X-Specola-Offline";
 
 // Reads that make no sense from a stale copy.
 const NO_CACHE_API = ["/api/search"];
+// A page's backend calls and log are live answers, often streamed: never
+// kept, nor even passed through here (which would tee the stream into the
+// cache and hand a stale copy to a page offline).
+const LIVE_API = /^\/api\/pages\/[^/]+\/(x|backend)(\/|$)/;
 
 self.addEventListener("install", (e) => {
   e.waitUntil(
@@ -45,6 +50,7 @@ self.addEventListener("fetch", (e) => {
   const p = url.pathname;
 
   if (p.startsWith("/api/")) {
+    if (LIVE_API.test(p)) return;
     if (!NO_CACHE_API.some((n) => p.startsWith(n))) e.respondWith(apiRead(req));
     return;
   }

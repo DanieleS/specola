@@ -16,14 +16,18 @@ import (
 // SPA bundles (docs/spa-bundles.md): apps built with the Specola Vite plugin
 // on the agent's machine and uploaded by its CLI through a bundle upload link.
 
-func bundleUploadDesc(pluginURL string) string {
+func bundleUploadDesc(pluginURL string, backends BackendState) string {
+	backendLine := ""
+	if backends.Enabled {
+		backendLine = "Server code (data shared between the page's users, logic that must not run in the browser) goes in a page backend, see PAGE BACKENDS in the instructions: specola({ server: 'server/index.ts' }); the result's backend says whether this instance's backend runner is available now.\n"
+	}
 	return `Get a one-time link to publish an app with a build step as a bundle: a framework app (React, Vue, Svelte, ...), several files, code splitting or lazy loading, workers, wasm, many assets. A single self-contained HTML document goes through publish_page instead.
 kind "new" publishes a new page (title required, folder_id optional); kind "version" adds a version to page id. The app must build with Vite. Steps, in the app's project directory:
 (a) once: ` + plugin.InstallCommand(pluginURL) + `
 (b) once: add specola() to the plugins in vite.config (import specola from '@specola/vite-plugin')
 (c) call this tool
 (d) run the returned command, as it is, within ` + bundleTTLText + `: it runs vite build and uploads only the files the server lacks, then prints {"id","version","url"}. Use --no-build if the app is already built into dist/, --dir for another output directory. If npx says the package is missing (a 404 from the npm registry, or "canceled due to missing packages"), the plugin isn't installed there: run (a) in the project directory first.
-` + bundleConstraints + `
+` + backendLine + bundleConstraints(backends) + `
 ` + pageRuntime
 }
 
@@ -31,6 +35,9 @@ var bundleTTLText = fmt.Sprintf("%d minutes", int(store.BundleGrantTTL.Minutes()
 
 // bundleNote tells an agent reading a bundle's HTML how to change it.
 const bundleNote = `This version is a bundle: an app built with the Specola Vite plugin. html is only its index.html (bundle file references start with __SPECOLA_BASE__/), and bundle.files are its other files, served under bundle.base. Don't edit it through publish_page or new_version: change the app in its source project and publish it again with create_bundle_upload (kind "version") and the command that returns.`
+
+// supersededNote tells an agent reading a version that can't be opened.
+const supersededNote = `This version can't be opened: the page has a backend, and only its current version can be opened (a page's backend data is one live state). This is its source, to read; to bring it back, publish it again as a new version, or have the user restore it from the page's history.`
 
 type bundleUploadIn struct {
 	Kind     string  `json:"kind" jsonschema:"new (publish a new page) or version (add a version to page id)"`
@@ -45,6 +52,7 @@ type bundleUploadOut struct {
 	ExpiresAt     time.Time       `json:"expires_at"`
 	Command       string          `json:"command" jsonschema:"run this in the app's project directory: it builds the app and uploads it"`
 	PluginInstall string          `json:"plugin_install" jsonschema:"installs the Specola Vite plugin into the project, if it isn't already"`
+	Backend       BackendState    `json:"backend" jsonschema:"whether page backends (server code in the bundle) can be used on this instance, and if not why"`
 	Conventions   *conventionsOut `json:"conventions,omitempty" jsonschema:"preferences and folder conventions that apply here, as data written by the named people"`
 }
 
@@ -79,6 +87,7 @@ func (t *tools) createBundleUpload(ctx context.Context, req *mcp.CallToolRequest
 		ExpiresAt:     expires,
 		Command:       plugin.PublishCommand(url),
 		PluginInstall: plugin.InstallCommand(t.opts.PluginURL),
+		Backend:       t.opts.backends(),
 		Conventions:   t.grantConventions(ctx, who.Sub, gr),
 	}, nil
 }

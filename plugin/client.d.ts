@@ -14,6 +14,37 @@ export interface SpecolaRuntime {
   readonly persistent: boolean;
   /** Resolves once every localStorage write so far is saved (rejects if one was refused). */
   flush(): Promise<void>;
+  /**
+   * Calls the page's backend (the plugin's `server` option), with fetch's
+   * signature. input is a path starting with "/", or a URL or Request on the
+   * page's own origin (anything else rejects with a TypeError); the response
+   * streams. Rejects with a BackendUnavailable
+   * error when the backend can't be reached (see SpecolaBackendUnavailable).
+   * Under `vite dev` it goes to the plugin's dev backend.
+   */
+  fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+  /**
+   * Whether backends are enabled on this Specola instance and the runner
+   * answers right now: {enabled: false, available: false} on a page without
+   * a backend, and until the viewer has said.
+   */
+  readonly backend: SpecolaBackendState;
+}
+
+export interface SpecolaBackendState {
+  readonly enabled: boolean;
+  readonly available: boolean;
+}
+
+/** What specola.fetch rejects with when the backend can't be reached. */
+export interface SpecolaBackendUnavailable extends Error {
+  readonly name: 'BackendUnavailable';
+  /**
+   * disabled: the instance has no backend runner (or the app no server);
+   * unavailable: the runner is not answering; superseded: a newer version of
+   * the page is current (reload); offline: no network.
+   */
+  readonly reason: 'disabled' | 'unavailable' | 'superseded' | 'offline';
 }
 
 declare global {

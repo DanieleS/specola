@@ -8,6 +8,7 @@
   import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
   import * as offline from "./lib/offline.svelte";
   import { resumeWrites } from "./lib/pagedata";
+  import { setBackends } from "./lib/backends.svelte";
 
   type Route =
     | { name: "list" }
@@ -32,6 +33,8 @@
     .me()
     .then(async (m) => {
       email = m.email || m.sub;
+      // A copy kept for offline says nothing about the runner now.
+      setBackends(m.offline ? { enabled: !!m.backends?.enabled, available: false } : m.backends);
       await offline.claim(m.sub);
       // Before any page opens: its data folds in the writes still unsaved.
       resumeWrites();

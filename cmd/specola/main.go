@@ -72,9 +72,17 @@ func main() {
 	st := store.New(pool)
 	go sweepGrants(ctx, st)
 
+	h := server.New(cfg, st, authn, tokens)
+	if cfg.BackendsEnabled() {
+		slog.Info("page backends: enabled", "runner", cfg.RunnerURL)
+		go h.WatchRunner(ctx)
+	} else {
+		slog.Info("page backends: disabled (set SPECOLA_RUNNER_URL, SPECOLA_RUNNER_TOKEN and SPECOLA_SECRETS_KEY to enable)")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           server.New(cfg, st, authn, tokens),
+		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

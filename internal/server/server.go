@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/danieles/specola/internal/auth"
+	"github.com/danieles/specola/internal/backend"
 	"github.com/danieles/specola/internal/config"
 	"github.com/danieles/specola/internal/mcpserver"
 	"github.com/danieles/specola/internal/store"
@@ -47,6 +48,11 @@ type Server struct {
 	viewHost string
 	viewMux  http.Handler
 	tokens   *viewTokens
+
+	// runner runs page backends; nil when they are disabled.
+	runner *backend.Runner
+	// calls counts the backend calls running per user and page.
+	calls callLimiter
 }
 
 // New builds the server. a is nil unless Specola runs its own OIDC login.
@@ -54,6 +60,9 @@ type Server struct {
 // "oauth"; it is ignored otherwise.
 func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.TokenVerifier) *Server {
 	s := &Server{cfg: cfg, st: st, auth: a}
+	if cfg.BackendsEnabled() {
+		s.runner = backend.NewRunner(cfg.RunnerURL, cfg.RunnerToken)
+	}
 	if a != nil {
 		a.OnLogin = func(ctx context.Context, id auth.Identity, name string) error {
 			return st.UpsertUser(ctx, id.Sub, id.Email, name)
@@ -78,6 +87,12 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	}
 
 	s.mountMCP(r, tokens)
+
+	// The runner's side of the internal API: on the app origin only, and
+	// for the runner only (its token); anything else under /internal/ is
+	// 404 rather than the SPA shell.
+	r.Get("/internal/runner/code/{versionId}", s.handleRunnerCode)
+	r.Handle("/internal/*", http.NotFoundHandler())
 
 	// The token is the credential: no session needed, so agents can curl it.
 	r.Put("/upload/{token}", s.handleUpload)
@@ -144,6 +159,10 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
 			r.Get("/pages/{id}/versions/{v}/files", s.handleVersionFiles)
 			r.Post("/bundle-uploads", s.handleCreateBundleUpload)
+			// A page's backend: any method, any path below x/.
+			r.HandleFunc("/pages/{id}/x", s.handleBackendCall)
+			r.HandleFunc("/pages/{id}/x/*", s.handleBackendCall)
+			r.Get("/pages/{id}/backend/logs", s.handleBackendLogs)
 			r.Get("/pages/{id}/data", s.handlePageData)
 			r.Patch("/pages/{id}/data", s.handleUpdatePageData)
 			r.Delete("/pages/{id}/data", s.handleClearPageData)
@@ -192,7 +211,9 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A byte range is of the stored representation: compressing the part
 	// would make it meaningless, so ranges are answered uncompressed.
-	if r.Header.Get("Range") != "" {
+	// A backend call is streamed through chunk by chunk, and a compressor
+	// would hold chunks back; the handler may compress its own answer.
+	if r.Header.Get("Range") != "" || isBackendCall(r.URL.Path) {
 		r.Header.Del("Accept-Encoding")
 	}
 	if s.viewMux != nil && strings.EqualFold(r.Host, s.viewHost) {
@@ -243,6 +264,10 @@ func (s *Server) mountMCP(r chi.Router, tokens mcpauth.TokenVerifier) {
 		PluginURL:     s.pluginURL(),
 		BundleBase:    s.bundleBase,
 		OnUser:        s.recordUser,
+		Backends: func() mcpserver.BackendState {
+			b := s.backendUploadState()
+			return mcpserver.BackendState{Enabled: b.Enabled, Available: b.Available, Reason: b.Reason}
+		},
 	}
 	switch s.cfg.MCPMode() {
 	case "oauth":
@@ -307,8 +332,15 @@ func identityOf(ctx context.Context) auth.Identity {
 
 func subOf(ctx context.Context) string { return identityOf(ctx).Sub }
 
+// meResp is the signed-in user, and what the app needs to know about the
+// instance.
+type meResp struct {
+	auth.Identity
+	Backends backendState `json:"backends"`
+}
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, identityOf(r.Context()))
+	writeJSON(w, http.StatusOK, meResp{Identity: identityOf(r.Context()), Backends: s.backendState()})
 }
 
 func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
@@ -673,16 +705,24 @@ func (s *Server) handleTokenView(w http.ResponseWriter, r *http.Request) {
 // per URL, and what is sent depends on the URL only through basename.
 func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id, basename string) {
 	ctx := r.Context()
+	ancestors := "'self'"
+	if s.tokens != nil {
+		ancestors = s.cfg.AppBaseURL
+		// The app keeps pages for offline viewing by fetching them; the token
+		// in the URL is the credential, so no cookies are involved. (It reads
+		// a closed version's 410 too.)
+		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AppBaseURL)
+	}
 	var (
 		n   int
 		err error
 	)
-	if v := r.URL.Query().Get("v"); v != "" {
-		if n, err = strconv.Atoi(v); err != nil || n < 1 {
+	numbered := r.URL.Query().Get("v") != ""
+	if numbered {
+		if n, err = strconv.Atoi(r.URL.Query().Get("v")); err != nil || n < 1 {
 			http.Error(w, "v must be a version number", http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	} else {
 		var hash string
 		if n, hash, err = s.st.CurrentVersion(ctx, sub, id); err != nil {
@@ -690,9 +730,10 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id, base
 			return
 		}
 		// Weak: the same version is sent gzipped or not, depending on the client.
-		// The SDK's version and the basename are in it too, since they are
-		// part of what is sent (the bundle's base is in hash).
-		etag := `W/"` + hash + "." + sdkVersion + "." + shortHash(basename) + `"`
+		// The SDK's version, the basename and whether backends are enabled are
+		// in it too, since they are part of what is sent (the bundle's base is
+		// in hash).
+		etag := `W/"` + hash + "." + sdkVersion + "." + shortHash(basename) + "." + s.bootBackendTag() + `"`
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Cache-Control", "private, no-cache")
 		if etagMatches(r.Header.Get("If-None-Match"), etag) {
@@ -700,21 +741,28 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id, base
 			return
 		}
 	}
-	html, key, err := s.st.VersionPage(ctx, sub, id, n)
+	sv, err := s.st.ServeVersion(ctx, sub, id, n)
+	if errors.Is(err, store.ErrSuperseded) {
+		writeSuperseded(w, ancestors, s.cfg.AppBaseURL+"/#/p/"+id)
+		return
+	}
 	if err != nil {
 		w.Header().Del("Cache-Control")
 		w.Header().Del("ETag")
 		httpError(w, err)
 		return
 	}
-	ancestors := "'self'"
-	if s.tokens != nil {
-		ancestors = s.cfg.AppBaseURL
-		// The app keeps pages for offline viewing by fetching them; the token
-		// in the URL is the credential, so no cookies are involved.
-		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AppBaseURL)
+	if numbered {
+		// A numbered version never changes, but on a page with a backend
+		// whether it can be opened does: it closes when another version
+		// becomes current.
+		if sv.Backend || sv.PageBackend {
+			w.Header().Set("Cache-Control", "private, no-cache")
+		} else {
+			w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+		}
 	}
-	writePage(w, s.pageHTML(html, key), ancestors, s.boot(key, basename))
+	writePage(w, s.pageHTML(sv.HTML, sv.BundleKey), ancestors, s.boot(sv, basename))
 }
 
 // shortHash is a few hex digits of s's sha256, enough to tell values apart
@@ -789,6 +837,12 @@ func httpError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, store.ErrForbidden):
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	case errors.Is(err, store.ErrBackendPinned):
+		backendError(w, http.StatusBadRequest, "backend-pinned", err.Error())
+		return
+	case errors.Is(err, store.ErrBackendDisabled):
+		backendError(w, http.StatusBadRequest, "backend-disabled", err.Error())
 		return
 	case errors.Is(err, store.ErrGrantKind), errors.Is(err, store.ErrUnknownUser), errors.Is(err, store.ErrSelfShare):
 		http.Error(w, err.Error(), http.StatusBadRequest)

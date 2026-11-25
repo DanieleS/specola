@@ -1,0 +1,15 @@
+{
+  "name": "specola-runner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runs Specola page backends: one Node worker per page, with SQLite and a file store",
+  "type": "module",
+  "main": "src/main.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/main.js",
+    "test": "node --test test/*.test.js"
+  }
+}

@@ -31,6 +31,8 @@ export type PageMeta = {
   viewUrl: string;
   /** The current version is an SPA bundle (docs/spa-bundles.md). */
   bundle?: boolean;
+  /** The current version has a backend (docs/page-backends.md): only it can be opened. */
+  backend?: boolean;
   /** Set when this is a copy kept by the service worker, read offline. */
   offline?: boolean;
 };
@@ -74,6 +76,29 @@ export type VersionInfo = {
   note?: string;
   /** This version is an SPA bundle. */
   bundle?: boolean;
+  /** This version has a backend. */
+  backend?: boolean;
+  /**
+   * It can be opened: it is the current version, or neither it nor the
+   * current one has a backend. The others are history (and can be restored).
+   */
+  viewable?: boolean;
+};
+
+/** Whether page backends are configured on this instance, and reachable now. */
+export type BackendsState = { enabled: boolean; available: boolean };
+
+export type Me = { sub: string; email: string; backends?: BackendsState; offline?: boolean };
+
+/** A line of a page's backend log (console output, errors, crashes). */
+export type BackendLogLine = {
+  seq: number;
+  /** RFC 3339. */
+  time: string;
+  level: "log" | "info" | "warn" | "error";
+  text: string;
+  /** Names the line in an error the page got ({"error":"backend-error","ref"}). */
+  ref?: string;
 };
 
 /** A bundle version's files, other than index.html. */
@@ -181,7 +206,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
 }
 
 export const api = {
-  me: () => req<{ sub: string; email: string; offline?: boolean }>("GET", "/api/me"),
+  me: () => req<Me>("GET", "/api/me"),
   tree: (parent?: string | null) =>
     req<TreeItem[]>("GET", "/api/tree" + (parent ? `?parent=${encodeURIComponent(parent)}` : "")),
   createFolder: (name: string, parentId: string | null) =>
@@ -202,6 +227,9 @@ export const api = {
   ) => req<BundleUpload>("POST", "/api/bundle-uploads", r),
   restoreVersion: (id: string, from: number) =>
     req<{ version: number }>("POST", `/api/pages/${id}/versions`, { restoreFrom: from }),
+  /** The backend log lines of page id after since (owners and editors). */
+  backendLogs: (id: string, since = 0) =>
+    req<{ lines: BackendLogLine[] }>("GET", `/api/pages/${id}/backend/logs?since=${since}`),
   /** The user's localStorage for page id; written by pagedata.ts. */
   pageData: (id: string) => req<Record<string, string>>("GET", `/api/pages/${id}/data`),
   rename: (kind: ItemKind, id: string, name: string) => req<void>("PATCH", `/api/${kind}s/${id}`, { name }),

@@ -3,7 +3,9 @@
 // call the API, so the viewer loads its data before loading it, passes it in
 // the frame's name, and saves its writes, as the signed-in user, from a
 // MessagePort handed to the page on its first hello. Offline, the same port
-// hands a kept bundle's files to the page (see offline.svelte.ts).
+// hands a kept bundle's files to the page (see offline.svelte.ts), and it
+// carries the page's calls to its backend (docs/page-backends.md, "Frame ↔
+// viewer"): see relay below.
 // A numbered version is cached for a year with the runtime it was served with,
 // so this side must keep answering older runtimes: extend the protocol, don't
 // change it.
@@ -13,6 +15,28 @@ import { index as offlineIndex, type BundleFile } from "./offline.svelte";
 
 type Write = { op: "write"; clear?: boolean; set?: Record<string, string>; remove?: string[] };
 type Reply = { ok: true } | { ok: false; error: string };
+type Fetch = { op: "fetch"; id: number; method: string; path: string; headers: [string, string][]; body?: ArrayBuffer };
+type Abort = { op: "abort"; id: number };
+
+/** The backend of the page shown in a frame, for serveStorage to relay its calls to. */
+export type Backend = {
+  /** GET /api/me's backends, read when the page says hello. */
+  status: () => { enabled: boolean; available: boolean };
+  /** The version the frame shows, sent as X-Specola-Version. */
+  version: number;
+  /** The frame shows the copy kept offline: calls fail with reason "offline". */
+  offline?: boolean;
+  /** A call was refused because a newer version is current. */
+  onSuperseded?: () => void;
+};
+
+// The errors from Specola or the runner (X-Specola-Error) that the page gets
+// as a BackendUnavailable rather than as a Response, with their reason.
+const UNAVAILABLE: Record<string, string> = {
+  "backend-disabled": "disabled",
+  "backend-unavailable": "unavailable",
+  superseded: "superseded",
+};
 
 /**
  * The frame name that hands page id's data to the next page loaded in a
@@ -41,10 +65,21 @@ export async function storageName(id: string): Promise<string | null> {
  * saves is whether the frame was handed the page's data (storageName): only
  * then are its writes saved, so a page that never saw the data can't write
  * over it. files, when given, are the kept bundle shown offline in frame:
- * they go to the page over the port when its hello asks for them.
+ * they go to the page over the port when its hello asks for them. backend,
+ * when the version shown has one, is where its specola.fetch calls go; the
+ * returned function also aborts the calls under way.
  */
-export function serveStorage(frame: HTMLIFrameElement, id: string, saves = true, files?: BundleFile[]): () => void {
+export function serveStorage(
+  frame: HTMLIFrameElement,
+  id: string,
+  saves = true,
+  files?: BundleFile[],
+  backend?: Backend,
+): () => void {
   let port: MessagePort | null = null;
+  // The backend calls under way, to abort when the page asks or goes.
+  const calls = new Map<number, AbortController>();
+  let gone = false;
 
   function onMessage(e: MessageEvent) {
     if (e.source !== frame.contentWindow || e.data?.specola !== "hello") return;
@@ -55,17 +90,146 @@ export function serveStorage(frame: HTMLIFrameElement, id: string, saves = true,
     }
     const ch = new MessageChannel();
     const p = (port = ch.port1);
-    p.onmessage = (m: MessageEvent<Write>) => {
-      if (m.data?.op !== "write") return;
-      if (saves) send(id, m.data, (r) => p.postMessage(r));
+    p.onmessage = (m: MessageEvent<Write | Fetch | Abort>) => {
+      const d = m.data;
+      if (d?.op === "fetch") {
+        if (!gone) void relay(p, d);
+        return;
+      }
+      if (d?.op === "abort") {
+        calls.get(d.id)?.abort();
+        calls.delete(d.id);
+        return;
+      }
+      if (d?.op !== "write") return;
+      if (saves) send(id, d, (r) => p.postMessage(r));
       else p.postMessage({ ok: false, error: "this page's saved data couldn't be loaded" } satisfies Reply);
     };
-    page.postMessage({ specola: "port" }, "*", [ch.port2]);
+    const st = backend?.status();
+    page.postMessage(
+      {
+        specola: "port",
+        backend: { enabled: !!st?.enabled, available: !!st?.available && !backend?.offline },
+        ...(backend?.offline ? { offline: true } : {}),
+      },
+      "*",
+      [ch.port2],
+    );
     if (files && e.data.files) p.postMessage({ op: "files", files });
   }
 
+  // relay makes the page's call to its backend as the signed-in user and
+  // sends the answer back over p: head, the body's chunks as they come
+  // (transferred, not copied), end; or an error.
+  async function relay(p: MessagePort, m: Fetch) {
+    const fail = (name: string, message: string, reason?: string) => p.postMessage({ op: "error", id: m.id, name, message, reason });
+    if (!backend) return fail("BackendUnavailable", "this page has no backend", "disabled");
+    if (backend.offline) return fail("BackendUnavailable", "offline: the page's backend can't be reached", "offline");
+    const url = backendURL(id, m.path);
+    if (!url) return fail("NetworkError", `not a backend path: ${m.path}`);
+    if (calls.has(m.id)) return fail("NetworkError", "this request id is in use");
+    const ac = new AbortController();
+    calls.set(m.id, ac);
+    const live = () => calls.get(m.id) === ac;
+    try {
+      const headers = new Headers();
+      for (const [k, v] of Array.isArray(m.headers) ? m.headers : []) {
+        if (/^x-specola-/i.test(k)) continue;
+        try {
+          headers.append(k, v);
+        } catch {
+          // A header fetch can't send: dropped, as a browser would.
+        }
+      }
+      headers.set("X-Specola-Version", String(backend.version));
+      const method = String(m.method || "GET").toUpperCase();
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method,
+          headers,
+          body: method === "GET" || method === "HEAD" ? undefined : m.body,
+          credentials: "same-origin",
+          cache: "no-store",
+          // A redirect would be followed here, with the user's session, to
+          // whatever the backend named, and the answer handed to the page.
+          redirect: "manual",
+          signal: ac.signal,
+        });
+      } catch {
+        if (!live()) return;
+        if (!navigator.onLine) return fail("BackendUnavailable", "offline: the page's backend can't be reached", "offline");
+        return fail("NetworkError", "can't reach Specola");
+      }
+      if (!live()) return;
+      if (res.type === "opaqueredirect") return fail("NetworkError", "the backend answered with a redirect, which Specola doesn't follow");
+      const reason = UNAVAILABLE[res.headers.get("X-Specola-Error") ?? ""];
+      if (reason) {
+        let message = res.statusText;
+        try {
+          message = (await res.json()).message || message;
+        } catch {
+          // Not the JSON Specola sends: the status says enough.
+        }
+        if (reason === "superseded") backend.onSuperseded?.();
+        if (live()) fail("BackendUnavailable", message, reason);
+        return;
+      }
+      p.postMessage({ op: "head", id: m.id, status: res.status, headers: [...res.headers] });
+      if (res.body) {
+        const reader = res.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done || !live()) break;
+            const buf = whole(value);
+            p.postMessage({ op: "chunk", id: m.id, data: buf }, [buf]);
+          }
+        } catch {
+          if (live()) fail("NetworkError", "the answer was cut short");
+          return;
+        } finally {
+          if (!live()) reader.cancel().catch(() => {});
+        }
+      }
+      if (live()) p.postMessage({ op: "end", id: m.id });
+    } finally {
+      if (live()) calls.delete(m.id);
+    }
+  }
+
   window.addEventListener("message", onMessage);
-  return () => window.removeEventListener("message", onMessage);
+  return () => {
+    window.removeEventListener("message", onMessage);
+    // The frame is going: its backend calls have no one to answer. (Its
+    // last writes are still saved, see above.)
+    gone = true;
+    for (const ac of calls.values()) ac.abort();
+    calls.clear();
+  };
+}
+
+// The URL of a page's backend path, or null when path isn't one. The path is
+// normalised on a placeholder origin first, so dot segments ("/../../me")
+// can't climb out of /api/pages/{id}/x into the rest of the API.
+export function backendURL(id: string, path: unknown): string | null {
+  if (typeof path !== "string" || path[0] !== "/") return null;
+  let u: URL;
+  try {
+    u = new URL(path, "https://page.invalid");
+  } catch {
+    return null;
+  }
+  if (u.origin !== "https://page.invalid") return null;
+  const prefix = `/api/pages/${encodeURIComponent(id)}/x`;
+  const out = new URL(prefix + u.pathname + u.search, location.href);
+  return out.pathname.startsWith(prefix + "/") ? out.href : null;
+}
+
+// A chunk's bytes as an ArrayBuffer of their own, to transfer.
+function whole(v: Uint8Array): ArrayBuffer {
+  if (v.byteOffset === 0 && v.byteLength === v.buffer.byteLength && v.buffer instanceof ArrayBuffer) return v.buffer;
+  return v.slice().buffer as ArrayBuffer;
 }
 
 // Each page's writes not saved yet, in order. They outlive the frame that made

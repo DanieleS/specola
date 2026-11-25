@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, resolve, sep } from 'node:path';
+import { MANIFEST_PATH, ManifestError, validateManifest } from './manifest.js';
 import { DEFAULT_LIMITS, bundleProblems, compareVersions, formatBytes, isJunk } from './rules.js';
 import { VERSION } from './version.js';
 
@@ -103,6 +104,7 @@ export async function publish(opts, env = {}) {
     throw new PublishError(`${opts.dir} is not a valid Specola bundle:\n  - ${problems.join('\n  - ')}`);
   }
   checkIndex(join(dir, 'index.html'), log);
+  checkBackend(files, grant, log);
 
   for (const f of files) f.sha256 = createHash('sha256').update(readFileSync(f.full)).digest('hex');
   const total = files.reduce((n, f) => n + f.size, 0);
@@ -272,6 +274,35 @@ function checkIndex(file, log) {
   }
 }
 
+// The server's words (POST …/manifest answers 400 backend-disabled), so the
+// author sees the same thing whichever side refuses.
+export const BACKEND_DISABLED =
+  'this bundle has a backend (.specola/backend.json), but page backends are not enabled on this Specola instance: it has no backend runner. ' +
+  "Publish the app without its server code, or ask the instance's operator to enable backends.";
+
+/**
+ * Checks a bundle with a backend before anything is uploaded: its manifest
+ * validates as the server will validate it, and the instance runs backends.
+ * A grant without "backend" comes from a Specola older than backends, which
+ * can't run one either.
+ */
+function checkBackend(files, grant, log) {
+  const manifest = files.find((f) => f.path === MANIFEST_PATH);
+  if (!manifest) return;
+  try {
+    validateManifest(readFileSync(manifest.full), files.map((f) => f.path));
+  } catch (err) {
+    if (err instanceof ManifestError) throw new PublishError(err.message);
+    throw err;
+  }
+  if (!grant.backend?.enabled) throw new PublishError(BACKEND_DISABLED);
+  if (!grant.backend.available) {
+    log(
+      "specola: warning: the backend runner is not answering right now: the bundle can be published, but its backend can't be called until the runner is back.",
+    );
+  }
+}
+
 /** Runs fn over items with at most n in flight; fails fast on the first error. */
 async function pool(items, n, fn) {
   let next = 0;
@@ -350,6 +381,7 @@ async function describe(method, url, res) {
   try {
     const parsed = JSON.parse(text);
     if (Array.isArray(parsed.missing)) text = `the server is still missing ${parsed.missing.length} file(s): ${parsed.missing.join(', ')}`;
+    else if (typeof parsed.message === 'string') text = parsed.message;
     else if (typeof parsed.error === 'string') text = parsed.error;
   } catch {
     // plain-text error body, keep it

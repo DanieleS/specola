@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
@@ -43,6 +44,14 @@ type Config struct {
 	// DevAuthEmail bypasses auth entirely and treats every request as this
 	// user. For local development only; never set in production.
 	DevAuthEmail string
+
+	// Page backends (docs/page-backends.md). RunnerURL is the runner's base
+	// URL; unset, backends are disabled. RunnerToken is the bearer both
+	// directions of the internal API carry, and SecretsKey (32 bytes) encrypts
+	// page secrets. The three come together or not at all.
+	RunnerURL   string
+	RunnerToken string
+	SecretsKey  []byte
 }
 
 func Load() (*Config, error) {
@@ -59,6 +68,9 @@ func Load() (*Config, error) {
 		ViewOrigin:        strings.TrimRight(os.Getenv("SPECOLA_VIEW_ORIGIN"), "/"),
 	}
 	c.AppBaseURL = strings.TrimRight(c.AppBaseURL, "/")
+	if err := c.loadBackends(); err != nil {
+		return nil, err
+	}
 	c.MCPResource = env("SPECOLA_MCP_RESOURCE", c.AppBaseURL+"/mcp")
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("SPECOLA_DATABASE_URL is required")
@@ -84,6 +96,40 @@ func Load() (*Config, error) {
 	}
 	return c, nil
 }
+
+// loadBackends reads the runner settings: all of them or none. A partial
+// setup is refused rather than run with backends quietly off, since pages
+// published with a backend would stop working without anyone noticing why.
+func (c *Config) loadBackends() error {
+	vars := []string{"SPECOLA_RUNNER_URL", "SPECOLA_RUNNER_TOKEN", "SPECOLA_SECRETS_KEY"}
+	var missing []string
+	for _, k := range vars {
+		if strings.TrimSpace(os.Getenv(k)) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == len(vars) {
+		return nil
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("page backends need SPECOLA_RUNNER_URL, SPECOLA_RUNNER_TOKEN and SPECOLA_SECRETS_KEY together; missing: %s", strings.Join(missing, ", "))
+	}
+	c.RunnerURL = strings.TrimRight(strings.TrimSpace(os.Getenv("SPECOLA_RUNNER_URL")), "/")
+	if _, err := hostOf(c.RunnerURL); err != nil {
+		return fmt.Errorf("SPECOLA_RUNNER_URL: %w", err)
+	}
+	c.RunnerToken = strings.TrimSpace(os.Getenv("SPECOLA_RUNNER_TOKEN"))
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(os.Getenv("SPECOLA_SECRETS_KEY")))
+	if err != nil || len(key) != 32 {
+		return fmt.Errorf("SPECOLA_SECRETS_KEY must be 32 bytes, base64-encoded (e.g. openssl rand -base64 32)")
+	}
+	c.SecretsKey = key
+	return nil
+}
+
+// BackendsEnabled reports whether page backends are configured. Whether the
+// runner answers is another matter (see the server's health check).
+func (c *Config) BackendsEnabled() bool { return c.RunnerURL != "" }
 
 // OIDCConfigured reports whether OIDC client credentials are present.
 func (c *Config) OIDCConfigured() bool {

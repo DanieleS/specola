@@ -68,6 +68,8 @@ type PageMeta struct {
 	Public bool `json:"public"`
 	// Bundle: the current version is an SPA bundle (see bundles.go).
 	Bundle bool `json:"bundle"`
+	// Backend: the current version has a backend (see backend.go).
+	Backend bool `json:"backend"`
 }
 
 // querier is the part of pgxpool.Pool and pgx.Tx the helpers need.
@@ -314,12 +316,12 @@ func (s *Store) PageMeta(ctx context.Context, sub, id string) (*PageMeta, error)
 		SELECT a.id::text, a.name, a.slug, a.folder_id::text, a.current_version, a.updated_at, r.level,
 		       EXISTS (SELECT 1 FROM acl_entry e WHERE e.asset_id = a.id), `+favoritePage("$2")+`,
 		       r.level = 3 AND `+hasPublicLinks+`,
-		       EXISTS (SELECT 1 FROM asset_version v
-		               WHERE v.asset_id = a.id AND v.version = a.current_version AND v.bundle_key IS NOT NULL)
+		       cur.bundle_key IS NOT NULL, cur.backend IS NOT NULL
 		FROM asset a CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
+		JOIN asset_version cur ON cur.asset_id = a.id AND cur.version = a.current_version
 		WHERE a.id = $1::uuid AND r.level > 0
 		  AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
-		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public, &m.Bundle)
+		Scan(&m.ID, &m.Name, &m.Slug, &m.FolderID, &m.Version, &m.UpdatedAt, &r, &m.Shared, &m.Favorite, &m.Public, &m.Bundle, &m.Backend)
 	m.Role = r.String()
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound

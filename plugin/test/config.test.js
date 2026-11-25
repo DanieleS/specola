@@ -34,3 +34,18 @@ test("app code gets window.specola's types from '@specola/vite-plugin/client'", 
   // The plugin's own types (vite.config) see it too.
   assert.match(readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8'), /<reference path="\.\/client\.d\.ts" \/>/);
 });
+
+test("a backend gets its types from '@specola/vite-plugin/server'", async () => {
+  const { readFileSync } = await import('node:fs');
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.exports['./server'].types, './server.d.ts');
+  assert.ok(pkg.files.includes('server.d.ts'));
+  const server = readFileSync(new URL('../server.d.ts', import.meta.url), 'utf8');
+  for (const name of ['Ctx', 'Handler', 'FileStore', 'User', 'PageInfo', 'LinkInfo', 'Role']) {
+    assert.match(server, new RegExp(`export (interface|type) ${name}\\b`), name);
+  }
+  const client = readFileSync(new URL('../client.d.ts', import.meta.url), 'utf8');
+  assert.match(client, /fetch\(input: string, init\?: RequestInit\): Promise<Response>;/);
+  assert.match(client, /readonly backend: SpecolaBackendState;/);
+  assert.doesNotMatch(client, /subscribe/, 'push is not available yet');
+});

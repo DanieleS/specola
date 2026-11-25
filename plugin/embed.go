@@ -24,7 +24,7 @@ import (
 // The files npm would pack: package.json and what its "files" lists. Keep in
 // sync with package.json (a test checks); never node_modules or the tests.
 //
-//go:embed package.json index.js index.d.ts client.d.ts lib bin README.md
+//go:embed package.json index.js index.d.ts client.d.ts server.d.ts lib bin README.md
 var sources embed.FS
 
 // npm's own fixed date for packed files, so the tarball is the same bytes on
