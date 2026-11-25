@@ -139,3 +139,19 @@ func (s *Store) PublicBackendTarget(ctx context.Context, token string) (*PublicT
 	}
 	return &t, nil
 }
+
+// PublicLinkPage is what a public link shows, for its shell and manifest
+// (docs/page-apps.md, "Public apps") and for a copy kept for offline: the
+// target and its version, served as OpenPublicLink serves it, with the same
+// errors, but without counting a view.
+func (s *Store) PublicLinkPage(ctx context.Context, token string) (*PublicTarget, *ServedVersion, error) {
+	t, err := s.PublicBackendTarget(ctx, token)
+	if err != nil {
+		return nil, nil, err
+	}
+	sv, err := servedVersion(ctx, s.pool, t.ID, t.Version)
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, sv, nil
+}

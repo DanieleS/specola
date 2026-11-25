@@ -210,3 +210,41 @@ func TestAppShellReplacesTheSPAHead(t *testing.T) {
 		}
 	}
 }
+
+func TestPublicAppManifestAndWorker(t *testing.T) {
+	ts := newTestServer(t)
+	id := publishPage(t, ts, "alice", "Shared board", `<meta name="theme-color" content="#be185d"><p>hi</p>`)
+	code, body := call(t, ts, "alice", "POST", "/api/pages/"+id+"/links", `{}`)
+	var l struct{ URL string }
+	mustJSON(t, body, &l)
+	path := strings.TrimPrefix(l.URL, "http://test")
+	if code != http.StatusCreated || !strings.HasPrefix(path, "/s/") {
+		t.Fatalf("link: %d %s", code, body)
+	}
+
+	// No session: the token is the credential.
+	res := get(t, ts, "", path+"/~app.webmanifest", nil)
+	var m appManifest
+	mustJSON(t, readBody(t, res), &m)
+	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/manifest+json" ||
+		m.ID != path+"/" || m.StartURL != path+"/" || m.Scope != path || m.Name != "Shared board" || m.ThemeColor != "#be185d" {
+		t.Fatalf("manifest: %d %+v", res.StatusCode, m)
+	}
+
+	res = get(t, ts, "", "/public-sw.js", nil)
+	if b := readBody(t, res); res.StatusCode != http.StatusOK || !strings.HasPrefix(res.Header.Get("Content-Type"), "text/javascript") ||
+		res.Header.Get("Cache-Control") != "no-cache" || !strings.Contains(b, `"offline":true`) {
+		t.Fatalf("worker: %d %v", res.StatusCode, res.Header)
+	}
+
+	// Revoked: gone, manifest and all.
+	var links []struct{ ID string }
+	_, body = call(t, ts, "alice", "GET", "/api/pages/"+id+"/links", "")
+	mustJSON(t, body, &links)
+	call(t, ts, "alice", "DELETE", "/api/pages/"+id+"/links/"+links[0].ID, "")
+	for _, p := range []string{path, path + "/~app.webmanifest", path + "/~page"} {
+		if res := get(t, ts, "", p, nil); res.StatusCode != http.StatusNotFound {
+			t.Errorf("%s after revoking: %d", p, res.StatusCode)
+		}
+	}
+}

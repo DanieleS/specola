@@ -22,10 +22,25 @@
     font: inherit; color: #0f172a; background: #f59e0b; border: 0;
     border-radius: 6px; padding: 3px 10px; cursor: pointer;
   }
-  #notice .close { color: inherit; background: none; padding: 0 2px; }
+  #notice .close, #install .close { color: inherit; background: none; padding: 0 2px; }
+  #install {
+    position: fixed; left: 50%; top: 12px; transform: translateX(-50%);
+    width: calc(100% - 32px); max-width: 28rem; box-sizing: border-box;
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #f8fafc; background: rgba(15, 23, 42, 0.95); border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); z-index: 2;
+  }
+  #install[hidden] { display: none; }
+  #install span { flex: 1; min-width: 0; }
+  #install button {
+    font: inherit; color: #0f172a; background: #f59e0b; border: 0;
+    border-radius: 6px; padding: 3px 10px; cursor: pointer;
+  }
 </style>
 </head>
 <body>
+<div id="install" role="region" aria-label="Install" hidden><span></span><button type="button" class="go">Install</button><button type="button" class="close" aria-label="Dismiss">&#x2715;</button></div>
 <div id="notice" role="status" hidden><span></span><button type="button" class="reload">Reload</button><button type="button" class="close" aria-label="Dismiss">&#x2715;</button></div>
 <script>
 "use strict";
@@ -48,6 +63,10 @@
 //   topics, reopened 100 ms after the set changes.
 // Superseded (a newer version is current) shows a small notice offering to
 // reload this document, which serves the new version in a new frame.
+// It is also the link's installable app (docs/page-apps.md, "Public apps"):
+// it registers the public service worker, offers to install, and once
+// installed keeps a copy of the page (not of a bundle), which it shows when
+// the worker serves it offline (boot.offline).
 // Everything is inline: the shell's CSP allows its own origin and nothing
 // else.
 (function (boot) {
@@ -57,6 +76,11 @@
   var backend = { enabled: !!state.enabled, available: !!state.available };
   var pageSrc = String(boot.pageSrc || "");
   var tokenPath = "/" + encodeURIComponent(token);
+  var name = String(boot.name || "this page");
+  var offline = boot.offline === true;
+  // Where the worker keeps this link's shell, and this script its page.
+  var KEPT = "/s" + tokenPath + "/~kept";
+  var CACHE = "specola-public";
   // Only the page this link serves is framed, whatever the boot data says.
   if (pageSrc.indexOf("/s" + tokenPath + "/~page") !== 0) pageSrc = "/s" + tokenPath + "/~page";
 
@@ -86,12 +110,99 @@
   }
 
   var frame = document.createElement("iframe");
-  frame.title = "page";
+  frame.title = name;
   frame.referrerPolicy = "no-referrer";
   // As the viewer frames pages: no allow-same-origin.
   frame.setAttribute("sandbox", "allow-scripts allow-popups allow-forms allow-modals");
-  frame.src = pageSrc;
-  document.body.insertBefore(frame, notice);
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/public-sw.js", { scope: "/s/" }).catch(function () {});
+  }
+
+  // Installed: running in its own window, not in a browser tab.
+  function standalone() {
+    if (navigator.standalone) return true;
+    return ["standalone", "fullscreen", "minimal-ui", "window-controls-overlay"].some(function (m) {
+      return matchMedia("(display-mode: " + m + ")").matches;
+    });
+  }
+
+  // keep stores the page as the link shows it now, for offline. Not counted
+  // as a view (X-Specola-Keep). A bundle runs from many files: not kept.
+  function keep() {
+    if (offline || boot.bundle || !("caches" in window)) return;
+    fetch("/s" + tokenPath + "/~page", { credentials: "omit", cache: "no-store", headers: { "X-Specola-Keep": "1" } })
+      .then(function (res) {
+        if (!res.ok) return;
+        return caches.open(CACHE).then(function (c) { return c.put(KEPT, res); });
+      })
+      .catch(function () {});
+  }
+
+  function show(src) {
+    frame.src = src;
+    document.body.insertBefore(frame, document.getElementById("install"));
+  }
+  if (!offline) {
+    show(pageSrc);
+    if (standalone()) keep();
+  } else if (boot.bundle) {
+    tell("You're offline: this app needs a connection to open.", true);
+  } else if (!("caches" in window)) {
+    tell("You're offline, and this page isn't kept on this device.", true);
+  } else {
+    caches.match(KEPT, { cacheName: CACHE }).then(function (hit) {
+      if (!hit) return tell("You're offline, and this page isn't kept on this device.", true);
+      return hit.text().then(function (h) {
+        show(URL.createObjectURL(new Blob([h], { type: "text/html" })));
+      });
+    });
+  }
+
+  // The install banner: the browser's prompt where it has one, the Share
+  // menu on iOS; never in the installed app, nor once dismissed here.
+  var install = document.getElementById("install");
+  var DISMISSED = "specola:install-dismissed:" + token;
+  var deferred = null;
+  function dismissed() {
+    try {
+      return localStorage.getItem(DISMISSED) === "1";
+    } catch (err) {
+      return false;
+    }
+  }
+  function offer(text, button) {
+    if (standalone() || dismissed()) return;
+    install.querySelector("span").textContent = text;
+    install.querySelector(".go").hidden = !button;
+    install.hidden = false;
+  }
+  install.querySelector(".close").onclick = function () {
+    install.hidden = true;
+    try {
+      localStorage.setItem(DISMISSED, "1");
+    } catch (err) {
+      // Not remembered: offered again next time.
+    }
+  };
+  install.querySelector(".go").onclick = function () {
+    var p = deferred;
+    deferred = null;
+    install.hidden = true;
+    if (p) p.prompt();
+  };
+  addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    deferred = e;
+    offer("Install " + name + " as an app on this device.", true);
+  });
+  addEventListener("appinstalled", function () {
+    install.hidden = true;
+    keep();
+  });
+  if (/iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) {
+    offer("To install " + name + ", tap Share, then \u201cAdd to Home Screen\u201d.", false);
+  }
 
   var port = null;
   var calls = new Map(); // id -> AbortController
@@ -123,7 +234,9 @@
         p.postMessage({ ok: false, error: "a public link keeps localStorage in memory only" });
       }
     };
-    page.postMessage({ specola: "port", backend: backend }, "*", [ch.port2]);
+    var reply = { specola: "port", backend: { enabled: backend.enabled, available: backend.available && !offline } };
+    if (offline) reply.offline = true;
+    page.postMessage(reply, "*", [ch.port2]);
   });
 
   // The URL of a backend path under /p/{token}/x, or null. Normalised on a

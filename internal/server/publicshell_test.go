@@ -93,7 +93,7 @@ func TestPublicShell(t *testing.T) {
 		res := get(t, ts, "", "/s/"+token+"/scores/top?a=1&b=%3C/script%3E<", nil)
 		body := readBody(t, res)
 		want := map[string]string{
-			"Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self'; connect-src 'self'; style-src 'unsafe-inline'",
+			"Content-Security-Policy": shellCSP,
 			"Cache-Control":           "no-store",
 			"Referrer-Policy":         "no-referrer",
 			"X-Robots-Tag":            "noindex",
@@ -114,16 +114,17 @@ func TestPublicShell(t *testing.T) {
 		if strings.ContainsAny(raw, "<>&") {
 			t.Fatalf("boot not escaped: %s", raw)
 		}
-		var boot struct {
-			Token   string
-			Version int
-			Backend backendState
-			PageSrc string
-		}
+		var boot shellBoot
 		mustJSON(t, raw, &boot)
 		if boot.Token != token || boot.Version != 1 || boot.Backend != (backendState{true, true}) ||
-			boot.PageSrc != "/s/"+token+"/~page/scores/top?a=1&b=%3C/script%3E<" {
+			boot.PageSrc != "/s/"+token+"/~page/scores/top?a=1&b=%3C/script%3E<" ||
+			!boot.HasBackend || !boot.Bundle || boot.Name != "Votes" || boot.Offline {
 			t.Fatalf("boot = %+v", boot)
+		}
+		// Installable: its own manifest, title and icon.
+		if !strings.Contains(body, `<link rel="manifest" href="/s/`+token+`/~app.webmanifest">`) ||
+			!strings.Contains(body, "<title>Votes</title>") || !strings.Contains(body, `<link rel="apple-touch-icon" href="/app-icons/g/`) {
+			t.Fatalf("shell head: %.900s", body)
 		}
 		res = get(t, ts, "", "/s/"+token, nil)
 		mustJSON(t, servedBoot(t, readBody(t, res)), &boot)
@@ -157,13 +158,22 @@ func TestPublicShell(t *testing.T) {
 		code, body := call(t, ts, "alice", "POST", "/api/pages", `{"name":"Plain","html":"<p>plain</p>"}`)
 		plain := createdID(t, code, body)
 		tok := publicLink(t, ts, plain, "")
+		// The same shell, with no backend.
 		res := get(t, ts, "", "/s/"+tok+"/deep", nil)
-		if b := readBody(t, res); res.StatusCode != http.StatusOK || b != served("<p>plain</p>", "/s/"+tok) ||
-			!strings.HasSuffix(res.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		var boot shellBoot
+		mustJSON(t, servedBoot(t, readBody(t, res)), &boot)
+		if res.StatusCode != http.StatusOK || boot.HasBackend || boot.Backend.Enabled || boot.Bundle ||
+			boot.PageSrc != "/s/"+tok+"/~page/deep" || boot.Name != "Plain" {
+			t.Fatalf("plain page's shell: %d %+v", res.StatusCode, boot)
+		}
+		res = get(t, ts, "", "/s/"+tok+"/~page/deep", nil)
+		if b := readBody(t, res); res.StatusCode != http.StatusOK || b != served("<p>plain</p>", "/s/"+tok+"/~page") ||
+			!strings.HasSuffix(res.Header.Get("Content-Security-Policy"), "frame-ancestors 'self'") {
 			t.Fatalf("plain page: %d %s", res.StatusCode, b)
 		}
-		if res := get(t, ts, "", "/s/"+tok+"/~page", nil); res.StatusCode != http.StatusNotFound {
-			t.Fatalf("~page of a plain page: %d", res.StatusCode)
+		// Specola's names under ~ aren't the page's.
+		if res := get(t, ts, "", "/s/"+tok+"/~other", nil); res.StatusCode != http.StatusNotFound {
+			t.Fatalf("~other: %d", res.StatusCode)
 		}
 		wantBackendError(t, publicCall(t, ts, "GET", "/p/"+tok+"/x/api/stats", 1, nil, nil), http.StatusNotFound, "no-backend")
 	})

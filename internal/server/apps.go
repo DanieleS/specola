@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"html"
 	"net/http"
@@ -69,11 +70,17 @@ func (s *Server) appLookOf(ctx context.Context, sub string, meta *store.PageMeta
 	if err != nil {
 		return appLook{}, err
 	}
-	theme := themeColorOf(content)
+	return appLookFrom(meta.ID, meta.Name, content), nil
+}
+
+// appLookFrom is how the app of page id looks, by default: named after the
+// page, colored after the version shown (its HTML).
+func appLookFrom(id, name, page string) appLook {
+	theme := themeColorOf(page)
 	if theme == "" {
 		theme = defaultThemeColor
 	}
-	name := strings.TrimSpace(meta.Name)
+	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "Page"
 	}
@@ -83,9 +90,9 @@ func (s *Server) appLookOf(ctx context.Context, sub string, meta *store.PageMeta
 		Display:         "standalone",
 		ThemeColor:      theme,
 		BackgroundColor: theme,
-		Icon:            generatedIcon(meta.ID, name),
+		Icon:            generatedIcon(id, name),
 		IconMaskable:    true,
-	}, nil
+	}
 }
 
 func (s *Server) handleAppShell(w http.ResponseWriter, r *http.Request) {
@@ -166,8 +173,13 @@ func (s *Server) handleAppManifest(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeManifest(w http.ResponseWriter, m appManifest) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/manifest+json")
-	writeJSON(w, http.StatusOK, m)
+	_, _ = w.Write(b)
 }
 
 // The tags of the SPA's head an app replaces with its own.

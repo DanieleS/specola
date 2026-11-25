@@ -87,6 +87,7 @@ async function run(name, env) {
   try {
     await waitFor(async () => (await fetch(app + '/healthz')).ok, 'server start');
     await checkApps(app);
+    await checkPublicApps(app);
   } finally {
     server.kill();
     await new Promise((r) => server.once('exit', r));
@@ -171,6 +172,66 @@ async function checkApps(app) {
   await page.goto(`${app}/app/${randomUUID()}/`);
   await page.locator('[data-app-gone]').waitFor({ timeout: 10000 }).catch(() => {});
   check(await page.locator('[data-app-gone]').isVisible(), "an app for a missing page says so");
+
+  check(!errors.length, 'no page errors', errors);
+  await context.close();
+}
+
+// A public link is installable too, from its shell at /s/{token}, with no
+// account: its own manifest, the page in the frame, offline from the copy
+// the shell keeps once installed, and nothing left once revoked.
+async function checkPublicApps(app) {
+  const res = await fetch(app + '/api/pages', { method: 'POST', body: JSON.stringify({ name: 'Public counter', html: counter }) });
+  const { id } = await res.json();
+  const link = await (await fetch(`${app}/api/pages/${id}/links`, { method: 'POST', body: '{}' })).json();
+  const path = new URL(link.url).pathname;
+
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const cdp = await context.newCDPSession(page);
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+
+  await page.goto(link.url);
+  const m = await cdp.send('Page.getAppManifest');
+  const parsed = m.data ? JSON.parse(m.data) : {};
+  check(m.url === `${link.url}/~app.webmanifest` && !m.errors.length, "a public link's manifest is fetched and parses", m);
+  check(
+    parsed.id === path + '/' && parsed.start_url === path + '/' && parsed.scope === path && parsed.name === 'Public counter',
+    'its id, start and scope are the link',
+    parsed,
+  );
+  check((await page.title()) === 'Public counter', 'the shell is titled after the page', await page.title());
+  const f = page.frameLocator('iframe');
+  await f.locator('body[data-saved]').waitFor({ timeout: 15000 });
+  check(/^count \d+$/.test(await f.locator('#count').textContent()), 'the page shows in the shell');
+
+  // Installed: the shell keeps the page. Headless Chromium can't emulate
+  // display-mode, so navigator.standalone (iOS's flag) says it.
+  await page.evaluate(() => navigator.serviceWorker.ready);
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, 'standalone', { get: () => true }));
+  await page.reload();
+  await f.locator('body[data-saved]').waitFor({ timeout: 15000 });
+  await waitFor(() => page.evaluate((k) => caches.match(k).then((r) => !!r), path + '/~kept'), 'the page kept for offline');
+  check(true, 'installed, the shell keeps a copy of the page');
+  check(!(await page.locator('#install').isVisible()), 'no install banner in the installed app');
+
+  await context.setOffline(true);
+  await page.reload();
+  const offline = page.frameLocator('iframe');
+  await offline.locator('#count').waitFor({ timeout: 15000 }).catch(() => {});
+  const shown = await offline.locator('#count').textContent().catch(() => null);
+  check(/^count \d+$/.test(shown ?? ''), 'offline, the public app opens from the kept copy', shown);
+  check((await page.title()) === 'Public counter', "offline, the link's own shell", await page.title());
+  await context.setOffline(false);
+
+  // Revoked: the link answers 404 and the worker drops what it kept.
+  const links = await (await fetch(`${app}/api/pages/${id}/links`)).json();
+  await fetch(`${app}/api/pages/${id}/links/${links[0].id}`, { method: 'DELETE' });
+  const gone = await page.reload();
+  check(gone.status() === 404, 'a revoked link answers 404', gone.status());
+  const left = await page.evaluate((k) => Promise.all([caches.match(k + '/'), caches.match(k + '/~kept')]).then((r) => r.some(Boolean)), path);
+  check(!left, 'and nothing of it stays on the device');
 
   check(!errors.length, 'no page errors', errors);
   await context.close();

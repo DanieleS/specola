@@ -22,15 +22,15 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// Public links on a backend page (docs/page-backends.md, "Public links").
-// Today's /s/{token} serves the page as the whole document, with no viewer
-// around it to relay specola.fetch. For a page whose current version has a
-// backend it serves instead a small shell (publicshell.html) that frames
-// the page, served at /s/{token}/~page/…, and plays the viewer's side of
-// the port: calls go to ANY /p/{token}/x/… and pushes come from
+// Public links (docs/page-backends.md, "Public links"; docs/page-apps.md,
+// "Public apps"). /s/{token} serves a small shell (publicshell.html) that
+// frames the page, served at /s/{token}/~page/…, and plays the viewer's side
+// of the port: calls go to ANY /p/{token}/x/… and pushes come from
 // GET /p/{token}/events, on the same origin, without a session. Only the
 // routes the manifest declares public reach the runner, as an anonymous
-// caller (role "public"), rate limited per link and per client IP.
+// caller (role "public"), rate limited per link and per client IP. The shell
+// is also the link's installable app: its own manifest, name and icon, and a
+// service worker (publicsw.js) that keeps it for offline.
 
 // publicShellHTML is the shell; its boot data replaces shellBootPlaceholder.
 //
@@ -41,8 +41,13 @@ var publicShellHTML string
 const shellBootPlaceholder = "SPECOLA_SHELL_BOOT"
 
 // shellCSP is the shell's own policy: its inline script, the framed page
-// and calls to its own origin, nothing else.
-const shellCSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self'; connect-src 'self'; style-src 'unsafe-inline'"
+// (from its origin, or the copy kept offline), calls to its own origin, its
+// manifest, icon and service worker, nothing else.
+const shellCSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self' blob:; connect-src 'self'; " +
+	"style-src 'unsafe-inline'; manifest-src 'self'; img-src 'self'; worker-src 'self'"
+
+//go:embed publicsw.js
+var publicSW string
 
 const (
 	// Public calls a minute, per link and client IP, and per link.
@@ -57,6 +62,10 @@ func (s *Server) routesPublic(r chi.Router) {
 	r.Get("/s/{token}/*", s.handlePublicShell)
 	r.Get("/s/{token}/~page", s.handlePublicPage)
 	r.Get("/s/{token}/~page/*", s.handlePublicPage)
+	r.Get("/s/{token}/~app.webmanifest", s.handlePublicManifest)
+	// Other names under ~ are Specola's, not the page's.
+	r.Get("/s/{token}/~*", http.NotFound)
+	r.Get("/public-sw.js", handlePublicSW)
 	r.HandleFunc("/p/{token}/x", s.handlePublicCall)
 	r.HandleFunc("/p/{token}/x/*", s.handlePublicCall)
 	r.Get("/p/{token}/events", s.handlePublicEvents)
@@ -70,16 +79,26 @@ type shellBoot struct {
 	Version int          `json:"version"`
 	Backend backendState `json:"backend"`
 	PageSrc string       `json:"pageSrc"`
+	// HasBackend: the version shown has a backend. Bundle: it is an SPA
+	// bundle, which isn't kept for offline here.
+	HasBackend bool   `json:"hasBackend"`
+	Bundle     bool   `json:"bundle"`
+	Name       string `json:"name"`
+	// Offline is false as served; the service worker sets it in the copy it
+	// serves when the server can't be reached (publicsw.js).
+	Offline bool `json:"offline"`
 }
 
-// handlePublicShell serves /s/{token} and any path below it: the shell for
-// a backend page, else the page itself as always (handlePublicLink, which
-// also answers every error about the link).
+// handlePublicShell serves /s/{token} and any path below it: the shell, or
+// the error about the link (404, 410).
 func (s *Server) handlePublicShell(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
-	t, err := s.st.PublicBackendTarget(r.Context(), token)
-	if err != nil || t.Manifest == nil {
-		s.handlePublicLink(w, r)
+	t, sv, err := s.st.PublicLinkPage(r.Context(), token)
+	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		publicLinkError(w, err)
 		return
 	}
 	// The frame shows the same path and query below ~page, so a deep link
@@ -88,7 +107,15 @@ func (s *Server) handlePublicShell(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" {
 		src += "?" + r.URL.RawQuery
 	}
-	boot, _ := json.Marshal(shellBoot{Token: token, Version: t.Version, Backend: s.backendState(), PageSrc: src})
+	var state backendState
+	if t.Manifest != nil {
+		state = s.backendState()
+	}
+	look := publicLook(t, sv)
+	boot, _ := json.Marshal(shellBoot{
+		Token: token, Version: t.Version, Backend: state, PageSrc: src,
+		HasBackend: t.Manifest != nil, Bundle: sv.BundleKey != "", Name: look.Name,
+	})
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Content-Security-Policy", shellCSP)
@@ -104,34 +131,64 @@ func (s *Server) handlePublicShell(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Frame-Options", "DENY")
 	// json.Marshal escapes <, > and &, so nothing in boot can close the
 	// script it lands in.
-	_, _ = io.WriteString(w, strings.Replace(publicShellHTML, shellBootPlaceholder, string(boot), 1))
+	shell := strings.Replace(publicShellHTML, shellBootPlaceholder, string(boot), 1)
+	// The token is the credential: the manifest needs no cookies.
+	_, _ = w.Write(appShell([]byte(shell), look, "/s/"+url.PathEscape(token)+"/~app.webmanifest", false))
 }
 
-// handlePublicPage serves a backend page in the public shell's frame,
-// exactly as /s/{token} serves any other page, with basename
-// /s/{token}/~page. There is no ~page for a page without a backend.
+// publicLook is how a public link's app looks: as the page's signed-in app,
+// from the version the link shows.
+func publicLook(t *store.PublicTarget, sv *store.ServedVersion) appLook {
+	return appLookFrom(t.ID, t.Title, sv.HTML)
+}
+
+// handlePublicManifest serves a public link's app manifest. Its id and start
+// are /s/{token}/; its scope, /s/{token}, covers the link as shared too.
+func (s *Server) handlePublicManifest(w http.ResponseWriter, r *http.Request) {
+	token := chi.URLParam(r, "token")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	t, sv, err := s.st.PublicLinkPage(r.Context(), token)
+	if err != nil {
+		publicLinkError(w, err)
+		return
+	}
+	base := "/s/" + url.PathEscape(token)
+	m := manifestOf(base+"/", publicLook(t, sv))
+	m.Scope = base
+	writeManifest(w, m)
+}
+
+// handlePublicSW serves the public links' service worker, which keeps their
+// shells for offline (publicsw.js).
+func handlePublicSW(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = io.WriteString(w, publicSW)
+}
+
+// handlePublicPage serves the page in the public shell's frame, sandboxed
+// onto an opaque origin, with basename /s/{token}/~page. Each load counts
+// as a view, except the shell's own fetch of a copy to keep for offline
+// (X-Specola-Keep: 1), which it makes besides showing the page.
 func (s *Server) handlePublicPage(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
-	t, err := s.st.PublicBackendTarget(r.Context(), token)
-	if err == nil && t.Manifest == nil {
-		http.NotFound(w, r)
-		return
+	var (
+		sv  *store.ServedVersion
+		err error
+	)
+	if r.Header.Get("X-Specola-Keep") == "1" {
+		_, sv, err = s.st.PublicLinkPage(r.Context(), token)
+	} else {
+		sv, err = s.st.OpenPublicLink(r.Context(), token)
 	}
 	if err != nil {
 		publicLinkError(w, err)
-		return
-	}
-	sv, err := s.st.OpenPublicLink(r.Context(), token)
-	if err != nil {
-		publicLinkError(w, err)
-		return
-	}
-	if !sv.Backend {
-		// The page changed in between.
-		http.NotFound(w, r)
 		return
 	}
 	// Framed by the shell, on this same origin.

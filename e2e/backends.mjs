@@ -89,7 +89,9 @@ const LINK_LABEL = 'e2e public';
 // every second, and the scheduling clock a minute ahead, so the job "tick"
 // made due a minute from now runs at once.
 const TEST_HOOKS = { SPECOLA_TEST_CRON_EVERY: '1s', SPECOLA_TEST_CLOCK_OFFSET: '1m' };
-const SHELL_CSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self'; connect-src 'self'; style-src 'unsafe-inline'";
+const SHELL_CSP =
+  "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self' blob:; connect-src 'self'; " +
+  "style-src 'unsafe-inline'; manifest-src 'self'; img-src 'self'; worker-src 'self'";
 
 let failures = 0;
 function check(ok, what, detail) {
