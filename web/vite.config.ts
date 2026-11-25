@@ -20,6 +20,9 @@ export default defineConfig({
       "/s/": "http://localhost:8080",
       "/auth": "http://localhost:8080",
       "/healthz": "http://localhost:8080",
+      // Page apps: the manifest and icons; the shell itself is the SPA's.
+      "^/app/[^/]+/manifest\\.webmanifest$": "http://localhost:8080",
+      "/app-icons": "http://localhost:8080",
     },
   },
 });

@@ -812,6 +812,7 @@ func (s *Store) SweepBundleBlobs(ctx context.Context, minAge time.Duration) (int
 		DELETE FROM bundle_blob b
 		WHERE b.created_at < now() - make_interval(secs => $1)
 		  AND NOT EXISTS (SELECT 1 FROM asset_version_file f WHERE f.sha256 = b.sha256)
+		  AND NOT EXISTS (SELECT 1 FROM page_app a WHERE a.icon_sha256 = b.sha256)
 		  AND NOT EXISTS (
 		    SELECT 1 FROM asset_grant g
 		    WHERE g.bundle AND g.manifest IS NOT NULL AND g.consumed_at IS NULL AND g.expires_at > now()

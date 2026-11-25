@@ -151,8 +151,9 @@ anyone who can open the page can send anything; decide with `ctx.user` and
 | | |
 | --- | --- |
 | `user`, `role`, `link`, `page` | who is calling (`owner`, `editor`, `viewer`…) and the page |
+| `visitor` | on a public link, the anonymous visitor calling (`{id}`, stable per link and browser), or `null` |
 | `db` | SQLite (`node:sqlite`) shared by everyone on the page, opened on first use |
-| `userDb` | SQLite private to `ctx.user` (`null` without a user) |
+| `userDb` | SQLite private to `ctx.user`, or to `ctx.visitor` on a public link (at most 16 MiB); `null` without either |
 | `files` | a file store: `put(key, body, {contentType})`, `get(key)`, `delete(key)`, `list(prefix)` |
 | `secrets` | the declared secrets that are set (see Secrets) |
 | `publish(topic, data, {to})` | push to the open pages subscribed to `topic` (see Push) |
@@ -175,6 +176,11 @@ streams (LLM output, long exports). It rejects with an error named
 when a newer version of the page is current, `offline`);
 `specola.backend` (`{enabled, available}`) lets the app degrade. Only the
 current version of a page with a backend can be opened.
+
+**Offline is the app's to handle.** A page can be installed as an app and
+opened with no network (see Specola's docs/page-apps.md): its backend calls
+then reject with `reason: "offline"`, and nothing is queued. Show what the
+app can without them, and say what needs a connection.
 
 ### What the build does
 

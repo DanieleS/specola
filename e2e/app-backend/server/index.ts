@@ -9,6 +9,7 @@ type Ctx = {
   role: string;
   page: { id: string; version: number; title: string };
   link: { id: string; label: string } | null;
+  visitor: { id: string } | null;
   secrets: Record<string, string>;
   publish(topic: string, data: unknown, opts?: { to?: string }): void;
   db: any;
@@ -99,7 +100,15 @@ export default {
         return Response.json({ runs: ctx.db.prepare('SELECT name, scheduled_time AS scheduledTime, role, has_user AS hasUser FROM runs ORDER BY id').all() });
       // Public routes (backend.json "public").
       case 'GET /api/public/hello':
-        return Response.json({ role: ctx.role, user: ctx.user, link: ctx.link, userDb: ctx.userDb === null });
+        // A visitor's own userDb (docs/page-apps.md, "Anonymous visitors"):
+        // how many times this visitor said hello.
+        let mine = null;
+        if (ctx.userDb) {
+          ctx.userDb.exec('CREATE TABLE IF NOT EXISTS hellos (n INTEGER)');
+          ctx.userDb.prepare('INSERT INTO hellos VALUES (1)').run();
+          mine = ctx.userDb.prepare('SELECT count(*) AS n FROM hellos').get().n;
+        }
+        return Response.json({ role: ctx.role, user: ctx.user, link: ctx.link, userDb: ctx.userDb === null, visitor: ctx.visitor, mine });
     }
     return new Response('not found', { status: 404 });
   },

@@ -31,6 +31,9 @@ const MAX_LINE = 16 * 1024;
 // ctx.publish ("Realtime push (step 4)"): the runner checks these again.
 const TOPIC = /^[A-Za-z0-9_.:/-]{1,128}$/;
 const MAX_PUSH_DATA = 7 * 1024;
+// A public link visitor's own database (docs/page-apps.md, "Anonymous
+// visitors") stops growing here: anyone holding the link can be a visitor.
+const VISITOR_DB_BYTES = 16 * 1024 * 1024;
 
 const send = (msg) => {
   if (process.connected) process.send(msg);
@@ -83,11 +86,19 @@ function openDb(file) {
   return db;
 }
 
+// A visitor's subject: never an OIDC sub, and what Specola names it by to
+// delete its data.
+const visitorSub = (id) => 'anon:' + id;
+
 function userDbFor(sub) {
   let db = userDbs.get(sub);
   if (!db) {
     const name = createHash('sha256').update(sub).digest('hex');
     db = openDb(path.join(pageDir, 'users', `${name}.sqlite`));
+    if (sub.startsWith('anon:')) {
+      const pageSize = db.prepare('PRAGMA page_size').get().page_size;
+      db.exec(`PRAGMA max_page_count = ${Math.max(1, Math.floor(VISITOR_DB_BYTES / pageSize))}`);
+    }
     userDbs.set(sub, db);
   }
   return db;
@@ -215,17 +226,20 @@ function publish(topic, data, opts) {
 
 function makeCtx(msg, call) {
   const user = msg.user ? Object.freeze({ sub: msg.user.sub, email: msg.user.email, name: msg.user.name }) : null;
+  const visitor = msg.visitor ? Object.freeze({ id: msg.visitor.id }) : null;
   const ctx = {
     user,
     role: msg.role,
     link: msg.link ? Object.freeze({ id: msg.link.id, label: msg.link.label }) : null,
+    visitor,
     page: Object.freeze({ ...(msg.page ?? page) }),
     get db() {
       sharedDb ??= openDb(path.join(pageDir, 'shared.sqlite'));
       return sharedDb;
     },
     get userDb() {
-      return user ? userDbFor(user.sub) : null;
+      if (user) return userDbFor(user.sub);
+      return visitor ? userDbFor(visitorSub(visitor.id)) : null;
     },
     get files() {
       files ??= new FileStore(pageDir, diskQuota, snapshotsDir);

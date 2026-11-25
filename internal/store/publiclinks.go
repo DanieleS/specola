@@ -45,6 +45,10 @@ type PublicLink struct {
 	Expired    bool       `json:"expired"`
 	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
 	Views      int64      `json:"views"`
+	// Visitors are the anonymous visitors the link keeps (visitors.go), and
+	// VisitorBytes what their localStorage takes. Never their data.
+	Visitors     int64 `json:"visitors"`
+	VisitorBytes int64 `json:"visitorBytes"`
 }
 
 // PublicLinkRequest describes a new public link.
@@ -126,7 +130,9 @@ func (s *Store) PublicLinks(ctx context.Context, sub, assetID string) ([]PublicL
 	rows, err := s.pool.Query(ctx, `
 		SELECT l.id::text, l.version, COALESCE(l.label, ''), COALESCE(u.email, l.created_by_sub),
 		       l.created_at, l.expires_at, l.expires_at IS NOT NULL AND l.expires_at <= now(),
-		       l.last_used_at, l.views
+		       l.last_used_at, l.views,
+		       (SELECT count(*) FROM public_visitor v WHERE v.link_id = l.id),
+		       (SELECT COALESCE(sum(octet_length(d.key) + octet_length(d.value)), 0) FROM page_data d WHERE d.link_id = l.id)
 		FROM public_link l LEFT JOIN app_user u ON u.sub = l.created_by_sub
 		WHERE l.asset_id = $1::uuid
 		ORDER BY l.created_at DESC`, assetID)
@@ -137,7 +143,7 @@ func (s *Store) PublicLinks(ctx context.Context, sub, assetID string) ([]PublicL
 	out := []PublicLink{}
 	for rows.Next() {
 		var l PublicLink
-		if err := rows.Scan(&l.ID, &l.Version, &l.Label, &l.CreatedBy, &l.CreatedAt, &l.ExpiresAt, &l.Expired, &l.LastUsedAt, &l.Views); err != nil {
+		if err := rows.Scan(&l.ID, &l.Version, &l.Label, &l.CreatedBy, &l.CreatedAt, &l.ExpiresAt, &l.Expired, &l.LastUsedAt, &l.Views, &l.Visitors, &l.VisitorBytes); err != nil {
 			return nil, err
 		}
 		out = append(out, l)

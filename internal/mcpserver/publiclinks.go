@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	createLinkDesc = `Make a public link to a page the user owns: a secret URL that shows the page, read-only, to anyone who has it, without signing in to Specola. The URL is returned only now and can't be retrieved later. The link follows the current version unless pinned to one with version, and expires after expires_in_days (at most 366) or never when that is omitted. It stops working when revoked, when the page is archived, or when its creator no longer owns the page. localStorage on a public link lasts for one load only.`
+	createLinkDesc = `Make a public link to a page the user owns: a secret URL that shows the page, read-only, to anyone who has it, without signing in to Specola. The URL is returned only now and can't be retrieved later. The link follows the current version unless pinned to one with version, and expires after expires_in_days (at most 366) or never when that is omitted. It stops working when revoked, when the page is archived, or when its creator no longer owns the page. Whoever opens it can install the page as an app (see set_page_app). Each visitor's browser gets localStorage of its own, kept by Specola (and, on a page with a backend, ctx.visitor and its own ctx.userDb).`
 	listLinksDesc  = `List the public links on a page the user owns, newest first, with their label, pinned version, expiry, views and last use. The URLs themselves are not kept.`
 	revokeLinkDesc = `Revoke a public link on a page the user owns, by the link id from list_public_links. The URL stops working at once.`
 )

@@ -37,6 +37,15 @@ export interface LinkInfo {
   readonly label: string;
 }
 
+/**
+ * An anonymous visitor of a public link: one per link and device, kept in a
+ * cookie, made on its first write or backend call.
+ */
+export interface VisitorInfo {
+  /** Stable for this visitor on this link. */
+  readonly id: string;
+}
+
 /** A file of the page's store, as listed. */
 export interface FileInfo {
   readonly key: string;
@@ -80,10 +89,18 @@ export interface Ctx {
   readonly role: Role;
   /** The public link used, if any. */
   readonly link: LinkInfo | null;
+  /**
+   * The public link's anonymous visitor, when ctx.role is "public" and the
+   * visitor has one (it may not, past the link's cap on visitors).
+   */
+  readonly visitor: VisitorInfo | null;
   readonly page: PageInfo;
   /** SQLite shared by everyone on this page, opened on first use (WAL). */
   readonly db: DatabaseSync;
-  /** SQLite private to ctx.user, opened on first use; null when there is no user. */
+  /**
+   * SQLite private to ctx.user, or to ctx.visitor on a public link (at most
+   * 16 MiB), opened on first use; null when there is neither.
+   */
   readonly userDb: DatabaseSync | null;
   /** The page's file store. */
   readonly files: FileStore;

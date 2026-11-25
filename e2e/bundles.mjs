@@ -172,14 +172,17 @@ async function checkServer(app, viewOrigin) {
     check(res.status() === 200, 'deep URL loads directly', res.status());
     expectResults('direct deep link', await results(direct.mainFrame()), { base, basename, path: basename + '/deep/route' });
 
-    // 4. A public link, at its root and deep.
+    // 4. A public link, at its root and deep: its shell frames the page at
+    // ~page, keeping the path (docs/page-apps.md, "Public apps").
     const link = await api('POST', `/api/pages/${id}/links`, {});
-    const linkBase = new URL(link.url).pathname;
+    const linkBase = new URL(link.url).pathname + '/~page';
     for (const url of [link.url, link.url + '/some/deep/path']) {
       const p = await context.newPage();
       const r = await p.goto(url);
       check(r.status() === 200, `public link ${url.slice(link.url.length) || '/'} loads`, r.status());
-      expectResults('public link', await results(p.mainFrame()), { base, basename: linkBase, path: new URL(url).pathname });
+      const f = await waitFor(() => p.frames().find((fr) => fr.url().includes('/~page')), 'the shell to frame the page');
+      const path = linkBase + new URL(url).pathname.slice(new URL(link.url).pathname.length);
+      expectResults('public link', await results(f), { base, basename: linkBase, path });
     }
   } finally {
     check(errors.length === 0, 'no uncaught errors in any page', errors);

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -72,31 +71,6 @@ func (s *Server) handleRevokeLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// handlePublicLink serves the page a public link shows. Nothing is cached, so
-// revoking a link takes effect at once; the token in the URL stays out of the
-// page's requests and out of search engines.
-func (s *Server) handlePublicLink(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
-	sv, err := s.st.OpenPublicLink(r.Context(), chi.URLParam(r, "token"))
-	switch {
-	case errors.Is(err, store.ErrSuperseded):
-		writeSuperseded(w, "'none'", "")
-		return
-	case errors.Is(err, store.ErrNotFound):
-		http.Error(w, "this link doesn't exist or has been revoked", http.StatusNotFound)
-		return
-	case errors.Is(err, store.ErrLinkExpired):
-		http.Error(w, err.Error(), http.StatusGone)
-		return
-	case err != nil:
-		httpError(w, err)
-		return
-	}
-	writePage(w, s.pageHTML(sv.HTML, sv.BundleKey), "'none'", s.boot(sv, "/s/"+chi.URLParam(r, "token")))
 }
 
 // writePage sends a page's HTML, with the page SDK added and given boot,

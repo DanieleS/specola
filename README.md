@@ -13,7 +13,8 @@ scripts can run without being able to touch Specola's session or API.
 
 > Status: early. Publish, browse, version with notes, view, share, public
 > links, favorites,
-> full-text search, offline viewing as an installable PWA, SPA bundles
+> full-text search, offline viewing as an installable PWA, page apps (any
+> page, or public link, installed on its own), SPA bundles
 > (multi-file apps built with the Specola Vite plugin), optional page
 > backends (server code shipped in a bundle, run by a separate runner: calls,
 > databases, files, logs, snapshots, export/import, secrets, an egress
@@ -58,8 +59,8 @@ tokens), not by email.
   their next and last runs.
 - **bundle_blob** — bundle file contents by sha256, deduplicated across all
   versions and pages, stored uncompressed as `bytea` (up to 25 MiB per file,
-  100 MiB per bundle). A periodic sweep deletes blobs no version uses (and no
-  live upload names) after 24 hours. Plan database size and backups with
+  100 MiB per bundle); also apps' uploaded icons. A periodic sweep deletes
+  blobs no version or app uses (and no live upload names) after 24 hours. Plan database size and backups with
   them in mind.
 - **acl_entry** — one user (`sub`), one role (`VIEWER` / `EDITOR`) on a folder *xor* an
   asset. A folder grant is inherited by everything beneath it.
@@ -67,9 +68,17 @@ tokens), not by email.
   HTML body instead of inlining it in a request, or upload a bundle (`bundle`,
   with the `manifest` it accepted and the blobs `uploaded` through it).
 - **favorite** — personal stars.
-- **page_data** — per page and user, the page's `localStorage`.
+- **page_data** — per page and user, the page's `localStorage`; also per
+  public link visitor, under the subject `anon:<hash>` with `link_id` and
+  `visitor_hash` set. Anything that reads it per user must filter
+  `link_id IS NULL`.
 - **public_link** — a page's public links: the sha256 of the token, an
   optional pinned version, label and expiry, and a view count.
+- **public_visitor** — a public link's anonymous visitors: the sha256 of
+  their secret and when they were last seen. **visitor_cleanup** lists the
+  visitors gone whose backend database the runner may still hold.
+- **page_app** — how a page looks installed as an app: name, colors,
+  display, and an uploaded icon (a `bundle_blob`).
 - **search_document** — per page, the title and tag-stripped text of the
   current version with a `tsvector`, for full-text search.
 
@@ -139,6 +148,35 @@ to precache. The shell is network-first, so a deploy still reaches the
 browser at once; `sw.js` and the manifest are served `no-cache`. It only runs
 over HTTPS (or on `localhost`) and isn't registered by the Vite dev server.
 
+## Page apps
+
+Any page can be **installed on its own**, as an app with its own icon, name
+and window and none of Specola around it
+([docs/page-apps.md](docs/page-apps.md)):
+
+- **Signed in**, from `/app/{id}/` (**Install as app ↗** in the viewer), by
+  anyone who can see the page. The app shows the page as the viewer does,
+  with the same data, and keeps it for offline once installed. Signed out,
+  it goes through the login and comes back.
+- **From a public link**, by anyone holding it, with no account: the link
+  itself (`/s/{token}`) is the app. Installed, it keeps a copy of the page
+  (not of an SPA bundle) to open offline.
+- Each app has its own manifest, so several install side by side, apart
+  from Specola. The page's editors set how it looks with **App…** in the
+  viewer (or MCP `set_page_app`): name, short name, display, orientation,
+  colors and a PNG icon (square, 512 px or more, up to 1 MB). By default the
+  name is the page's, the theme color its `<meta name="theme-color">`, and
+  the icon its first letter on a color picked from the page.
+- On iOS and iPadOS each home-screen app has its own cookies and storage:
+  a signed-in app asks to sign in once, and a public app is a visitor of its
+  own.
+
+API: `GET/PUT/DELETE /api/pages/{id}/app` (`PUT` takes any of `name`,
+`shortName`, `display`, `orientation`, `themeColor`, `backgroundColor`
+(`null` for the default) and `iconMaskable`), `PUT/DELETE
+/api/pages/{id}/app/icon` (a PNG body); `/app/{id}/manifest.webmanifest`,
+`/s/{token}/~app.webmanifest`, icons under `/app-icons/`.
+
 ## Sharing
 
 Share a folder or page with another user by email, as **viewer** (read) or
@@ -180,17 +218,28 @@ below).
 - A link works only while the page is active and its creator still owns it:
   archiving the page or a folder above it takes its links down, and
   restoring it brings them back.
-- The page is served at `/s/{token}` (on `SPECOLA_VIEW_ORIGIN` when set) as
-  the whole document, with the same CSP sandbox, `frame-ancestors 'none'`,
-  `Referrer-Policy: no-referrer` and `X-Robots-Tag: noindex`. Its
-  `localStorage` works in memory only, for that load. An expired link
-  answers 410; an unknown or revoked one 404.
-- A page with a [backend](#page-backends) is served instead in a small
-  **shell** that frames it (at `/s/{token}/~page/…`) and relays its
+- `/s/{token}` (on `SPECOLA_VIEW_ORIGIN` when set) serves a small **shell**,
+  which is also the link's installable [app](#page-apps). It frames the page,
+  served at `/s/{token}/~page/…` with the same CSP sandbox, `frame-ancestors`
+  only the shell's origin, `Referrer-Policy: no-referrer` and
+  `X-Robots-Tag: noindex`. Each load of the page counts as a view. An
+  expired link answers 410; an unknown or revoked one 404.
+- **Each visitor's `localStorage` is kept**, apart from everyone else's.
+  Before its first write, the shell gets an anonymous **visitor** for the
+  link (`POST /p/{token}/visitor`), keeps its secret in its own origin's
+  storage and sends it in `X-Specola-Visitor` (no cookies). The data is kept
+  as a user's is, with the same limits (`/p/{token}/data`). A link keeps at
+  most `SPECOLA_PUBLIC_VISITORS_PER_LINK` visitors (1000) and gets at most 10
+  new ones a minute per address; past that, the page's storage stays in
+  memory. A visitor unused for 90 days is forgotten; revoking the link
+  deletes its visitors and their data. The owner sees how many visitors keep
+  data, never the data.
+- On a page with a [backend](#page-backends), the shell relays its
   `specola.fetch` and `specola.subscribe` to `/p/{token}/x/…` and
   `/p/{token}/events`, without a session: only the routes and topics its
   manifest makes public, as role `public`, rate limited per link and client
-  IP (see Page backends).
+  IP (see Page backends). A visitor has `ctx.visitor` and a `ctx.userDb` of
+  its own.
 
 API (owner only): `GET/POST /api/pages/{id}/links` (`POST` takes
 `{"label", "version", "expiresInDays"}`, all optional, and answers with the
@@ -383,8 +432,9 @@ export default {
   last run and its outcome (`GET /api/pages/{id}/backend/cron`).
 - **Public routes.** The manifest's `public` routes (`"GET /api/stats"`,
   `"GET /api/public/*"`) and `topics.public` are what a public link's
-  visitors may call and subscribe to, with `ctx.role` `"public"`, no user and
-  `ctx.link` set; anything else answers them 403 `not-public` without
+  visitors may call and subscribe to, with `ctx.role` `"public"`, no user,
+  `ctx.link` set, and `ctx.visitor` with a `ctx.userDb` of its own (at most
+  16 MiB) once the visitor has one; anything else answers them 403 `not-public` without
   reaching the backend. At most 60 calls a minute per link and client IP, and
   600 per link (429 with `Retry-After`). The client IP is the connection's,
   or the first `X-Forwarded-For` hop with `SPECOLA_TRUST_FORWARDED=1`.
@@ -471,6 +521,7 @@ All via environment variables (see [`specola.env.example`](./specola.env.example
 | `SPECOLA_RUNNER_TOKEN` | with the runner | shared bearer for the internal API (≥ 16 characters) |
 | `SPECOLA_SECRETS_KEY` | with the runner | 32 bytes, base64 |
 | `SPECOLA_BACKEND_PURGE_AFTER_DAYS` | no | delete the backend data of pages dormant this many days (default: never) |
+| `SPECOLA_PUBLIC_VISITORS_PER_LINK` | no | anonymous visitors a public link keeps data for (default 1000) |
 | `SPECOLA_TRUST_FORWARDED` | no | `1`: the client IP for public links' rate limits is the first `X-Forwarded-For` hop (only behind a proxy that sets it); otherwise the connection's address |
 | `SPECOLA_TEST_CRON_EVERY` | **tests only** | the scheduled jobs' tick (a Go duration, at least `100ms`) instead of 30 s. Refused without `SPECOLA_DEV_AUTH_EMAIL` |
 | `SPECOLA_TEST_CLOCK_OFFSET` | **tests only** | moves the scheduling clock (jobs, purge) ahead by this duration, so a job due soon runs at once. Refused without `SPECOLA_DEV_AUTH_EMAIL` |
@@ -540,7 +591,7 @@ user**, so they land in that user's gallery.
 
 | Tool | Input | Output |
 | --- | --- | --- |
-| `publish_page` | `title`, `html`, `folder_id?`, `note?` | `{id, version, url}` |
+| `publish_page` | `title`, `html`, `folder_id?`, `note?` | `{id, version, url, app_url}` |
 | `new_version` | `id`, `html`, `note?` | `{version, url}` |
 | `list` | `folder_id?`, `shared_with_me?` or `archived?` | folders and pages |
 | `get_page` | `id`, `version?` | metadata and the HTML of that version (default current); for a version that can't be opened (a backend page's older one), a note saying so |
@@ -554,6 +605,7 @@ user**, so they land in that user's gallery.
 | `create_public_link` | `id`, `label?`, `version?`, `expires_in_days?` | the link and its `url` (shown only now) |
 | `list_public_links` | `id` | the page's public links, with expiry and views |
 | `revoke_public_link` | `id`, `link_id` | `{ok}` |
+| `set_page_app` | `id`, `name?`, `short_name?`, `display?`, `orientation?`, `theme_color?`, `background_color?`, `icon_maskable?`, `icon_png_base64?`, `generated_icon?` (`""` resets a field) | how the app looks now, and its `app_url` |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
 | `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx --no -- specola-publish` command to run, the plugin install command, and `backend: {enabled, available, reason?}` |
 
@@ -640,6 +692,15 @@ CIMD clients then connect without being registered in advance.
   They also allow CORS reads from the app origin, which is how the app keeps
   pages for offline viewing; offline, a kept page is rendered from the app
   origin in the sandboxed iframe, without the separate origin.
+- Page apps' shells (`/app/{id}/`, `/s/{token}`) are Specola's own
+  documents; the page still runs in the same sandboxed frame. A signed-in
+  app's manifest needs the session (linked with `crossorigin=
+  "use-credentials"`) and answers 404 without access; a public one needs the
+  token. A public visitor's secret is sent only by the shell, in a header,
+  never as a cookie, and requests saying they come from another origin
+  (a page's `null` included) are refused. Uploaded icons are served by
+  sha256, only while some app uses them, decoded as PNG on upload.
+- The login's `next` is a local path only: no open redirect.
 - Page backends run page authors' code on the runner: see
   [their security model](#security-model). Backend answers are relayed to
   the viewer's `fetch` only, never rendered on the app origin

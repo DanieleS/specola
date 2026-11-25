@@ -542,7 +542,7 @@ func TestBundleServing(t *testing.T) {
 		var l struct{ URL string }
 		mustJSON(t, body, &l)
 		linkPath := strings.TrimPrefix(l.URL, "http://test")
-		if got := readBody(t, get(t, ts, "", linkPath+"/deep/path", nil)); got != want(linkPath) {
+		if got := readBody(t, get(t, ts, "", linkPath+"/~page/deep/path", nil)); got != want(linkPath+"/~page") {
 			t.Fatalf("public link: %q", got)
 		}
 		// The stored HTML keeps the placeholder.
@@ -653,7 +653,7 @@ func TestBundleOnViewOrigin(t *testing.T) {
 	var l struct{ URL string }
 	mustJSON(t, body, &l)
 	linkPath := strings.TrimPrefix(l.URL, viewOrigin)
-	if got := readBody(t, get(t, ts, viewHost, linkPath, nil)); got != want(linkPath) {
+	if got := readBody(t, get(t, ts, viewHost, linkPath+"/~page", nil)); got != want(linkPath+"/~page") {
 		t.Fatalf("public link: %q", got)
 	}
 }

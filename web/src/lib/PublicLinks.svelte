@@ -72,12 +72,14 @@
   }
 
   const date = (s: string) => new Date(s).toLocaleDateString();
+  const size = (n: number) => (n < 1024 ? `${n} B` : n < 1 << 20 ? `${Math.round(n / 1024)} KB` : `${(n / (1 << 20)).toFixed(1)} MB`);
   function details(l: PublicLink) {
     const parts = [l.version ? `v${l.version} only` : "current version"];
     if (l.expired) parts.push("expired");
     else parts.push(l.expiresAt ? `until ${date(l.expiresAt)}` : "no expiry");
     parts.push(`${l.views} ${l.views === 1 ? "view" : "views"}`);
     if (l.lastUsedAt) parts.push(`last ${date(l.lastUsedAt)}`);
+    if (l.visitors) parts.push(`${l.visitors} ${l.visitors === 1 ? "visitor keeps" : "visitors keep"} data (${size(l.visitorBytes ?? 0)})`);
     return parts.join(" · ");
   }
   const input = "px-3 py-1.5 rounded-md bg-white/5 border border-white/15 focus:border-amber-400 outline-none text-sm";
@@ -86,7 +88,8 @@
 <section class="mt-5 pt-4 border-t border-white/10" aria-labelledby="public-links-title">
   <h3 id="public-links-title" class="font-semibold text-sm mb-1">Public links</h3>
   <p class="text-xs text-white/40 mb-3">
-    Anyone with the link can view the page, without signing in. They can't see anything else in Specola.
+    Anyone with the link can view the page, without signing in, and install it as an app. They can't see anything else in
+    Specola. Each visitor gets the page's saved data of their own, which you don't see.
   </p>
 
   <form onsubmit={create} class="flex flex-wrap gap-2 mb-2">
@@ -120,7 +123,9 @@
           >{copied ? "Copied" : "Copy"}</button
         >
       </div>
-      <p class="text-xs text-amber-200/80 mt-1">Copy it now: Specola doesn't keep it and can't show it again.</p>
+      <p class="text-xs text-amber-200/80 mt-1">
+        Copy it now: Specola doesn't keep it and can't show it again. Whoever opens it can install it as an app.
+      </p>
     </div>
   {/if}
 

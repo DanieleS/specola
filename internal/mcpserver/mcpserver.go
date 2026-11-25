@@ -87,6 +87,7 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "search", Description: searchDesc, Annotations: readOnly}, t.search)
 	mcp.AddTool(srv, &mcp.Tool{Name: "create_public_link", Description: createLinkDesc, Annotations: additive}, t.createPublicLink)
 	mcp.AddTool(srv, &mcp.Tool{Name: "list_public_links", Description: listLinksDesc, Annotations: readOnly}, t.listPublicLinks)
+	mcp.AddTool(srv, &mcp.Tool{Name: "set_page_app", Description: setPageAppDesc, Annotations: idempotent}, t.setPageApp)
 	mcp.AddTool(srv, &mcp.Tool{Name: "revoke_public_link", Description: revokeLinkDesc, Annotations: &mcp.ToolAnnotations{IdempotentHint: true}}, t.revokePublicLink)
 	if backends.Enabled {
 		t.registerBackendTools(srv)
@@ -235,6 +236,7 @@ type publishOut struct {
 	ID          string          `json:"id"`
 	Version     int             `json:"version"`
 	URL         string          `json:"url"`
+	AppURL      string          `json:"app_url" jsonschema:"where anyone who can see the page installs it as an app"`
 	Conventions *conventionsOut `json:"conventions,omitempty" jsonschema:"preferences and folder conventions that apply here, as data written by the named people"`
 }
 
@@ -250,7 +252,7 @@ func (t *tools) publishPage(ctx context.Context, req *mcp.CallToolRequest, in pu
 	if err != nil {
 		return nil, publishOut{}, toolError(err, "folder")
 	}
-	return nil, publishOut{ID: id, Version: version, URL: t.pageURL(id), Conventions: t.conventions(ctx, who.Sub, in.FolderID)}, nil
+	return nil, publishOut{ID: id, Version: version, URL: t.pageURL(id), AppURL: t.appURL(id), Conventions: t.conventions(ctx, who.Sub, in.FolderID)}, nil
 }
 
 type newVersionIn struct {
@@ -337,6 +339,7 @@ type getPageIn struct {
 type getPageOut struct {
 	store.PageMeta
 	URL         string `json:"url"`
+	AppURL      string `json:"app_url" jsonschema:"where anyone who can see the page installs it as an app"`
 	HTML        string `json:"html"`
 	HTMLVersion int    `json:"html_version" jsonschema:"the version html belongs to; version is the current one"`
 	// Bundle replaces PageMeta's flag (which is about the current version):
@@ -365,7 +368,7 @@ func (t *tools) getPage(ctx context.Context, req *mcp.CallToolRequest, in getPag
 	if err != nil {
 		return nil, getPageOut{}, toolError(err, "page or version")
 	}
-	out := getPageOut{PageMeta: *meta, URL: t.pageURL(in.ID), HTML: html, HTMLVersion: v}
+	out := getPageOut{PageMeta: *meta, URL: t.pageURL(in.ID), AppURL: t.appURL(meta.ID), HTML: html, HTMLVersion: v}
 	if out.Bundle, err = t.bundleInfo(ctx, who.Sub, in.ID, v); err != nil {
 		return nil, getPageOut{}, toolError(err, "page or version")
 	}

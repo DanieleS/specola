@@ -5,10 +5,9 @@
   import PageViewer from "./lib/PageViewer.svelte";
   import PublishForm from "./lib/PublishForm.svelte";
   import Settings from "./lib/Settings.svelte";
-  import { api, Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
+  import { Unauthorized, UNAUTHORIZED_EVENT } from "./lib/api";
   import * as offline from "./lib/offline.svelte";
-  import { resumeWrites } from "./lib/pagedata";
-  import { setBackends } from "./lib/backends.svelte";
+  import { startSession } from "./lib/session";
 
   type Route =
     | { name: "list" }
@@ -29,15 +28,9 @@
   let authError = $state("");
   let email = $state("");
 
-  api
-    .me()
-    .then(async (m) => {
+  startSession()
+    .then((m) => {
       email = m.email || m.sub;
-      // A copy kept for offline says nothing about the runner now.
-      setBackends(m.offline ? { enabled: !!m.backends?.enabled, available: false } : m.backends);
-      await offline.claim(m.sub);
-      // Before any page opens: its data folds in the writes still unsaved.
-      resumeWrites();
       auth = "in";
       if (!m.offline) offline.sync().catch((e) => console.warn("offline sync:", e));
     })

@@ -63,6 +63,10 @@ type Config struct {
 	// or whose current version has no backend) for longer than this many
 	// days. 0, the default, never does.
 	BackendPurgeAfterDays int
+	// PublicVisitorsPerLink caps the anonymous visitors a public link keeps
+	// data for (SPECOLA_PUBLIC_VISITORS_PER_LINK); 0 means the default,
+	// 1000.
+	PublicVisitorsPerLink int
 
 	// Test hooks, for end-to-end tests only (e2e/backends.mjs), honoured
 	// only with SPECOLA_DEV_AUTH_EMAIL (a dev bypass is never production):
@@ -91,6 +95,9 @@ func Load() (*Config, error) {
 	}
 	c.AppBaseURL = strings.TrimRight(c.AppBaseURL, "/")
 	if err := c.loadBackends(); err != nil {
+		return nil, err
+	}
+	if err := c.loadVisitors(); err != nil {
 		return nil, err
 	}
 	if err := c.loadPurge(); err != nil {
@@ -160,6 +167,23 @@ func (c *Config) loadBackends() error {
 	return nil
 }
 
+// DefaultPublicVisitorsPerLink is SPECOLA_PUBLIC_VISITORS_PER_LINK unset.
+const DefaultPublicVisitorsPerLink = 1000
+
+// loadVisitors reads SPECOLA_PUBLIC_VISITORS_PER_LINK.
+func (c *Config) loadVisitors() error {
+	v := strings.TrimSpace(os.Getenv("SPECOLA_PUBLIC_VISITORS_PER_LINK"))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 10_000_000 {
+		return fmt.Errorf("SPECOLA_PUBLIC_VISITORS_PER_LINK must be a positive number of visitors, got %q", v)
+	}
+	c.PublicVisitorsPerLink = n
+	return nil
+}
+
 // loadPurge reads SPECOLA_BACKEND_PURGE_AFTER_DAYS. A value that isn't a
 // positive number of days is refused rather than read as "never": whoever
 // set it meant data to be deleted, or meant something else entirely.
@@ -204,6 +228,14 @@ func (c *Config) loadTestHooks() error {
 		*h.dst = d
 	}
 	return nil
+}
+
+// VisitorsPerLink is the cap on a public link's anonymous visitors.
+func (c *Config) VisitorsPerLink() int {
+	if c.PublicVisitorsPerLink > 0 {
+		return c.PublicVisitorsPerLink
+	}
+	return DefaultPublicVisitorsPerLink
 }
 
 // BackendsEnabled reports whether page backends are configured. Whether the

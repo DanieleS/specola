@@ -43,6 +43,7 @@ type Index = { owner: string; pages: Record<string, OfflinePage> };
 const INDEX_KEY = "specola:offline";
 const PAGES = "specola-pages";
 const API = "specola-api"; // the service worker's API cache
+const APPS = "specola-apps"; // its copies of page apps' shells and icons
 const MAX_RECENT = 30;
 // Recent pages also give way once they take more than this together: one
 // bundle may be as large as 100 MiB.
@@ -99,7 +100,28 @@ export async function clear() {
   } catch {
     // Storage unavailable: nothing kept there either.
   }
-  if (supported) await Promise.all([caches.delete(PAGES), caches.delete(API)]);
+  if (supported) await Promise.all([caches.delete(PAGES), caches.delete(API), caches.delete(APPS)]);
+}
+
+/** What a kept page's metadata was, for when the server can't be reached. */
+export function keptMeta(k: OfflinePage): PageMeta {
+  const v = k.versions.at(-1)!;
+  return {
+    id: k.id,
+    name: k.name,
+    slug: "",
+    folderId: null,
+    version: v,
+    updatedAt: k.updatedAt,
+    role: k.role,
+    bundle: isBundle(k.id, v),
+    backend: !!k.backend,
+    shared: false,
+    favorite: false,
+    public: false,
+    viewUrl: "",
+    offline: true,
+  };
 }
 
 /** Binds the offline data to the signed-in user, wiping another user's. */

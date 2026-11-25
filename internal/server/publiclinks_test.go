@@ -50,13 +50,21 @@ func TestPublicLinks(t *testing.T) {
 	current, currentPath := create(`{"label":"for the board"}`)
 	_, pinnedPath := create(`{"version":1,"expiresInDays":7}`)
 
-	t.Run("anyone with the link sees the page, sandboxed", func(t *testing.T) {
-		code, body, h := open(currentPath)
-		if code != http.StatusOK || body != served("<p>v2</p>", currentPath) {
+	// page is where the shell at path frames the page.
+	page := func(path string) string { return path + "/~page" }
+
+	t.Run("anyone with the link sees the page, sandboxed, in the shell", func(t *testing.T) {
+		code, body, _ := open(currentPath)
+		if code != http.StatusOK || !strings.Contains(body, `"pageSrc":"`+page(currentPath)+`"`) ||
+			!strings.Contains(body, `<link rel="manifest" href="`+currentPath+`/~app.webmanifest">`) {
+			t.Fatalf("shell: %d %q", code, body)
+		}
+		code, body, h := open(page(currentPath))
+		if code != http.StatusOK || body != served("<p>v2</p>", page(currentPath)) {
 			t.Fatalf("open: %d %q", code, body)
 		}
 		csp := h.Get("Content-Security-Policy")
-		if !strings.Contains(csp, "sandbox allow-scripts") || !strings.Contains(csp, "frame-ancestors 'none'") {
+		if !strings.Contains(csp, "sandbox allow-scripts") || !strings.Contains(csp, "frame-ancestors 'self'") {
 			t.Fatalf("CSP = %q", csp)
 		}
 		for k, want := range map[string]string{"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow"} {
@@ -64,17 +72,23 @@ func TestPublicLinks(t *testing.T) {
 				t.Fatalf("%s = %q, want %q", k, h.Get(k), want)
 			}
 		}
-		if _, body, _ := open(pinnedPath); body != served("<p>v1</p>", pinnedPath) {
+		if _, body, _ := open(page(pinnedPath)); body != served("<p>v1</p>", page(pinnedPath)) {
 			t.Fatalf("pinned: %q", body)
 		}
 		expect(alice, "POST", "/api/pages/"+id+"/versions", `{"html":"<p>v3</p>"}`, http.StatusCreated)
-		if _, body, _ := open(currentPath); body != served("<p>v3</p>", currentPath) {
+		if _, body, _ := open(page(currentPath)); body != served("<p>v3</p>", page(currentPath)) {
 			t.Fatalf("after a new version: %q", body)
 		}
-		if _, body, _ := open(pinnedPath); body != served("<p>v1</p>", pinnedPath) {
+		if _, body, _ := open(page(pinnedPath)); body != served("<p>v1</p>", page(pinnedPath)) {
 			t.Fatalf("pinned after a new version: %q", body)
 		}
-		for _, p := range []string{"/s/nope", "/s/" + strings.Repeat("A", 43)} {
+		// The shell, its manifest and a copy kept for offline aren't views.
+		open(currentPath)
+		open(currentPath + "/~app.webmanifest")
+		if res := get(t, ts, "", page(currentPath), http.Header{"X-Specola-Keep": {"1"}}); res.StatusCode != http.StatusOK {
+			t.Fatalf("keep: %d", res.StatusCode)
+		}
+		for _, p := range []string{"/s/nope", "/s/" + strings.Repeat("A", 43), "/s/nope/~page", "/s/nope/~app.webmanifest"} {
 			if code, _, _ := open(p); code != http.StatusNotFound {
 				t.Fatalf("%s: %d, want 404", p, code)
 			}
@@ -170,8 +184,8 @@ func TestPublicLinksOnViewOrigin(t *testing.T) {
 		t.Fatalf("url = %q, want it on the view origin", l.URL)
 	}
 
-	res := get(t, ts, "view.specola.test", u.Path, nil)
-	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != served("<p>hi</p>", u.Path) {
+	res := get(t, ts, "view.specola.test", u.Path+"/~page", nil)
+	if b := readBody(t, res); res.StatusCode != http.StatusOK || b != served("<p>hi</p>", u.Path+"/~page") {
 		t.Fatalf("view origin: %d %q", res.StatusCode, b)
 	}
 	if acao := res.Header.Get("Access-Control-Allow-Origin"); acao != "" {

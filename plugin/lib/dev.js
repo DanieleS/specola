@@ -211,6 +211,7 @@ export function createDevBackend({ root, load, manifest, env = process.env, logg
       user,
       role: cron ? 'cron' : 'owner',
       link: null,
+      visitor: null,
       page,
       get db() {
         sharedDb ??= openDb(join(dataDir, 'shared.sqlite'));

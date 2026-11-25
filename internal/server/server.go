@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,9 @@ type Server struct {
 	// public links' call budgets (publicshell.go).
 	push         pushHub
 	publicLimits rateLimiter
+	// visitorLimits bounds how fast public links get new visitors
+	// (visitors.go).
+	visitorLimits rateLimiter
 	// cron runs the pages' scheduled jobs (cron.go).
 	cron cronState
 }
@@ -73,6 +77,7 @@ type Server struct {
 // "oauth"; it is ignored otherwise.
 func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.TokenVerifier) *Server {
 	s := &Server{cfg: cfg, st: st, auth: a, now: time.Now, purgeEvery: purgeEvery}
+	s.visitorLimits.perIP, s.visitorLimits.perLink = newVisitorsPerIP, newVisitorsPerLink
 	// Test hooks (config.go: dev bypass only), for e2e/backends.mjs.
 	s.cron.every = cfg.TestCronEvery
 	if off := cfg.TestClockOffset; off != 0 {
@@ -150,13 +155,20 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		vr.Get("/view/{id}", s.handleTokenView)
 		vr.Get("/view/{id}/*", s.handleTokenView)
 		s.routesPublic(vr)
+		s.routesAppIcons(vr)
 		vr.Get("/b/{key}/*", s.handleBundleFile)
 		vr.Head("/b/{key}/*", s.handleBundleFile)
 		s.viewMux = vr
 	}
 
+	// Page apps' icons need no session (apps.go); any other path under
+	// /app/ than an app's own answers 404 rather than the SPA shell.
+	s.routesAppIcons(r)
+	r.Handle("/app/*", http.NotFoundHandler())
+
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAuth)
+		s.routesApps(r)
 		if cfg.ViewOrigin == "" {
 			r.Get("/view/{id}", s.handleView)
 			r.Get("/view/{id}/*", s.handleView)
@@ -172,6 +184,11 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Post("/folders", s.handleCreateFolder)
 			r.Post("/pages", s.handleCreatePage)
 			r.Get("/pages/{id}", s.handlePageMeta)
+			r.Get("/pages/{id}/app", s.handleAppSettings)
+			r.Put("/pages/{id}/app", s.handleSetAppSettings)
+			r.Delete("/pages/{id}/app", s.handleResetApp)
+			r.Put("/pages/{id}/app/icon", s.handleSetAppIcon)
+			r.Delete("/pages/{id}/app/icon", s.handleDeleteAppIcon)
 			r.Get("/pages/{id}/versions", s.handleVersions)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
 			r.Get("/pages/{id}/versions/{v}/files", s.handleVersionFiles)
@@ -276,8 +293,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 		if id.Sub == "" {
 			// Only our own OIDC flow can recover an anonymous browser request.
+			// It comes back where it was going (a page app, say).
 			if s.auth != nil && !strings.HasPrefix(r.URL.Path, "/api") {
-				http.Redirect(w, r, "/auth/login", http.StatusFound)
+				http.Redirect(w, r, "/auth/login?next="+url.QueryEscape(auth.SafeNext(r.URL.RequestURI())), http.StatusFound)
 				return
 			}
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -472,7 +490,9 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 // has backend data, and when it will be purged if that is within a week.
 type pageMetaResp struct {
 	*store.PageMeta
-	ViewURL        string     `json:"viewUrl"`
+	ViewURL string `json:"viewUrl"`
+	// AppURL is where the page is installed as an app (apps.go).
+	AppURL         string     `json:"appUrl"`
 	BackendData    bool       `json:"backendData"`
 	BackendPurgeAt *time.Time `json:"backendPurgeAt,omitempty"`
 	// BackendSecretsMissing: for owners and editors of a backend page
@@ -492,7 +512,7 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, pageMetaResp{
-		PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID),
+		PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID), AppURL: "/app/" + meta.ID + "/",
 		BackendData: meta.BackendData, BackendPurgeAt: s.backendPurgeAt(meta.BackendDormantSince),
 		BackendSecretsMissing: missing,
 	})
