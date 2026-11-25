@@ -695,6 +695,160 @@ dormant for longer than the setting get `DELETE /pages/{id}` on the runner,
 then `backend_used_at` cleared. It never runs when backends are disabled
 or the runner is unavailable (it retries the next hour).
 
+## Wire formats for steps 3–7 (exact)
+
+Migrations: `0014_page_secrets.sql`, `0015_backend_cron.sql` (step 2 took
+`0013`). New routes are registered from a function per feature in its own
+file (`routesSecrets`, `routesPush`, …), called from `server.go`.
+
+### Secrets (step 3)
+
+- `page_secret(asset_id uuid REFERENCES asset, name text, ciphertext bytea,
+  nonce bytea, updated_by text, updated_at timestamptz, PRIMARY KEY
+  (asset_id, name))`. AES-256-GCM, a fresh 12-byte nonce per write, the
+  associated data is `asset_id || 0x00 || name` so a ciphertext cannot be
+  moved to another page or name. A value is 1 byte–8 KiB of UTF-8.
+- `GET /api/pages/{id}/secrets` (owners, editors) →
+  `{"secrets":[{"name","declared":bool,"set":bool,"updatedAt"?,"updatedBy"?}]}`:
+  every name the current version declares plus any set but no longer
+  declared, sorted by name. Never a value.
+- `PUT /api/pages/{id}/secrets/{name}` (owners) body `{"value"}` → 204;
+  `DELETE` (owners) → 204, also when unset. 400 `bad-request` for an
+  invalid name or value. Names need not be declared (an owner may set one
+  ahead of a version that declares it).
+- `/invoke` and `/scheduled` heads carry `secrets` = the declared names that
+  are set, decrypted, and `egress` = the version's normalised list.
+- `GET /api/pages/{id}` carries `backendSecretsMissing: [names]` (declared,
+  not set) for owners and editors.
+
+### Egress proxy (step 3)
+
+- The runner listens on `127.0.0.1:<random port>` for proxy traffic.
+  Every worker gets `NODE_USE_ENV_PROXY=1`, `HTTP_PROXY` and `HTTPS_PROXY`
+  set to `http://w-<worker id>:<random token>@127.0.0.1:<port>`, and
+  `NO_PROXY` empty. The credential identifies the worker and so its page's
+  `egress`.
+- `CONNECT host:port` (port 443, or 80) and absolute-URI HTTP requests
+  (`http://host[:80]/…`). The host must match an `egress` entry (exact, or
+  `*.suffix` matching one or more labels below `suffix`, never `suffix`
+  itself). The proxy resolves the name itself and refuses when any address
+  is loopback, private (RFC 1918), link-local, CGNAT (100.64/10), ULA
+  (fc00::/7), multicast, unspecified, IPv4-mapped forms of those, or the
+  metadata address 169.254.169.254; then connects to a resolved address
+  (never re-resolving, so no DNS rebinding). IP-literal hosts are refused.
+- Refusal: `403` with a one-line text body; the backend log gets
+  `egress refused: <host>:<port> (<reason>)`. A missing or wrong credential
+  is `407`.
+- Raw sockets (`net`, `tls`) bypass the proxy. On a trusted instance that
+  is accepted (Trust model); the README says how to close it with a
+  container network policy.
+
+### Realtime push (step 4)
+
+- `ctx.publish(topic, data, {to?})`: `topic` matches
+  `^[A-Za-z0-9_.:/-]{1,128}$`; `data` is JSON-serialisable and at most
+  7 KiB serialised; `to` a `sub`. Invalid → throws `TypeError`. At most 50
+  publishes per second per page (token bucket in the runner); beyond that
+  they are dropped with one log warning per second.
+- Runner → specola `POST /internal/runner/publish` (bearer) body
+  `{"page","topic","data","to"?}` → 204. Specola checks the page exists and
+  sends `NOTIFY specola_push, '<json>'`. Every specola replica `LISTEN`s
+  with a dedicated connection (reconnecting with backoff) and fans out to
+  its own streams.
+- `GET /api/pages/{id}/events?v=<version>&topic=<t>&topic=<t>…` (session,
+  view access, 1–20 topics): `text/event-stream`, never compressed or
+  buffered. Each event is `event: message` + `data: {"topic","data"}`. A
+  comment line every 25 s keeps it open. If `v` is not the current version,
+  or becomes not current, the stream sends `event: superseded` and closes.
+  Access is re-checked every 5 minutes; lost access closes the stream with
+  `event: forbidden`. Targeted events (`to`) go only to that `sub`.
+- Port: frame → viewer `{op:"sub", topic}` / `{op:"unsub", topic}`; viewer
+  → frame `{op:"event", topic, data}`. The SDK's
+  `specola.subscribe(topic, onMessage)` returns `unsubscribe()`; several
+  subscriptions to one topic share the stream. The viewer keeps one
+  `EventSource` per frame for the current topic set and reopens it (debounced
+  100 ms) when the set changes; `superseded` triggers the reload notice.
+  Best effort: no replay, and the SDK documents it.
+
+### Scheduled jobs (step 5)
+
+- `backend_cron(asset_id uuid, name text, schedule text, next_run_at
+  timestamptz, last_run_at timestamptz NULL, last_status text NULL,
+  last_error text NULL, last_duration_ms int NULL, PRIMARY KEY (asset_id,
+  name))`. Rewritten in the same transaction that changes a page's current
+  version (commit, restore): rows for jobs the new version declares are
+  upserted (keeping `last_*` for a name that stays), others deleted.
+- A ticker every 30 s (injectable) claims due rows with `FOR UPDATE SKIP
+  LOCKED`, skips pages that are archived or whose runner is unavailable
+  (`last_status = "skipped"`), sets `next_run_at` to the next slot after
+  now (no catch-up), and calls the runner. At most 4 jobs run at once per
+  specola process.
+- specola → runner `POST /scheduled`: same headers as `/invoke`, the head
+  has `"event": {"name","scheduledTime": <ms>}` instead of `request`,
+  `user: null`, `role: "cron"`. The runner calls the default export's
+  `scheduled(event, ctx)` with a 5-minute limit and answers
+  `{"status":"ok"|"no-handler"|"error"|"timeout","ref"?}`. `last_status`
+  stores that status (`"unavailable"` when the runner can't be reached),
+  `last_error` the ref and message.
+- `GET /api/pages/{id}/backend/cron` (owners, editors) →
+  `{"jobs":[{"name","schedule","nextRunAt","lastRunAt"?,"lastStatus"?,"lastError"?,"lastDurationMs"?}]}`.
+- Cron times are UTC; schedules use the five fields validated in step 1.
+
+### Public links (step 6)
+
+- For a backend page, `/s/{token}` and `/s/{token}/*` serve the **shell**:
+  a small HTML document (embedded in the binary, inline script, its own
+  CSP: `default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src
+  'self'; connect-src 'self'; style-src 'unsafe-inline'`), `Cache-Control:
+  no-store`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex`. It
+  frames `/s/{token}/~page/<rest of the path>?<query>`, which serves the
+  page exactly as `/s/{token}` does today, with basename
+  `/s/{token}/~page`. A page without a backend keeps today's behaviour (and
+  `~page` answers 404 for it).
+- The shell implements the viewer's side of the port: the backend state
+  (from boot data in the shell), `fetch` → `ANY /p/{token}/x/{path}` with
+  `X-Specola-Version` and `X-Specola-Headers`, streaming, abort,
+  `sub`/`unsub` → `GET /p/{token}/events?v=&topic=`. It hands no
+  `localStorage` data, so the page's storage stays in memory as today.
+- `/p/{token}/x/*`: the link must be valid as for serving (else 404/410);
+  the method and path (without query) must match one of the version's
+  `public` patterns (else 403 `not-public`, the runner is not called); rate
+  limits 60 requests/min per (link, client IP) and 600/min per link (429
+  `too-many-requests`, `Retry-After`). The head has `user: null`,
+  `role: "public"`, `link: {"id","label"}`. Same header rules, limits and
+  errors as `/api/pages/{id}/x`.
+- `/p/{token}/events`: only topics in `topics.public` (others 403
+  `not-public`), never targeted events.
+- Client IP is `RemoteAddr`, or the first `X-Forwarded-For` hop only when
+  `SPECOLA_TRUST_FORWARDED=1`.
+
+### MCP (step 7)
+
+All four act as the user, with the same access rules as the API; for a
+page without a backend they answer an error saying so.
+
+- `call_backend(id, method, path, body?, headers?)` — calls the current
+  version exactly as `specola.fetch` would. Returns `{status, headers,
+  body, body_encoding: "utf-8"|"base64", truncated}`; at most 64 KiB of body.
+- `backend_logs(id, since?)` — owners and editors; the log lines.
+- `backend_query(id, sql, params?)` — owners and editors; one read-only
+  statement on the shared database through runner `POST
+  /pages/{id}/query` `{sql, params}` → `{columns, rows, truncated}`. The
+  runner opens `shared.sqlite` read-only (`readOnly: true`, plus `PRAGMA
+  query_only`) in a short-lived child process with `--permission` read
+  access to that file only, kills it after 5 s (`backend-timeout`), and
+  returns at most 1000 rows / 1 MiB.
+- `list_secrets(id)` — owners and editors; the same as `GET
+  /api/pages/{id}/secrets`, with a note that values are set by owners in
+  the UI only.
+- Instructions (enabled): the full backend feature as built, kept short:
+  plugin option, handler shape, `ctx` fields, `specola.fetch` and
+  `subscribe`, `backend.json` fields, secrets set by owners, egress
+  allowlist, cron in UTC, public routes, data per page across versions,
+  only the current version live, and these four tools for testing.
+  `get_page` carries `backend: {manifest, secrets_missing}` for the
+  current version.
+
 ## Plugin and CLI
 
 `specola({ server: "server/index.ts", backend: {…manifest fields} })`:
