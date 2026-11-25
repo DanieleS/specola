@@ -612,10 +612,88 @@ bad migrations, **not** from losing the volume. Back up the volume.
 | Unarchived | Everything resumes |
 | New version without a backend | Kept dormant; the panel still offers export, snapshots and wipe; a later backend version finds it |
 | A user loses access | Their `userDb` stays, unreachable; it comes back with the access (as `localStorage` does today) |
-| Purge | Specola never deletes a page, so backend data of a page archived or without a backend for more than `RUNNER_PURGE_AFTER_DAYS` days (default: never) is deleted with its snapshots. The panel and the Archived list show the date 7 days ahead |
+| Purge | Specola never deletes a page, so backend data of a page that has been **dormant** (archived, itself or through a folder, or whose current version has no backend) for more than `SPECOLA_BACKEND_PURGE_AFTER_DAYS` days (default: never) is deleted with its snapshots. The panel and the Archived list show the date from 7 days ahead |
 
 MCP gets none of the destructive operations (restore, import, wipe): they
 are UI-only, for owners.
+
+### Wire formats for data (exact)
+
+**Who has data.** Specola records `asset.backend_used_at` (set on the
+first call the runner answers, kept current at most once an hour, cleared
+by a purge). A page has **backend data** when it is set. `GET
+/api/pages/{id}` carries `backendData: bool` and, when a purge is
+scheduled within 7 days, `backendPurgeAt` (RFC 3339); `GET /api/archived`
+carries `backendPurgeAt` per page the same way. **Dormant since** is the
+latest of: when the page or the folder above it that archived it was
+archived, and when the current version became current if it has no
+backend. A page with backend data and no current backend still shows the
+Backend panel (data only).
+
+**Specola API** (session; `id` must be a page the caller can view, else
+404; roles as stated, else 403 `forbidden`; all answers JSON unless said;
+every error carries `X-Specola-Error`; disabled/unavailable as for calls):
+
+| Route | Who | What |
+| --- | --- | --- |
+| `GET /api/pages/{id}/backend/data` | owner, editor | `{usage:{pageBytes, pageLimit, snapshotBytes, snapshotLimit}, snapshots:[Snapshot]}`, newest first |
+| `POST /api/pages/{id}/backend/snapshots` | owner | body `{label}` (1–100 chars) → 201 `Snapshot`; 409 `too-many-snapshots` past 10 manual ones |
+| `DELETE /api/pages/{id}/backend/snapshots/{sid}` | owner | manual snapshots only (409 `not-manual` otherwise) → 204 |
+| `POST /api/pages/{id}/backend/snapshots/{sid}/restore` | owner | → 200 `{before: Snapshot}` (the snapshot taken first) |
+| `GET /api/pages/{id}/backend/export` | owner, editor | `application/zip`, `Content-Disposition` attachment `<title>-data.zip` |
+| `PUT /api/pages/{id}/backend/import` | owner | body the zip (≤ 1 GiB, `application/zip`) → 200 `{before: Snapshot}`; 400 `bad-import` naming what's wrong |
+| `POST /api/pages/{id}/backend/wipe` | owner | body `{scope:"shared"\|"users"}` → 200 `{before: Snapshot}` |
+| `GET /api/pages/{id}/backend/my-data` | any viewer | the caller's `userDb` as `application/vnd.sqlite3`, attachment `<title>-my-data.sqlite`; 404 `no-data` when they have none |
+| `DELETE /api/pages/{id}/backend/my-data` | any viewer | → 204 (also when there was none) |
+
+Version restore with data: the viewer restores the version as today, then
+calls the snapshot restore for the newest `version` snapshot whose
+`version` is the restored one, if the owner ticked it.
+
+`Snapshot` is `{"id", "kind", "label"?, "version"?, "createdAt",
+"sizeBytes"}`; `kind` is `version` (with `version`: the version that was
+leaving), `daily`, `manual` (with `label`), `before-restore`,
+`before-import` or `before-wipe`. `id` is `<UTC stamp>-<kind>` with an
+optional `-v<N>`, matching `^[0-9]{8}T[0-9]{6}Z-[a-z-]+(-v[0-9]+)?$`.
+
+**Export zip**: `manifest.json` (`{"format":"specola-backend-data",
+"formatVersion":1, "page":{"id","title","version"}, "exportedAt"}`),
+`shared.sqlite` (absent when the page has none), `files/index.json`
+(`[{"key","contentType","size","sha256"}]`) and each file at
+`files/data/<key>`. Deflate for everything but the SQLite file and blobs
+whose content type is already compressed. Import accepts exactly this
+layout (unknown entries, paths outside it, duplicate or invalid keys, a
+`sha256` that doesn't match, or an expanded size over the page quota are
+`bad-import`; nothing is changed then). Import replaces `shared.sqlite` and
+the file store, never users' databases.
+
+**Runner** (bearer; specola has already checked access; page id
+canonical; the caller's sub, when one is needed, in
+`X-Specola-Sub`, which the runner hashes):
+
+| Route | What |
+| --- | --- |
+| `GET /pages/{id}/data` | `{usage, snapshots}` as above |
+| `POST /pages/{id}/snapshots` | `{kind:"manual", label}` → 201 `Snapshot` |
+| `DELETE /pages/{id}/snapshots/{sid}` | → 204 |
+| `POST /pages/{id}/snapshots/{sid}/restore` | → `{before}` |
+| `GET /pages/{id}/export` | the zip, streamed |
+| `PUT /pages/{id}/import` | the zip → `{before}` |
+| `POST /pages/{id}/wipe` | `{scope}` → `{before}` |
+| `GET /pages/{id}/my-data` | the sub's database, 404 `no-data` |
+| `DELETE /pages/{id}/my-data` | → 204 |
+| `DELETE /pages/{id}` | purge everything of the page (data, snapshots, state) → 204, also when there was nothing |
+
+Restore, import, wipe and purge take the page **offline** while they run:
+the worker is drained and stopped, new calls wait (up to the first-byte
+timeout, then 503 `backend-unavailable`), and the next call starts a fresh
+worker. Daily snapshots are taken by the runner after a call, in the
+background, when the newest `daily` one is older than 24 h.
+
+**Purge** runs in specola every hour: pages with `backend_used_at` set and
+dormant for longer than the setting get `DELETE /pages/{id}` on the runner,
+then `backend_used_at` cleared. It never runs when backends are disabled
+or the runner is unavailable (it retries the next hour).
 
 ## Plugin and CLI
 
@@ -691,7 +769,7 @@ amount; the log warns at 99%.
 | `SPECOLA_URL` | runner | specola's internal base URL |
 | `RUNNER_DATA_DIR` | runner | the volume (default `/data`) |
 | `RUNNER_LISTEN` | runner | listen address (default `:8081`) |
-| `RUNNER_PURGE_AFTER_DAYS` | runner | purge data of dormant pages after this many days (default: never) |
+| `SPECOLA_BACKEND_PURGE_AFTER_DAYS` | specola | purge backend data of pages dormant this long (default: never) |
 
 `docker-compose.yaml` gains a `runner` service and volume, commented out by
 default.
