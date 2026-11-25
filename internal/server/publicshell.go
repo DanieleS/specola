@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/danieles/specola/internal/backend"
+	"github.com/danieles/specola/internal/pageapp"
 	"github.com/danieles/specola/internal/store"
 
 	"github.com/go-chi/chi/v5"
@@ -69,6 +70,11 @@ func (s *Server) routesPublic(r chi.Router) {
 	r.HandleFunc("/p/{token}/x", s.handlePublicCall)
 	r.HandleFunc("/p/{token}/x/*", s.handlePublicCall)
 	r.Get("/p/{token}/events", s.handlePublicEvents)
+	// The visitor's page data (visitors.go).
+	r.Post("/p/{token}/visitor", s.handleNewVisitor)
+	r.Get("/p/{token}/data", s.handleVisitorData)
+	r.Patch("/p/{token}/data", s.handleUpdateVisitorData)
+	r.Delete("/p/{token}/data", s.handleUpdateVisitorData)
 	// Anything else under /p/ is not a page of the app.
 	r.HandleFunc("/p/*", http.NotFound)
 }
@@ -111,7 +117,11 @@ func (s *Server) handlePublicShell(w http.ResponseWriter, r *http.Request) {
 	if t.Manifest != nil {
 		state = s.backendState()
 	}
-	look := publicLook(t, sv)
+	look, err := s.publicLook(r.Context(), t, sv)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
 	boot, _ := json.Marshal(shellBoot{
 		Token: token, Version: t.Version, Backend: state, PageSrc: src,
 		HasBackend: t.Manifest != nil, Bundle: sv.BundleKey != "", Name: look.Name,
@@ -138,8 +148,12 @@ func (s *Server) handlePublicShell(w http.ResponseWriter, r *http.Request) {
 
 // publicLook is how a public link's app looks: as the page's signed-in app,
 // from the version the link shows.
-func publicLook(t *store.PublicTarget, sv *store.ServedVersion) appLook {
-	return appLookFrom(t.ID, t.Title, sv.HTML)
+func (s *Server) publicLook(ctx context.Context, t *store.PublicTarget, sv *store.ServedVersion) (pageapp.Look, error) {
+	settings, err := s.st.AppSettings(ctx, t.ID)
+	if err != nil {
+		return pageapp.Look{}, err
+	}
+	return pageapp.LookOf(t.ID, t.Title, sv.HTML, settings), nil
 }
 
 // handlePublicManifest serves a public link's app manifest. Its id and start
@@ -154,10 +168,13 @@ func (s *Server) handlePublicManifest(w http.ResponseWriter, r *http.Request) {
 		publicLinkError(w, err)
 		return
 	}
+	look, err := s.publicLook(r.Context(), t, sv)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
 	base := "/s/" + url.PathEscape(token)
-	m := manifestOf(base+"/", publicLook(t, sv))
-	m.Scope = base
-	writeManifest(w, m)
+	writeManifest(w, pageapp.ManifestOf(base+"/", base, look))
 }
 
 // handlePublicSW serves the public links' service worker, which keeps their
@@ -247,6 +264,7 @@ func (s *Server) handlePublicCall(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
 	path := strings.TrimPrefix(r.URL.EscapedPath(), "/p/"+token+"/x")
 	ip := s.clientIP(r)
+	var visitor *backend.Visitor
 	s.callBackend(w, r, backendCall{
 		page:      backend.Page{ID: t.ID, Version: t.Version, Title: t.Title},
 		versionID: t.VersionID,
@@ -268,8 +286,18 @@ func (s *Server) handlePublicCall(w http.ResponseWriter, r *http.Request) {
 					fmt.Sprintf("a public link takes at most %d calls a minute from one address, and %d in all", publicCallsPerIP, publicCallsPerLink))
 				return false
 			}
+			// The caller's visitor, if it sent one: its own userDb.
+			v, err := s.visitor(r, token)
+			if err != nil {
+				visitorError(w, err)
+				return false
+			}
+			if v != nil {
+				visitor = &backend.Visitor{ID: v.Hash}
+			}
 			return true
 		},
+		visitor: func() *backend.Visitor { return visitor },
 	})
 }
 
@@ -422,8 +450,11 @@ func (s *Server) clientIP(r *http.Request) string {
 
 // rateLimiter keeps the public links' call budgets: token buckets, one per
 // (link, IP) and one per link, each holding a minute's worth of calls and
-// refilled continuously. Its zero value is ready to use.
+// refilled continuously. Its zero value is ready to use, with the budgets of
+// public calls; perIP and perLink, when set, are other budgets a minute.
 type rateLimiter struct {
+	perIP, perLink float64
+
 	mu        sync.Mutex
 	buckets   map[string]*bucket
 	lastSweep time.Time
@@ -454,6 +485,12 @@ func (l *rateLimiter) allow(link, ip string, now time.Time) time.Duration {
 	}
 	keys := []string{"ip\x00" + link + "\x00" + ip, "link\x00" + link}
 	caps := []float64{publicCallsPerIP, publicCallsPerLink}
+	if l.perIP > 0 {
+		caps[0] = l.perIP
+	}
+	if l.perLink > 0 {
+		caps[1] = l.perLink
+	}
 	var wait time.Duration
 	for i, k := range keys {
 		b := l.buckets[k]

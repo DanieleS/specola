@@ -168,6 +168,27 @@ async function checkApps(app) {
   check((await page.title()) === 'Load counter', "offline, the app's own shell", await page.title());
   await context.setOffline(false);
 
+  // The author sets how the app looks: in the viewer's App dialog, a name
+  // and an uploaded icon, which the app's manifest then has.
+  await page.goto(`${app}/#/p/${id}`);
+  await page.getByRole('button', { name: 'App…' }).click();
+  const dialog = page.locator('[data-app-settings]');
+  await dialog.locator('[data-app-name]').fill('Counter app');
+  await dialog.locator('[data-app-save]').click();
+  await dialog.getByText('Saved.').waitFor();
+  const png = Buffer.from(await (await fetch(`${app}/app-icons/g/1d4ed8/C/512.png`)).arrayBuffer());
+  await dialog.locator('[data-app-icon-input]').setInputFiles({ name: 'icon.png', mimeType: 'image/png', buffer: png });
+  await dialog.getByText('Use the generated icon').waitFor();
+  await page.goto(`${app}/app/${id}/`);
+  const set = await cdp.send('Page.getAppManifest');
+  const sm = set.data ? JSON.parse(set.data) : {};
+  check(
+    sm.name === 'Counter app' && sm.icons?.length === 1 && /^\/app-icons\/[0-9a-f]{64}\.png$/.test(sm.icons[0].src) && sm.icons[0].sizes === '512x512',
+    "the author's name and icon reach the app's manifest",
+    sm,
+  );
+  check((await page.title()) === 'Counter app', "and the app's title", await page.title());
+
   // A page that isn't there (or not for this user).
   await page.goto(`${app}/app/${randomUUID()}/`);
   await page.locator('[data-app-gone]').waitFor({ timeout: 10000 }).catch(() => {});
@@ -203,8 +224,31 @@ async function checkPublicApps(app) {
   );
   check((await page.title()) === 'Public counter', 'the shell is titled after the page', await page.title());
   const f = page.frameLocator('iframe');
-  await f.locator('body[data-saved]').waitFor({ timeout: 15000 });
-  check(/^count \d+$/.test(await f.locator('#count').textContent()), 'the page shows in the shell');
+  const shown = async () => {
+    await f.locator('body[data-saved]').waitFor({ timeout: 15000 });
+    return { count: await f.locator('#count').textContent(), persistent: await f.locator('body').getAttribute('data-saved') };
+  };
+  let got = await shown();
+  check(got.count === 'count 1' && got.persistent === 'true', 'the page shows in the shell, with storage that persists', got);
+
+  // An anonymous visitor: its localStorage is kept across reloads, apart
+  // from another browser's (docs/page-apps.md, "Anonymous visitors").
+  const token = path.slice(3);
+  const secret = await page.evaluate((t) => localStorage.getItem('specola:public-visitor:' + t), token);
+  check(/^"[A-Za-z0-9_-]{43}"$/.test(secret ?? ''), "the first write made a visitor, its secret kept by the link's shell", secret);
+  check((await context.cookies()).length === 0, 'and no cookies at all');
+  await page.reload();
+  got = await shown();
+  check(got.count === 'count 2', "the visitor's localStorage is kept across reloads", got);
+  const other = await browser.newContext();
+  const op = await other.newPage();
+  await op.goto(link.url);
+  await op.frameLocator('iframe').locator('body[data-saved]').waitFor({ timeout: 15000 });
+  const otherCount = await op.frameLocator('iframe').locator('#count').textContent();
+  check(otherCount === 'count 1', 'another browser is another visitor, with data of its own', otherCount);
+  await other.close();
+  const listed = await (await fetch(`${app}/api/pages/${id}/links`)).json();
+  check(listed[0]?.visitors === 2 && listed[0].visitorBytes > 0, 'the owner sees two visitors keep data', listed[0]);
 
   // Installed: the shell keeps the page. Headless Chromium can't emulate
   // display-mode, so navigator.standalone (iOS's flag) says it.
@@ -220,10 +264,21 @@ async function checkPublicApps(app) {
   await page.reload();
   const offline = page.frameLocator('iframe');
   await offline.locator('#count').waitFor({ timeout: 15000 }).catch(() => {});
-  const shown = await offline.locator('#count').textContent().catch(() => null);
-  check(/^count \d+$/.test(shown ?? ''), 'offline, the public app opens from the kept copy', shown);
+  const offCount = await offline.locator('#count').textContent().catch(() => null);
+  check(/^count \d+$/.test(offCount ?? ''), 'offline, the public app opens from the kept copy', offCount);
+  // Its data is the copy the shell keeps, with what it couldn't save yet.
+  const n = Number(offCount?.split(' ')[1]);
+  await page.reload();
+  await offline.locator('#count').waitFor({ timeout: 15000 }).catch(() => {});
+  const again = await offline.locator('#count').textContent().catch(() => null);
+  check(again === `count ${n + 1}`, 'offline, writes are kept across reloads', { before: offCount, after: again });
   check((await page.title()) === 'Public counter', "offline, the link's own shell", await page.title());
   await context.setOffline(false);
+  // Back online, the shell saves them.
+  await page.reload();
+  await f.locator('body[data-saved]').waitFor({ timeout: 15000 });
+  const online = await f.locator('#count').textContent();
+  check(online === `count ${n + 2}`, 'back online, the offline writes are saved', online);
 
   // Revoked: the link answers 404 and the worker drops what it kept.
   const links = await (await fetch(`${app}/api/pages/${id}/links`)).json();

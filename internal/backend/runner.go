@@ -176,6 +176,12 @@ type Link struct {
 	Label string `json:"label"`
 }
 
+// Visitor is a public link's anonymous visitor, as ctx.visitor: the
+// sha256 (hex) of its secret, which its userDb is kept by.
+type Visitor struct {
+	ID string `json:"id"`
+}
+
 // Request is the head of the page's request: method, path with query, and
 // headers in order.
 type Request struct {
@@ -193,6 +199,7 @@ type Invoke struct {
 	User      *User             `json:"user"`
 	Role      string            `json:"role"`
 	Link      *Link             `json:"link"`
+	Visitor   *Visitor          `json:"visitor,omitempty"`
 	Secrets   map[string]string `json:"secrets"`
 	Egress    []string          `json:"egress"`
 	Request   Request           `json:"request"`

@@ -76,6 +76,9 @@ func main() {
 		slog.Warn("test hooks set: for tests only", "SPECOLA_TEST_CRON_EVERY", cfg.TestCronEvery, "SPECOLA_TEST_CLOCK_OFFSET", cfg.TestClockOffset)
 	}
 	h := server.New(cfg, st, authn, tokens)
+	// Public links' anonymous visitors: idle ones forgotten, their backend
+	// data deleted.
+	go h.SweepVisitors(ctx)
 	if cfg.BackendsEnabled() {
 		slog.Info("page backends: enabled", "runner", cfg.RunnerURL)
 		go h.WatchRunner(ctx)

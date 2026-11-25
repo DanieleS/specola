@@ -285,6 +285,46 @@ describe('handlers', () => {
     assert.equal(await res.text(), 'https://page.invalid//evil.example/x');
   });
 
+  test('a public link visitor has its own userDb, capped', async () => {
+    const v = r.publish(
+      backend(`export default {
+        async fetch(request, ctx) {
+          const url = new URL(request.url);
+          if (!ctx.userDb) return Response.json({ visitor: ctx.visitor, mine: null });
+          ctx.userDb.exec('CREATE TABLE IF NOT EXISTS mine (x)');
+          if (url.pathname === '/big') {
+            try {
+              ctx.userDb.prepare('INSERT INTO mine VALUES (?)').run('x'.repeat(20 * 1024 * 1024));
+              return new Response('stored');
+            } catch (e) {
+              return new Response('refused: ' + e.message);
+            }
+          }
+          ctx.userDb.prepare('INSERT INTO mine VALUES (1)').run();
+          return Response.json({ visitor: ctx.visitor, user: ctx.user, mine: ctx.userDb.prepare('SELECT count(*) AS n FROM mine').get().n });
+        },
+      }`),
+    );
+    const a = 'a'.repeat(64);
+    const b = 'b'.repeat(64);
+    const call = (o) => r.invoke({ ...v, page: 'h-visitor', user: null, role: 'public', link: { id: 'l1', label: '' }, ...o });
+    assert.deepEqual(await (await call({ visitor: { id: a } })).json(), { visitor: { id: a }, user: null, mine: 1 });
+    assert.deepEqual(await (await call({ visitor: { id: a } })).json(), { visitor: { id: a }, user: null, mine: 2 });
+    assert.deepEqual(await (await call({ visitor: { id: b } })).json(), { visitor: { id: b }, user: null, mine: 1 });
+    assert.deepEqual(await (await call({})).json(), { visitor: null, mine: null }, 'no visitor, no userDb');
+    assert.match(await (await call({ visitor: { id: a }, path: '/big' })).text(), /^refused: .*full/);
+
+    // Its database is the subject anon:{id}'s, as Specola deletes it.
+    const { createHash } = await import('node:crypto');
+    const name = createHash('sha256').update('anon:' + a).digest('hex') + '.sqlite';
+    assert.ok((await fs.readdir(path.join(r.dataDir, 'pages', 'h-visitor', 'users'))).includes(name));
+
+    const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const head = { page: { id: 'p', version: 1, title: 't' }, versionId: 'v', codeHash: 'a'.repeat(64), user: null, role: 'public', link: null, request: { method: 'GET', path: '/', headers: [] } };
+    assert.throws(() => parseInvoke(enc({ ...head, visitor: { id: 'short' } })), { code: 'bad-request' });
+    assert.throws(() => parseInvoke(enc({ ...head, user: { sub: 's', email: 'e', name: 'n' }, role: 'viewer', visitor: { id: a } })), { code: 'bad-request' });
+  });
+
   test('an invoke head up to the 48 KiB cap specola allows fits', async () => {
     const v = r.publish(backend(`export default { fetch: (req) => new Response(String(req.headers.get('x-big').length)) }`));
     // Base64url grows the JSON by a third: ~44 KiB on the wire, past Node's

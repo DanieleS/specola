@@ -74,6 +74,50 @@ export type PublicLink = {
   expired: boolean;
   lastUsedAt?: string;
   views: number;
+  /** Anonymous visitors that keep data on the link (docs/page-apps.md), and how much their localStorage takes. */
+  visitors?: number;
+  visitorBytes?: number;
+};
+
+/** How a page's app looks (docs/page-apps.md, "Author settings"). */
+export type AppDisplay = "standalone" | "fullscreen" | "minimal-ui";
+export type AppOrientation = "portrait" | "landscape";
+export type AppSettingsInput = {
+  name?: string | null;
+  shortName?: string | null;
+  display?: AppDisplay | null;
+  orientation?: AppOrientation | null;
+  themeColor?: string | null;
+  backgroundColor?: string | null;
+  iconMaskable?: boolean;
+};
+export type AppSettings = {
+  /** As set: null fields take the default. */
+  settings: {
+    name: string | null;
+    shortName: string | null;
+    display: AppDisplay | null;
+    orientation: AppOrientation | null;
+    themeColor: string | null;
+    backgroundColor: string | null;
+    iconMaskable: boolean;
+    /** An uploaded icon's URL, or null for the generated one. */
+    icon: string | null;
+  };
+  /** In effect, defaults filled in. */
+  effective: {
+    name: string;
+    shortName: string;
+    display: AppDisplay;
+    orientation?: AppOrientation;
+    themeColor: string;
+    backgroundColor: string;
+    /** At 512 px. */
+    icon: string;
+    iconMaskable: boolean;
+  };
+  url: string;
+  canEdit: boolean;
 };
 
 export type SearchResult = TreeItem & {
@@ -347,6 +391,20 @@ export const api = {
   createPage: (name: string, html: string, folderId: string | null, note: string) =>
     req<{ id: string; version: number }>("POST", "/api/pages", { name, html, folderId, note }),
   pageMeta: (id: string) => req<PageMeta>("GET", `/api/pages/${id}`),
+  appSettings: (id: string) => req<AppSettings>("GET", `/api/pages/${id}/app`),
+  setAppSettings: (id: string, s: AppSettingsInput) => req<AppSettings>("PUT", `/api/pages/${id}/app`, s),
+  resetApp: (id: string) => req<AppSettings>("DELETE", `/api/pages/${id}/app`),
+  setAppIcon: async (id: string, png: Blob) => {
+    const res = await fetch(`/api/pages/${id}/app/icon`, {
+      method: "PUT",
+      headers: { "Content-Type": "image/png" },
+      body: png,
+      credentials: "same-origin",
+    });
+    if (!res.ok) await fail(res);
+    return (await res.json()) as AppSettings;
+  },
+  deleteAppIcon: (id: string) => req<AppSettings>("DELETE", `/api/pages/${id}/app/icon`),
   shared: () => req<TreeItem[]>("GET", "/api/shared"),
   archived: () => req<TreeItem[]>("GET", "/api/archived"),
   favorites: () => req<TreeItem[]>("GET", "/api/favorites"),

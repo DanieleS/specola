@@ -309,6 +309,9 @@ type backendCall struct {
 	user  *backend.User
 	role  string
 	link  *backend.Link
+	// visitor, when set, is the public link's visitor making the call,
+	// asked once the call is allowed (it may make one: visitors.go).
+	visitor func() *backend.Visitor
 	// limitKey counts the calls running for one caller on one page.
 	limitKey string
 	// path is the escaped path below …/x the page asked for, without the
@@ -404,6 +407,7 @@ func (s *Server) callBackend(w http.ResponseWriter, r *http.Request, c backendCa
 		User:      c.user,
 		Role:      c.role,
 		Link:      c.link,
+		Visitor:   visitorOf(c),
 		Secrets:   secrets,
 		Egress:    egress,
 		Request:   backend.Request{Method: r.Method, Path: path, Headers: headers},

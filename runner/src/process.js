@@ -315,6 +315,7 @@ export class PageWorker {
       user: inv.user,
       role: inv.role,
       link: inv.link,
+      visitor: inv.visitor ?? null,
       secrets: declaredSecrets(inv.secrets, this.secretNames),
       request: { method: inv.request.method, path: inv.request.path, headers: requestHeaders(inv.request.headers) },
     });

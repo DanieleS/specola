@@ -29,6 +29,7 @@ export const RUNNER_VERSION = JSON.parse(readFileSync(new URL('../package.json',
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const HASH = /^[0-9a-f]{64}$/;
+const VISITOR = HASH;
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/; // an HTTP method
 const ROLES = new Set(['owner', 'editor', 'viewer', 'public', 'cron']);
 // Specola caps the encoded X-Specola-Invoke at 48 KiB; Node's default
@@ -86,6 +87,11 @@ function parseHead(header, scheduled) {
   if (!ROLES.has(inv.role)) throw bad('role is invalid');
   if ((inv.role === 'public' || inv.role === 'cron') !== (user === null)) throw bad('user and role disagree');
   if (link != null && !(isObject(link) && isString(link.id) && isString(link.label))) throw bad('link is invalid');
+  // A public link's anonymous visitor (docs/page-apps.md, "Anonymous
+  // visitors"): only on a public call.
+  const visitor = inv.visitor ?? null;
+  if (visitor !== null && !(isObject(visitor) && isString(visitor.id) && VISITOR.test(visitor.id))) throw bad('visitor is invalid');
+  if (visitor !== null && inv.role !== 'public') throw bad('only a public call has a visitor');
   const secrets = inv.secrets ?? {};
   if (!isObject(secrets) || !Object.values(secrets).every(isString)) throw bad('secrets is invalid');
   const egress = inv.egress ?? [];
@@ -97,6 +103,7 @@ function parseHead(header, scheduled) {
     user: user && { sub: user.sub, email: user.email, name: user.name },
     role: inv.role,
     link: link ? { id: link.id, label: link.label } : null,
+    visitor: visitor && { id: visitor.id },
     secrets,
     egress,
   };

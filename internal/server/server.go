@@ -65,6 +65,9 @@ type Server struct {
 	// public links' call budgets (publicshell.go).
 	push         pushHub
 	publicLimits rateLimiter
+	// visitorLimits bounds how fast public links get new visitors
+	// (visitors.go).
+	visitorLimits rateLimiter
 	// cron runs the pages' scheduled jobs (cron.go).
 	cron cronState
 }
@@ -74,6 +77,7 @@ type Server struct {
 // "oauth"; it is ignored otherwise.
 func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.TokenVerifier) *Server {
 	s := &Server{cfg: cfg, st: st, auth: a, now: time.Now, purgeEvery: purgeEvery}
+	s.visitorLimits.perIP, s.visitorLimits.perLink = newVisitorsPerIP, newVisitorsPerLink
 	// Test hooks (config.go: dev bypass only), for e2e/backends.mjs.
 	s.cron.every = cfg.TestCronEvery
 	if off := cfg.TestClockOffset; off != 0 {
@@ -151,7 +155,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		vr.Get("/view/{id}", s.handleTokenView)
 		vr.Get("/view/{id}/*", s.handleTokenView)
 		s.routesPublic(vr)
-		routesAppIcons(vr)
+		s.routesAppIcons(vr)
 		vr.Get("/b/{key}/*", s.handleBundleFile)
 		vr.Head("/b/{key}/*", s.handleBundleFile)
 		s.viewMux = vr
@@ -159,7 +163,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 
 	// Page apps' icons need no session (apps.go); any other path under
 	// /app/ than an app's own answers 404 rather than the SPA shell.
-	routesAppIcons(r)
+	s.routesAppIcons(r)
 	r.Handle("/app/*", http.NotFoundHandler())
 
 	r.Group(func(r chi.Router) {
@@ -180,6 +184,11 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Post("/folders", s.handleCreateFolder)
 			r.Post("/pages", s.handleCreatePage)
 			r.Get("/pages/{id}", s.handlePageMeta)
+			r.Get("/pages/{id}/app", s.handleAppSettings)
+			r.Put("/pages/{id}/app", s.handleSetAppSettings)
+			r.Delete("/pages/{id}/app", s.handleResetApp)
+			r.Put("/pages/{id}/app/icon", s.handleSetAppIcon)
+			r.Delete("/pages/{id}/app/icon", s.handleDeleteAppIcon)
 			r.Get("/pages/{id}/versions", s.handleVersions)
 			r.Post("/pages/{id}/versions", s.handleAddVersion)
 			r.Get("/pages/{id}/versions/{v}/files", s.handleVersionFiles)

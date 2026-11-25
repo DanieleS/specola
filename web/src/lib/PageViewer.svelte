@@ -13,6 +13,7 @@
   import ConfirmDialog from "./ConfirmDialog.svelte";
   import { backends, refreshBackends } from "./backends.svelte";
   import * as offline from "./offline.svelte";
+  import AppSettings from "./AppSettings.svelte";
   import PageFrame, { viewSrc } from "./PageFrame.svelte";
   import ShareDialog from "./ShareDialog.svelte";
   import { versionSnapshot } from "./snapshots";
@@ -22,6 +23,8 @@
   let meta = $state<PageMeta | null>(null);
   let error = $state("");
   let sharing = $state(false);
+  // The App settings dialog (docs/page-apps.md, "Author settings").
+  let appOpen = $state(false);
   // The side panel open, if any.
   let panel = $state<"history" | "backend" | null>(null);
   // The Backend panel's tab, kept while it is closed and set by the
@@ -334,6 +337,9 @@
           title="Open this page on its own, to install it as an app on this device">Install as app ↗</a
         >
       {/if}
+      {#if canEdit && !readOffline}
+        <button class={action} onclick={() => (appOpen = true)} title="How this page looks once installed as an app">App…</button>
+      {/if}
       {#if src}
         <a href={src} target="_blank" rel="noopener noreferrer" class={action}>Open raw ↗</a>
       {/if}
@@ -505,6 +511,10 @@
       <p class="text-white/50">The data stays as it is now.</p>
     {/if}
   </ConfirmDialog>
+{/if}
+
+{#if appOpen}
+  <AppSettings {id} onclose={() => (appOpen = false)} />
 {/if}
 
 {#if sharing && meta}

@@ -163,3 +163,23 @@ func TestTestHooks(t *testing.T) {
 		})
 	}
 }
+
+func TestPublicVisitorsPerLink(t *testing.T) {
+	for v, want := range map[string]int{"": DefaultPublicVisitorsPerLink, "5": 5, "0": -1, "-3": -1, "many": -1} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("SPECOLA_DATABASE_URL", "postgres://x")
+			t.Setenv("SPECOLA_DEV_AUTH_EMAIL", "dev@example.com")
+			t.Setenv("SPECOLA_PUBLIC_VISITORS_PER_LINK", v)
+			c, err := Load()
+			if want < 0 {
+				if err == nil || !strings.Contains(err.Error(), "SPECOLA_PUBLIC_VISITORS_PER_LINK") {
+					t.Fatalf("err = %v", err)
+				}
+				return
+			}
+			if err != nil || c.VisitorsPerLink() != want {
+				t.Fatalf("visitors = %d, err = %v", c.VisitorsPerLink(), err)
+			}
+		})
+	}
+}

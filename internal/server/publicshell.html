@@ -52,9 +52,14 @@
 // - the first hello from the framed document gets the port, with the backend
 //   state of the boot data; a later hello (the frame reloaded or navigated)
 //   is refused, as in the viewer: one port per frame load;
-// - no localStorage data is handed over (the frame has no name), so the
-//   page's storage stays in memory, as on any public link; a write that
-//   reaches the port anyway is refused;
+// - localStorage is the visitor's (docs/page-apps.md, "Anonymous
+//   visitors"): loaded from GET /p/{token}/data and handed over in the
+//   frame's name, writes saved one at a time with PATCH, retried while
+//   offline and kept in this origin's localStorage until saved, with a copy
+//   of the data for offline. Before the first write or backend call the
+//   shell asks for a visitor (POST /p/{token}/visitor), whose secret it keeps
+//   here and sends in X-Specola-Visitor; past the link's cap, writes are
+//   refused and the page's storage stays in memory. No cookies are sent;
 // - fetch goes to ANY /p/{token}/x/{path} with X-Specola-Version and
 //   X-Specola-Headers, streamed back as head, chunks and end; abort cancels;
 //   backend-disabled, backend-unavailable and superseded become a
@@ -139,9 +144,200 @@
       .catch(function () {});
   }
 
+  // --- the visitor's localStorage -------------------------------------
+  var DATA = "/p" + tokenPath + "/data";
+  var VISITOR = "specola:public-visitor:" + token;
+  var SNAPSHOT = "specola:public-data:" + token;
+  var OUTBOX = "specola:public-outbox:" + token;
+  function read(key) {
+    try {
+      return JSON.parse(localStorage.getItem(key));
+    } catch (err) {
+      return null;
+    }
+  }
+  function write(key, v) {
+    try {
+      if (v === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, JSON.stringify(v));
+    } catch (err) {
+      // Full or unavailable: kept while this runs.
+    }
+  }
+  function apply(data, w) {
+    if (w.clear) data = {};
+    (Array.isArray(w.remove) ? w.remove : []).forEach(function (k) { delete data[k]; });
+    var set = w.set && typeof w.set === "object" ? w.set : {};
+    Object.keys(set).forEach(function (k) { data[k] = String(set[k]); });
+    return data;
+  }
+  // The data as last saved (null: never loaded here), and the writes not
+  // saved yet, in order, each with whom to tell once it is.
+  var snapshot = read(SNAPSHOT);
+  if (!snapshot || typeof snapshot !== "object") snapshot = null;
+  var queue = (Array.isArray(read(OUTBOX)) ? read(OUTBOX) : []).map(function (w) {
+    return { w: w, done: function () {} };
+  });
+  var saves = false;
+
+  // The visitor's secret, kept here; asked for once, when first needed.
+  // ensureVisitor resolves to {secret}, {refused: why} (the link keeps no
+  // more visitors), or {} when Specola can't be reached.
+  var visitor = typeof read(VISITOR) === "string" ? read(VISITOR) : null;
+  var making = null;
+  function ensureVisitor() {
+    if (visitor) return Promise.resolve({ secret: visitor });
+    if (making) return making;
+    making = fetch("/p" + tokenPath + "/visitor", { method: "POST", credentials: "omit", cache: "no-store" })
+      .then(
+        function (res) {
+          return res.json().catch(function () { return {}; }).then(function (b) {
+            if (res.ok && typeof b.secret === "string") {
+              visitor = b.secret;
+              write(VISITOR, visitor);
+              return { secret: visitor };
+            }
+            if (GONE[b.error]) onGone(b.error);
+            if (res.status >= 500) return {};
+            return { refused: b.message || res.statusText };
+          });
+        },
+        function () { return {}; },
+      )
+      .then(function (r) {
+        making = null;
+        return r;
+      });
+    return making;
+  }
+  function visitorHeaders(h) {
+    if (visitor) h["X-Specola-Visitor"] = visitor;
+    return h;
+  }
+  function keepOutbox() {
+    write(OUTBOX, queue.length ? queue.map(function (e) { return e.w; }) : null);
+  }
+  function withOutbox(data) {
+    return queue.reduce(function (d, e) { return apply(d, e.w); }, Object.assign({}, data));
+  }
+  var draining = false;
+  function drain() {
+    if (draining) return;
+    draining = true;
+    var backoff = 0;
+    function retry() {
+      backoff = Math.min(Math.max(1000, backoff * 2), 30000);
+      var t = setTimeout(go, backoff);
+      addEventListener("online", function once() {
+        removeEventListener("online", once);
+        clearTimeout(t);
+        go();
+      });
+    }
+    function go() {
+      if (!queue.length) {
+        draining = false;
+        return;
+      }
+      var e = queue[0];
+      ensureVisitor().then(function (v) {
+        if (v.refused) {
+          // No visitor: nothing queued can be saved.
+          var all = queue;
+          queue = [];
+          keepOutbox();
+          draining = false;
+          all.forEach(function (x) { x.done({ ok: false, error: v.refused }); });
+          return;
+        }
+        if (!v.secret) return retry();
+        save(e);
+      });
+    }
+    function save(e) {
+      var body = JSON.stringify({ clear: !!e.w.clear, set: e.w.set || {}, remove: e.w.remove || [] });
+      fetch(DATA, {
+        method: "PATCH",
+        headers: visitorHeaders({ "Content-Type": "application/json" }),
+        body: body,
+        credentials: "omit",
+        cache: "no-store",
+        keepalive: body.length < 60000,
+      }).then(
+        function (res) {
+          if (res.status >= 500) return retry();
+          if (!res.ok && res.status === 403 && visitor) {
+            // The link forgot this visitor (unused for months): a new one.
+            return res.json().catch(function () { return {}; }).then(function (b) {
+              if (b.error !== "no-visitor") return fail(res, b);
+              visitor = null;
+              write(VISITOR, null);
+              go();
+            });
+          }
+          backoff = 0;
+          if (res.ok) {
+            queue.shift();
+            keepOutbox();
+            snapshot = apply(snapshot || {}, e.w);
+            write(SNAPSHOT, snapshot);
+            e.done({ ok: true });
+            return go();
+          }
+          return res.json().catch(function () { return {}; }).then(function (b) { fail(res, b); });
+        },
+        retry,
+      );
+    }
+    function fail(res, b) {
+      var e = queue.shift();
+      keepOutbox();
+      if (GONE[b.error]) onGone(b.error);
+      e.done({ ok: false, error: b.message || res.statusText });
+      go();
+    }
+    go();
+  }
+
+  // The data to hand the page: the server's, else (offline) the copy kept
+  // here, with the writes not saved yet; null keeps it in memory.
+  function loadData() {
+    if (offline) return Promise.resolve(snapshot ? withOutbox(snapshot) : null);
+    return fetch(DATA, { credentials: "omit", cache: "no-store", headers: visitorHeaders({}) }).then(
+      function (res) {
+        // The link forgot this visitor: the next write makes a new one.
+        if (res.ok && visitor && res.headers.get("X-Specola-Visitor") === "none") {
+          visitor = null;
+          write(VISITOR, null);
+        }
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (b) {
+            if (GONE[b.error]) onGone(b.error);
+            return null;
+          });
+        }
+        return res.json().then(function (data) {
+          snapshot = data;
+          write(SNAPSHOT, data);
+          return withOutbox(data);
+        });
+      },
+      function () {
+        return snapshot ? withOutbox(snapshot) : null;
+      },
+    );
+  }
+
   function show(src) {
-    frame.src = src;
-    document.body.insertBefore(frame, document.getElementById("install"));
+    loadData().then(function (data) {
+      if (data) {
+        saves = true;
+        frame.name = "specola:" + JSON.stringify({ data: data });
+      }
+      frame.src = src;
+      document.body.insertBefore(frame, document.getElementById("install"));
+      if (queue.length && !offline) drain();
+    });
   }
   if (!offline) {
     show(pageSrc);
@@ -231,7 +427,13 @@
         if (d.op === "sub") push.sub(d.topic);
         else push.unsub(d.topic);
       } else if (d.op === "write") {
-        p.postMessage({ ok: false, error: "a public link keeps localStorage in memory only" });
+        if (!saves) {
+          p.postMessage({ ok: false, error: "this page's saved data couldn't be loaded" });
+          return;
+        }
+        queue.push({ w: { clear: !!d.clear, set: d.set || {}, remove: d.remove || [] }, done: function (r) { p.postMessage(r); } });
+        keepOutbox();
+        drain();
       }
     };
     var reply = { specola: "port", backend: { enabled: backend.enabled, available: backend.available && !offline } };
@@ -296,6 +498,11 @@
       // what the browser or a proxy adds.
       headers.set("X-Specola-Headers", encodeHeaders(Array.from(headers)));
       headers.set("X-Specola-Version", String(version));
+      // The visitor, made on the first call: the backend's ctx.visitor and
+      // its own userDb. Without one the call goes as before.
+      if (!offline) await ensureVisitor();
+      if (!live()) return;
+      if (visitor) headers.set("X-Specola-Visitor", visitor);
       var method = String(m.method || "GET").toUpperCase();
       var res;
       try {

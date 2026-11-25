@@ -923,7 +923,16 @@ async function publicLink(id) {
     const f = await waitFor(() => page.frames().find((fr) => fr.url().includes(`/s/${tok}/~page`)), 'the shell to frame the page');
     await f.waitForFunction(() => window.specola?.backend?.available, null, { timeout: 20000 });
     const hello = await call(f, '/api/public/hello');
-    check(hello.status === 200 && hello.json?.role === 'public' && hello.json.user === null && hello.json.userDb === true && hello.json.link?.id === link.id && hello.json.link.label === LINK_LABEL, 'a public route answers, with role public and ctx.link', hello);
+    check(hello.status === 200 && hello.json?.role === 'public' && hello.json.user === null && hello.json.link?.id === link.id && hello.json.link.label === LINK_LABEL, 'a public route answers, with role public and ctx.link', hello);
+    // The shell's first call made this browser a visitor, with a userDb of
+    // its own (docs/page-apps.md, "Anonymous visitors").
+    const again = await call(f, '/api/public/hello');
+    check(
+      hello.json.userDb === false && /^[0-9a-f]{64}$/.test(hello.json.visitor?.id ?? '') && hello.json.mine === 1 &&
+        again.json?.visitor?.id === hello.json.visitor.id && again.json.mine === 2,
+      'a public visitor has its own userDb, kept across calls',
+      { hello: hello.json, again: again.json },
+    );
     const closed = await call(f, '/api/counter', { method: 'POST' });
     check(closed.status === 403 && closed.headers['x-specola-error'] === 'not-public', 'a route that is not public answers 403 not-public', closed);
     check((await x(id, '/api/counter')).json.count === before, 'without reaching the backend');
