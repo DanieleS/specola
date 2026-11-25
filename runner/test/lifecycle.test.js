@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, test } from 'node:test';
 import { backend, logText, startRunner, until } from './helpers.js';
+import { sweepSnapshots, takeVersionSnapshot } from '../src/snapshot.js';
+import { FileStore } from '../src/worker/files.mjs';
 
 async function withRunner(limits, fn) {
   const r = await startRunner(limits);
@@ -261,6 +264,114 @@ describe('limits and failures', () => {
     }));
 });
 
+describe('disk quota', () => {
+  test('database writes stop at the page disk quota', () =>
+    withRunner({ pageDiskBytes: 2_000_000 }, async (r) => {
+      const v = r.publish(
+        backend(`import { DatabaseSync } from 'node:sqlite';
+          const fill = (db) => {
+            try {
+              db.exec('CREATE TABLE IF NOT EXISTS t (b)');
+              // Row by row: each one that fits stays.
+              for (let i = 0; i < 100; i++) db.exec('INSERT INTO t VALUES (randomblob(100000))');
+              return 'stored';
+            } catch (e) {
+              return e.message;
+            }
+          };
+          export default {
+            async fetch(request, ctx) {
+              const which = new URL(request.url).pathname;
+              const db = which === '/shared' ? ctx.db : which === '/user' ? ctx.userDb : new DatabaseSync('own.sqlite');
+              return new Response(fill(db));
+            },
+          };`),
+      );
+      for (const p of ['/shared', '/user', '/own']) {
+        assert.equal(await (await r.invoke({ ...v, page: 'q-db', path: p })).text(), 'database or disk is full', p);
+      }
+      const dir = path.join(r.dataDir, 'pages', 'q-db');
+      let total = 0;
+      for (const e of await fs.readdir(dir, { recursive: true, withFileTypes: true })) {
+        if (e.isFile()) total += (await fs.stat(path.join(e.parentPath, e.name))).size;
+      }
+      // Thirty megabytes were asked for; a little over the quota at most.
+      assert.ok(total < 2_600_000, `page uses ${total} bytes`);
+      await until(async () => /of its 1\.91 MiB disk quota: writes to its databases and files fail past it/.test(await logText(r, 'q-db')));
+    }));
+
+  test('concurrent files.put cannot go over the quota together', () =>
+    withRunner({ pageDiskBytes: 1_000_000 }, async (r) => {
+      const v = r.publish(
+        backend(`export default {
+          async fetch(request, ctx) {
+            const slow = new ReadableStream({
+              async pull(c) {
+                await new Promise((r) => setTimeout(r, 20));
+                if ((this.n = (this.n ?? 0) + 1) > 12) c.close();
+                else c.enqueue(new Uint8Array(50_000).fill(this.n));
+              },
+            });
+            try {
+              await ctx.files.put(new URL(request.url).pathname.slice(1), slow);
+              return new Response('stored');
+            } catch (e) {
+              return new Response(e.name, { status: 507 });
+            }
+          },
+        }`),
+      );
+      const res = await Promise.all(['a', 'b', 'c'].map((k) => r.invoke({ ...v, page: 'q-race', path: '/' + k }).then((x) => x.text())));
+      assert.ok(res.filter((t) => t === 'stored').length <= 1, res.join());
+      const blobs = path.join(r.dataDir, 'pages', 'q-race', 'files', 'blobs');
+      let total = 0;
+      for (const n of await fs.readdir(blobs)) total += (await fs.stat(path.join(blobs, n))).size;
+      assert.ok(total <= 1_000_000, `blobs use ${total} bytes`);
+    }));
+});
+
+describe('start and callers', () => {
+  test('an entry that never finishes loading fails its calls instead of hanging them', () =>
+    withRunner({ firstByteMs: 800 }, async (r) => {
+      const v = r.publish(backend(`await new Promise(() => {}); export default { fetch: () => new Response('ok') };`));
+      const t0 = Date.now();
+      const res = await r.invoke({ ...v, page: 's-load' });
+      assert.equal(res.status, 500);
+      assert.equal(res.headers.get('x-specola-error'), 'backend-error');
+      const { ref } = await res.json();
+      assert.ok(Date.now() - t0 < 2000);
+      const { body } = await r.logs('s-load');
+      assert.match(body.lines.find((l) => l.ref === ref).text, /did not finish loading within 800 ms/);
+      await until(async () => /stopped \(it did not finish loading\)/.test(await logText(r, 's-load')));
+      // The next call gets a fresh worker (which fails the same way).
+      assert.equal((await r.invoke({ ...v, page: 's-load' })).status, 500);
+      assert.equal((await logText(r, 's-load')).match(/worker started/g).length, 2);
+    }));
+
+  test('a call whose caller left while it waited is never run', () =>
+    withRunner({}, async (r) => {
+      const v = r.publish(
+        backend(`export default {
+          async fetch(request) {
+            console.log('ran ' + request.method);
+            return new Response('ok');
+          },
+        }`),
+      );
+      r.specola.delayMs = 400; // the code download is slow
+      for (const method of ['GET', 'POST']) {
+        const ac = new AbortController();
+        const call = r.invoke({ ...v, page: 's-gone', method, body: method === 'POST' ? 'x' : undefined, signal: ac.signal });
+        setTimeout(() => ac.abort(), 100);
+        await assert.rejects(call);
+      }
+      await new Promise((res) => setTimeout(res, 700));
+      assert.doesNotMatch(await logText(r, 's-gone'), /ran /);
+      r.specola.delayMs = 0;
+      assert.equal(await (await r.invoke({ ...v, page: 's-gone' })).text(), 'ok');
+    }));
+});
+
 describe('permissions', () => {
   test('a worker reads and writes only its own directories', () =>
     withRunner({}, async (r) => {
@@ -353,10 +464,10 @@ describe('versions', () => {
       assert.equal((await stale.json()).error, 'superseded');
 
       const pageDir = path.join(r.dataDir, 'pages', 'v-1');
-      const snaps = await fs.readdir(path.join(pageDir, 'snapshots'));
+      const snaps = await fs.readdir(path.join(r.dataDir, 'snapshots', 'v-1'));
       assert.equal(snaps.length, 1);
       assert.match(snaps[0], /^\d{8}T\d{6}\.\d{3}Z-v1$/);
-      const snap = path.join(pageDir, 'snapshots', snaps[0]);
+      const snap = path.join(r.dataDir, 'snapshots', 'v-1', snaps[0]);
       const rows = (file, table) => {
         const db = new DatabaseSync(file, { readOnly: true });
         try {
@@ -423,7 +534,126 @@ describe('versions', () => {
       for (let v = 1; v <= 8; v++) {
         assert.equal(await (await r.invoke({ ...code, page: 'v-3', version: v })).text(), String(v));
       }
-      const snaps = (await fs.readdir(path.join(r.dataDir, 'pages', 'v-3', 'snapshots'))).sort();
+      const snaps = (await fs.readdir(path.join(r.dataDir, 'snapshots', 'v-3'))).sort();
       assert.deepEqual(snaps.map((s) => s.replace(/^.*-/, '')), ['v3', 'v4', 'v5', 'v6', 'v7']);
     }));
+});
+
+describe('snapshots', () => {
+  test('are out of the page code\'s reach, and a newer version cannot destroy them', () =>
+    withRunner({}, async (r) => {
+      const src = (tag) => `import fs from 'node:fs';
+        import { DatabaseSync } from 'node:sqlite';
+        export default {
+          async fetch(request, ctx) {
+            ctx.db.exec('CREATE TABLE IF NOT EXISTS t (v TEXT)');
+            ctx.db.prepare('INSERT INTO t VALUES (?)').run('${tag}');
+            const dir = await request.text();
+            const attempt = (fn) => { try { fn(); return 'allowed'; } catch (e) { return e.code || e.message; } };
+            return Response.json({
+              list: attempt(() => fs.readdirSync(dir)),
+              remove: attempt(() => fs.rmSync(dir, { recursive: true, force: true })),
+              write: attempt(() => fs.writeFileSync(dir + '/x', 'x')),
+              sqlite: attempt(() => new DatabaseSync(dir + '/x.sqlite')),
+            });
+          },
+        }`;
+      const v1 = r.publish(backend(src('one')));
+      const v2 = r.publish(backend(src('two')));
+      const dir = path.join(r.dataDir, 'snapshots', 'snap-1');
+      await r.invoke({ ...v1, page: 'snap-1', version: 1, method: 'POST', body: dir });
+      const res = await r.invoke({ ...v2, page: 'snap-1', version: 2, method: 'POST', body: dir });
+      assert.deepEqual(await res.json(), { list: 'allowed', remove: 'ERR_ACCESS_DENIED', write: 'ERR_ACCESS_DENIED', sqlite: 'ERR_ACCESS_DENIED' });
+      const snaps = await fs.readdir(dir);
+      assert.equal(snaps.length, 1);
+      const db = new DatabaseSync(path.join(dir, snaps[0], 'shared.sqlite'), { readOnly: true });
+      assert.deepEqual(db.prepare('SELECT v FROM t').all().map((x) => x.v), ['one']);
+      db.close();
+    }));
+
+  test('a database the code broke is left out instead of blocking the switch', () =>
+    withRunner({}, async (r) => {
+      const src = (tag) => `import fs from 'node:fs';
+        export default {
+          async fetch(request, ctx) {
+            ctx.db.exec('CREATE TABLE IF NOT EXISTS t (v TEXT)');
+            ctx.db.prepare('INSERT INTO t VALUES (?)').run('${tag}');
+            fs.mkdirSync('users', { recursive: true });
+            fs.writeFileSync('users/' + 'a'.repeat(64) + '.sqlite', 'not a database, just some text that is long enough to be read as a header ....................');
+            fs.writeFileSync('users/notes.sqlite', 'a file of the code');
+            return new Response('${tag}');
+          },
+        }`;
+      const v1 = r.publish(backend(src('one')));
+      const v2 = r.publish(backend(src('two')));
+      assert.equal(await (await r.invoke({ ...v1, page: 'snap-2', version: 1 })).text(), 'one');
+      assert.equal(await (await r.invoke({ ...v2, page: 'snap-2', version: 2 })).text(), 'two');
+      const log = await logText(r, 'snap-2');
+      assert.match(log, /\[warn\] snapshot of version 1's data: left out users\/a{64}\.sqlite \(file is not a database\)/);
+      const dir = path.join(r.dataDir, 'snapshots', 'snap-2');
+      const [snap] = await fs.readdir(dir);
+      assert.deepEqual((await fs.readdir(path.join(dir, snap), { recursive: true })).sort(), ['shared.sqlite', 'users']);
+    }));
+
+  test('a failed snapshot leaves nothing behind, and half-written ones are swept', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'specola-snap-test-'));
+    try {
+      const pageDir = path.join(root, 'pages', 'p');
+      const snapshotsDir = path.join(root, 'snapshots', 'p');
+      await fs.mkdir(path.join(pageDir, 'users', 'b'.repeat(64) + '.sqlite'), { recursive: true }); // can't be opened
+      new DatabaseSync(path.join(pageDir, 'shared.sqlite')).exec('CREATE TABLE t (v)');
+      for (let i = 0; i < 3; i++) {
+        await assert.rejects(takeVersionSnapshot({ pageDir, snapshotsDir, oldVersion: 1, keep: 5, maxBytes: 1e9 }));
+      }
+      assert.deepEqual(await fs.readdir(snapshotsDir), []);
+
+      await fs.mkdir(path.join(snapshotsDir, '.tmp-20261125T000000.000Z-v1', 'users'), { recursive: true });
+      await fs.mkdir(path.join(snapshotsDir, '20261125T000000.000Z-v1'));
+      await sweepSnapshots(root);
+      assert.deepEqual(await fs.readdir(snapshotsDir), ['20261125T000000.000Z-v1']);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('past their byte budget, the oldest go first', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'specola-snap-test-'));
+    try {
+      const pageDir = path.join(root, 'pages', 'p');
+      const snapshotsDir = path.join(root, 'snapshots', 'p');
+      await fs.mkdir(pageDir, { recursive: true });
+      const db = new DatabaseSync(path.join(pageDir, 'shared.sqlite'));
+      db.exec("CREATE TABLE t (b); INSERT INTO t VALUES (randomblob(100000))");
+      db.close();
+      for (let v = 1; v <= 4; v++) {
+        await takeVersionSnapshot({ pageDir, snapshotsDir, oldVersion: v, keep: 5, maxBytes: 250_000 });
+      }
+      assert.deepEqual((await fs.readdir(snapshotsDir)).map((n) => n.replace(/^.*-/, '')).sort(), ['v3', 'v4']);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the file store keeps blobs while a snapshot is being written', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'specola-snap-test-'));
+    try {
+      const pageDir = path.join(root, 'pages', 'p');
+      const snapshotsDir = path.join(root, 'snapshots', 'p');
+      const tmp = path.join(snapshotsDir, '.tmp-20261125T000000.000Z-v1');
+      await fs.mkdir(tmp, { recursive: true });
+      await fs.writeFile(path.join(tmp, 'files.sqlite'), ''); // half written
+      const store = new FileStore(pageDir, 1e9, snapshotsDir);
+      await store.put('a.png', 'aaa');
+      assert.equal(await store.delete('a.png'), true);
+      const blobs = path.join(pageDir, 'files', 'blobs');
+      assert.equal((await fs.readdir(blobs)).length, 1, 'left for the runner\'s collection');
+      await fs.rm(tmp, { recursive: true });
+      await store.put('b.png', 'bbb');
+      await store.delete('b.png');
+      assert.equal((await fs.readdir(blobs)).length, 1, 'b is collected at once');
+      store.close();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });

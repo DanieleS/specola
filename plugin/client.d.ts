@@ -18,8 +18,8 @@ export interface SpecolaRuntime {
    * Calls the page's backend (the plugin's `server` option), with fetch's
    * signature. input is a path starting with "/", or a URL or Request on the
    * page's own origin (anything else rejects with a TypeError); the response
-   * streams. Rejects with a BackendUnavailable
-   * error when the backend can't be reached (see SpecolaBackendUnavailable).
+   * streams. Rejects with a BackendUnavailable error when the backend can't
+   * be reached (see SpecolaBackendUnavailable).
    * Under `vite dev` it goes to the plugin's dev backend.
    */
   fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;

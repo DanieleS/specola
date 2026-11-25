@@ -157,6 +157,15 @@ func TestBackendVersions(t *testing.T) {
 		target.Manifest == nil || target.Manifest.Egress[0] != "api.example.com" || target.Title != "App" {
 		t.Fatalf("target = %+v, %v", target, err)
 	}
+	if target.ID != page {
+		t.Fatalf("target.ID = %q, want %q", target.ID, page)
+	}
+	// Other spellings of the same uuid name the same page, by its one id.
+	for _, spelling := range []string{strings.ToUpper(page), strings.ReplaceAll(page, "-", "")} {
+		if alt, err := st.BackendTarget(ctx, "alice", spelling); err != nil || alt.ID != page {
+			t.Fatalf("BackendTarget(%q) = %+v, %v; want ID %q", spelling, alt, err, page)
+		}
+	}
 	if _, err := st.BackendTarget(ctx, "bob", page); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("bob's target: %v, want ErrNotFound", err)
 	}
@@ -175,6 +184,13 @@ func TestBackendVersions(t *testing.T) {
 	viewable(true, true, false, true)
 	if _, err := st.OpenPublicLink(ctx, pinned); err != nil {
 		t.Fatalf("pinned link once the page is static again: %v", err)
+	}
+	// v3, with a backend, is closed now: no link can be pinned to it.
+	if _, _, err := st.CreatePublicLink(ctx, "alice", page, PublicLinkRequest{Version: 3}); !errors.Is(err, ErrBackendPinned) {
+		t.Fatalf("pin a closed backend version: %v, want ErrBackendPinned", err)
+	}
+	if _, _, err := st.CreatePublicLink(ctx, "alice", page, PublicLinkRequest{Version: 2}); err != nil {
+		t.Fatalf("pin a static version of a static page: %v", err)
 	}
 	if _, _, err := st.BackendCode(ctx, mustVersionID(t, st, page, 4)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("code of a static version: %v", err)

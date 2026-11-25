@@ -5,7 +5,7 @@ import { after, before, describe, test } from 'node:test';
 import { backendHash } from '../src/code.js';
 import { loadConfig, parseListen } from '../src/config.js';
 import { parseInvoke } from '../src/server.js';
-import { TOKEN, backend, invoke, logText, makeCode, startRunner } from './helpers.js';
+import { TOKEN, backend, invoke, logText, makeCode, startRunner, until } from './helpers.js';
 
 describe('auth and plumbing', () => {
   let r;
@@ -219,6 +219,58 @@ describe('handlers', () => {
     assert.deepEqual(b.page, { id: 'h-1', version: 1, title: 'Test page' });
     assert.deepEqual(b.secrets, {});
     assert.equal(b.hasEnvToken, false);
+  });
+
+  test('response headers with an effect on the whole origin are dropped', async () => {
+    const v = r.publish(
+      backend(`export default {
+        fetch: () => new Response('ok', { headers: {
+          'clear-site-data': '"cookies", "storage"',
+          'nel': '{"report_to":"x","max_age":31536000}',
+          'report-to': '{"group":"x","max_age":31536000,"endpoints":[{"url":"https://evil.example/r"}]}',
+          'reporting-endpoints': 'x="https://evil.example/r"',
+          'strict-transport-security': 'max-age=31536000; includeSubDomains',
+          'access-control-allow-origin': 'https://evil.example',
+          'content-type': 'text/plain',
+          'etag': '"1"',
+          'x-mine': '1',
+        } }),
+      }`),
+    );
+    const res = await r.invoke({ ...v, page: 'h-hdr' });
+    assert.equal(await res.text(), 'ok');
+    for (const h of ['clear-site-data', 'nel', 'report-to', 'reporting-endpoints', 'strict-transport-security', 'access-control-allow-origin']) {
+      assert.equal(res.headers.get(h), null, h);
+    }
+    assert.equal(res.headers.get('content-type'), 'text/plain');
+    assert.equal(res.headers.get('etag'), '"1"');
+    assert.equal(res.headers.get('x-mine'), '1');
+  });
+
+  test('ctx.page is the one of each call, not the one the worker started with', async () => {
+    const v = r.publish(backend(`export default { fetch: (req, ctx) => new Response(ctx.page.title) }`));
+    assert.equal(await (await r.invoke({ ...v, page: 'h-title', title: 'Old' })).text(), 'Old');
+    assert.equal(await (await r.invoke({ ...v, page: 'h-title', title: 'New' })).text(), 'New');
+  });
+
+  test('output without newlines is cut into bounded lines', async () => {
+    const v = r.publish(
+      backend(`export default {
+        async fetch() {
+          for (let i = 0; i < 64; i++) process.stdout.write('x'.repeat(16 * 1024));
+          process.stdout.write('\\nafter\\n');
+          return new Response('ok');
+        },
+      }`),
+    );
+    assert.equal(await (await r.invoke({ ...v, page: 'h-out' })).text(), 'ok');
+    const lines = await until(async () => {
+      const { body } = await r.logs('h-out');
+      return body.lines.some((l) => l.text === 'after') && body.lines;
+    });
+    const long = lines.filter((l) => l.text.startsWith('xxx'));
+    assert.equal(long.length, 1);
+    assert.ok(long[0].text.length < 17 * 1024 && long[0].text.endsWith('(truncated)'));
   });
 
   test('a path starting with // stays a path', async () => {

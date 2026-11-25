@@ -119,6 +119,11 @@ func (c *Config) loadBackends() error {
 		return fmt.Errorf("SPECOLA_RUNNER_URL: %w", err)
 	}
 	c.RunnerToken = strings.TrimSpace(os.Getenv("SPECOLA_RUNNER_TOKEN"))
+	// The runner refuses to start with less (runner/src/config.js): accepting
+	// it here would leave backends on with a runner that never answers.
+	if len(c.RunnerToken) < 16 {
+		return fmt.Errorf("SPECOLA_RUNNER_TOKEN must be at least 16 characters (e.g. openssl rand -base64 32)")
+	}
 	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(os.Getenv("SPECOLA_SECRETS_KEY")))
 	if err != nil || len(key) != 32 {
 		return fmt.Errorf("SPECOLA_SECRETS_KEY must be 32 bytes, base64-encoded (e.g. openssl rand -base64 32)")

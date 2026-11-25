@@ -755,8 +755,9 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request, sub, id, base
 	if numbered {
 		// A numbered version never changes, but on a page with a backend
 		// whether it can be opened does: it closes when another version
-		// becomes current.
-		if sv.Backend || sv.PageBackend {
+		// becomes current. With backends on, any page can get one later
+		// (and close every older version then), so none is cached for good.
+		if sv.Backend || sv.PageBackend || s.runner != nil {
 			w.Header().Set("Cache-Control", "private, no-cache")
 		} else {
 			w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")

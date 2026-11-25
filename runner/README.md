@@ -53,8 +53,9 @@ same `SPECOLA_RUNNER_TOKEN`, and `SPECOLA_SECRETS_KEY` (see
 | `RUNNER_REQUEST_TIMEOUT_MS` | 300000 | Whole request, `waitUntil` work included |
 | `RUNNER_WORKER_MEMORY_MB` | 256 | A worker's heap (`--max-old-space-size`) |
 | `RUNNER_WORKER_CONCURRENCY` | 32 | Requests a worker handles at once (more answer `429`) |
-| `RUNNER_PAGE_DISK_BYTES` | 1 GiB | A page's databases and files, snapshots excluded |
+| `RUNNER_PAGE_DISK_BYTES` | 1 GiB | A page's databases and files, snapshots excluded. Databases get a SQLite `max_page_count` from it (writes past it fail with "database or disk is full"); `files.put` refuses with `QuotaExceededError` |
 | `RUNNER_IDLE_TIMEOUT_MS` | 300000 | An idle worker stops after this |
+| `RUNNER_SNAPSHOT_DISK_BYTES` | 2 GiB | A page's snapshots; past it the oldest go first (the newest is always kept) |
 
 Back up the volume along with Specola's database: page data lives only
 here, and snapshots are on the same volume.
@@ -83,8 +84,14 @@ A missing or wrong token answers `401 unauthorized` everywhere.
 /data/pages/{pageId}/users/{sha256(sub)}.sqlite   ctx.userDb
 /data/pages/{pageId}/files.sqlite            ctx.files index
 /data/pages/{pageId}/files/blobs/{sha256}    ctx.files contents
-/data/pages/{pageId}/snapshots/{UTC time}-v{N}/   data as version N left it (last 5 kept)
+/data/snapshots/{pageId}/{UTC time}-v{N}/    data as version N left it (last 5 kept; outside the page's reach)
 ```
+
+A database the page's code broke (one that SQLite says is not a database,
+or malformed) is left out of a snapshot with a warning in the backend log,
+so it can't block version switches for good. Only the databases the runner
+creates are snapshotted; anything else the code writes in its directory is
+its own.
 
 ## Security model
 
@@ -93,16 +100,18 @@ publish a bundle can run Node code on it. What it does is keep accidents
 contained and pages from stepping on each other:
 
 - Each page runs in its own process, under Node's **permission model**:
-  `--permission`, reading only its code directory, its page directory and
-  the worker's own bootstrap files, writing only its page directory; no
+  `--permission`, reading only its code directory, its page directory, its
+  snapshots and the worker's own bootstrap files, writing only its page
+  directory (so not its snapshots, which must survive its bugs); no
   child processes, worker threads, native addons or WASI. A backend that
   opens `node:sqlite` itself is held to its page directory too (Node 22's
   `node:sqlite` does not consult the permission model, so the worker routes
   it through a guard; the guard needs `module.registerHooks`, Node ≥ 22.15).
 - A worker's environment is empty but for `TZ`, `NODE_ENV` and `LANG`: the
   runner's token never reaches page code.
-- Limits per request (time, body sizes), per worker (heap, concurrency) and
-  per page (disk). A worker that runs out of memory, crashes or stops
+- Limits per request (time, body sizes), per worker (heap, concurrency,
+  output lines, start time) and per page (disk: files written with `node:fs`
+  directly count against it but are not refused). A worker that runs out of memory, crashes or stops
   answering is killed; its requests answer `502 backend-crashed` and the next
   request gets a fresh worker.
 - What a worker sends over IPC is treated as input: page code can call

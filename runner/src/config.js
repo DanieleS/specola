@@ -15,6 +15,7 @@ export const DEFAULT_LIMITS = Object.freeze({
   pageDiskBytes: 1024 * MiB,
   idleMs: 5 * 60_000,
   versionSnapshotsKept: 5,
+  snapshotDiskBytes: 2048 * MiB,
 });
 
 // RUNNER_* variable for each limit.
@@ -27,6 +28,7 @@ const LIMIT_ENV = {
   workerConcurrency: 'RUNNER_WORKER_CONCURRENCY',
   pageDiskBytes: 'RUNNER_PAGE_DISK_BYTES',
   idleMs: 'RUNNER_IDLE_TIMEOUT_MS',
+  snapshotDiskBytes: 'RUNNER_SNAPSHOT_DISK_BYTES',
 };
 
 function positiveInt(name, value) {

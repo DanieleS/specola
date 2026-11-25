@@ -1,7 +1,11 @@
 # Page backends — design and contract
 
-Status: **proposal**, nothing implemented yet. Decisions taken so far are
-stated as the contract; what is still open is listed at the end.
+Status: **step 1 of the delivery plan is implemented** (runner, `specola.fetch`
+with streaming, `db`/`userDb`/`files`, plugin server build and dev server,
+backend log, disabled/unavailable states, only-current-version rules, the
+version-switch snapshot), checked end to end in Chromium by
+`e2e/backends.mjs`. The rest is design: the contract for later steps may
+still change, and what is still open is listed at the end.
 
 A **page backend** is server-side code that ships inside an SPA bundle,
 next to the app, and that the page reaches through Specola. It runs in
@@ -99,8 +103,10 @@ Consequences that hold whatever the hardening:
 Backends are enabled when `SPECOLA_RUNNER_URL` is set (with
 `SPECOLA_RUNNER_TOKEN` and `SPECOLA_SECRETS_KEY`; specola refuses to start
 with only some of them). Specola checks `GET {runner}/health` at start and
-every 30 s; "enabled" is a configuration fact, "available" is the latest
-health check.
+every 30 s (every 5 s while it is failing), and a call that cannot reach
+the runner marks it unavailable at once; "enabled" is a configuration fact,
+"available" is the latest health check. `SPECOLA_RUNNER_TOKEN` must be at
+least 16 characters.
 
 When **disabled** (not configured):
 
@@ -165,8 +171,17 @@ the runner reads them, through the internal API.
 - `cron` — up to 10 jobs; 5-field cron in UTC, at most once a minute.
 - `topics.public` — push topics a public-link visitor may subscribe to.
 
-The manifest is validated at `POST /upload/bundle/{token}/manifest` (shape
-and limits; the entry's presence at commit). It is stored parsed on the
+The upload's manifest step only knows paths and hashes, so it checks the
+layout (`.specola/` files need a `.specola/backend.json`, at most 64 KiB)
+and refuses backends when they are disabled; `backend.json` itself is
+validated at commit, once its bytes are there (errors are 400 and name the
+field; the commit refuses a backend when backends are disabled too).
+Besides the rules above: unknown fields are refused; `public`, `egress`,
+`secrets` and `topics.public` hold at most 100 entries, without duplicates;
+methods are GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS; egress hosts may
+end in `:443` or `:80`; a cron job name is 1–64 of `[A-Za-z0-9_.-]`, a topic
+1–128 of `[A-Za-z0-9_.:/-]`, and cron macros (`@daily`) are refused;
+`entry` defaults to `server/index.mjs`. It is stored parsed on the
 version (`asset_version.backend jsonb`), so specola reads routes, secrets and
 cron without touching blobs.
 
@@ -217,9 +232,19 @@ export default {
 ```
 
 `request.url` is `https://page.invalid/<path>?<query>` (the path the page
-asked for; the origin is a fixed placeholder). Request headers are the
-page's, minus `Cookie`, hop-by-hop headers and anything `X-Specola-*`.
-Response headers `Set-Cookie` and hop-by-hop ones are dropped.
+asked for; the origin is a fixed placeholder). Request headers are only
+those the page set (see Viewer ↔ specola), minus `Cookie`, `Host`,
+`Content-Length`, `Accept-Encoding`, hop-by-hop headers, anything
+`X-Specola-*` and the trusted-user header when one is configured.
+Response headers dropped by the runner, specola and the dev server alike:
+`Set-Cookie`, `Content-Length`, hop-by-hop ones, every `Access-Control-*`,
+and those that act on the whole origin (`Clear-Site-Data`, `NEL`,
+`Report-To`, `Reporting-Endpoints`, `Strict-Transport-Security`, `Alt-Svc`,
+`Accept-CH`, `Critical-CH`, `Origin-Agent-Cluster`,
+`Service-Worker-Allowed`, `Set-Login`, `Refresh`). Specola adds
+`X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox;
+default-src 'none'` and, when the handler sets none, `Cache-Control:
+private, no-store`.
 
 ```ts
 interface Ctx {
@@ -288,9 +313,13 @@ load; a second hello is refused; the viewer only answers that document.
 ### Viewer ↔ specola
 
 `ANY /api/pages/{id}/x/{path…}` (session cookie), with
-`X-Specola-Version: N` — the version the frame shows. The viewer copies
-method, page headers and body, and streams the response body back as
-chunks. Pushes: one `EventSource` per open backend page, `GET
+`X-Specola-Version: N` — the version the frame shows; it is required,
+which also keeps navigations and cross-site requests out. The viewer copies
+method and body, and sends the page's own headers in
+`X-Specola-Headers: <base64url(JSON [[name, value]…])>`: specola forwards
+only those, so credentials the browser adds on its own (cached Basic auth)
+or a proxy in front adds never reach page code. The call is full duplex,
+and the response body streams back as chunks. Pushes: one `EventSource` per open backend page, `GET
 /api/pages/{id}/events?topic=a&topic=b`, reopened when the subscription set
 changes.
 
@@ -317,7 +346,7 @@ Versions).
 - `GET {runner}/logs?page=…` — recent log lines of a page.
 - `GET {runner}/health`.
 - Runner → specola: `GET /internal/runner/code/{versionId}` (the
-  `.specola/` files of a version, as a tar stream; cached on the runner's
+  `.specola/` files of a version, as JSON, see Wire formats; cached on the runner's
   disk by `codeHash`) and `POST /internal/runner/publish` (a push).
 
 `/internal/*` is only on the app listener, requires the runner token, and
@@ -332,7 +361,12 @@ the header `X-Specola-Error: <code>` and a JSON body
 `superseded` (409), `backend-disabled` (503), `backend-unavailable` (503),
 `body-too-large` (413), `too-many-requests` (429), `backend-error` (500,
 uncaught exception, `ref` names the log line), `backend-crashed` (502),
-`backend-timeout` (504), `bad-request` (400). The viewer turns
+`backend-timeout` (504), `bad-request` (400, e.g. a missing or
+non-numeric `X-Specola-Version`), and the access codes `not-found` (404),
+`forbidden` (403) and `internal` (500). One exception to the JSON body: a
+closed version opened as a page (`/view?v=N`, the token view, a pinned
+link) answers 410 with a small HTML page saying so and linking to the
+current version, with `X-Specola-Error: superseded`. The viewer turns
 `backend-disabled`, `backend-unavailable` and `superseded` into
 `{op:"error", id, name:"BackendUnavailable", reason, message}` (`reason` is
 `disabled`, `unavailable` or `superseded`); every other response, these
@@ -406,19 +440,37 @@ A small Node service (`runner/` in this repo, its own image on
 /data/code/{codeHash}/…                 extracted .specola/ files
 /data/pages/{pageId}/shared.sqlite
 /data/pages/{pageId}/users/{sha256(sub)}.sqlite
-/data/pages/{pageId}/files/…
+/data/pages/{pageId}/files.sqlite        the file store's index
+/data/pages/{pageId}/files/blobs/{sha256}
+/data/snapshots/{pageId}/{UTC stamp}-v{old}/
+/data/state/{pageId}.json                the version the page's worker runs
 ```
+
+Snapshots are outside the page directory so page code cannot change them;
+the worker may only read them (the file store needs to know which blobs
+they still name). Partial snapshots (`.tmp-*`) are removed on failure and
+swept at start. Only `shared.sqlite`, `files.sqlite` and
+`users/<hex>.sqlite` are snapshotted; a database SQLite reports as broken
+is left out with a warning instead of blocking the switch. Snapshots also
+have their own budget (`RUNNER_SNAPSHOT_DISK_BYTES`, 2 GiB), oldest first,
+always keeping the newest.
 
 - **One worker process per page**, running its current version, started
   on first request, kept warm, stopped after 5 minutes idle. When a new
   version becomes current, the runner snapshots the data (see Data
   lifecycle), then starts a new worker for it and lets the old one drain
   its in-flight requests. Each worker runs
-  with `node --permission --allow-fs-read=<its code dir>,<its page dir>
-  --allow-fs-write=<its page dir>` and no child processes, workers or
-  addons, `--max-old-space-size` from the limits, and its own environment
-  (no runner secrets, `NODE_USE_ENV_PROXY=1`, `HTTPS_PROXY`/`HTTP_PROXY`
-  pointing at the egress proxy with a per-worker credential).
+  with `node --permission --allow-fs-read=<its code dir>,<its page dir>,
+  <its snapshots dir>,<the runner's worker bootstrap> --allow-fs-write=<its
+  page dir>` and no child processes, workers or addons,
+  `--max-old-space-size` from the limits, and its own minimal environment
+  (`TZ=UTC`, `NODE_ENV=production`, `LANG=C.UTF-8`; no runner secrets). From
+  step 3 it also gets `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY`/`HTTP_PROXY`
+  pointing at the egress proxy with a per-worker credential; until then
+  outbound HTTP is unrestricted.
+- **Start-up**: a worker whose entry has not finished loading within the
+  first-byte timeout is stopped; the call answers 500 `backend-error` with a
+  `ref`, and the log says the entry did not finish loading.
 - **Egress proxy**: in the runner process; HTTP `CONNECT` and plain HTTP;
   identifies the worker by its credential and allows only the hosts of that
   version's `egress`. Private, loopback and link-local addresses are refused
@@ -570,7 +622,8 @@ are UI-only, for owners.
 `specola({ server: "server/index.ts", backend: {…manifest fields} })`:
 
 - builds the server entry with Vite's SSR build (`ssr`, `target: node24`,
-  everything bundled — `noExternal: true`) into `.specola/server/`, after
+  everything bundled — `noExternal: true`; the build targets `node22`, the
+  oldest Node the runner supports) into `.specola/server/`, after
   the client build;
 - writes `.specola/backend.json` from the `backend` option (or a
   `specola.backend.json` next to `vite.config`);
@@ -613,8 +666,20 @@ The CLI and upload protocol are unchanged: `.specola/` files are bundle files.
 | snapshots per page | 2 GiB, beyond the page's own 1 GiB |
 | import zip | 1 GiB |
 
-Runner env (`RUNNER_*`) overrides the runner-side ones; specola env
-(`SPECOLA_BACKEND_*`) the specola-side ones.
+Runner env overrides the runner-side ones: `RUNNER_MAX_BODY_BYTES`,
+`RUNNER_MAX_RESPONSE_BYTES`, `RUNNER_FIRST_BYTE_TIMEOUT_MS`,
+`RUNNER_REQUEST_TIMEOUT_MS`, `RUNNER_WORKER_MEMORY_MB`,
+`RUNNER_WORKER_CONCURRENCY`, `RUNNER_PAGE_DISK_BYTES`,
+`RUNNER_SNAPSHOT_DISK_BYTES`, `RUNNER_IDLE_TIMEOUT_MS`. The specola-side
+ones (request body, calls per user and page, 5-minute cap) are constants
+for now.
+
+The page disk limit covers everything under the page's directory. SQLite
+databases get a `max_page_count` set from the room the page has left
+(re-measured after calls, at most once a second), so writes past it fail
+with "database or disk is full"; `files.put` measures again once the bytes
+are on disk. A page can end slightly over its quota, never by an unbounded
+amount; the log warns at 99%.
 
 ## Configuration
 
@@ -625,6 +690,7 @@ Runner env (`RUNNER_*`) overrides the runner-side ones; specola env
 | `SPECOLA_SECRETS_KEY` | specola | 32 bytes, base64; encrypts page secrets |
 | `SPECOLA_URL` | runner | specola's internal base URL |
 | `RUNNER_DATA_DIR` | runner | the volume (default `/data`) |
+| `RUNNER_LISTEN` | runner | listen address (default `:8081`) |
 | `RUNNER_PURGE_AFTER_DAYS` | runner | purge data of dormant pages after this many days (default: never) |
 
 `docker-compose.yaml` gains a `runner` service and volume, commented out by

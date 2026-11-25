@@ -167,7 +167,8 @@ In the app:
 const res = await specola.fetch('/api/vote', { method: 'POST', body: JSON.stringify({ choice: 'a' }) });
 ```
 
-Same signature as `fetch`, with a path starting with `/`; the response
+Same signature as `fetch`, with a path starting with `/` (or a `URL` or
+`Request` on the page's own origin); the response
 streams (LLM output, long exports). It rejects with an error named
 `BackendUnavailable` (`err.reason`: `disabled`, `unavailable`, `superseded`
 when a newer version of the page is current, `offline`);

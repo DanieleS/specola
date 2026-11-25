@@ -20,6 +20,7 @@ import { pathToFileURL } from 'node:url';
 import { formatWithOptions } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { FileStore } from './files.mjs';
+import { PageQuota } from './quota.mjs';
 
 const WINDOW = 8; // response chunks in flight before waiting for an ack
 const PIECE = 64 * 1024; // IPC message size for response bytes
@@ -58,7 +59,9 @@ process.on('disconnect', () => process.exit(0)); // the runner is gone
 
 let page; // {id, version, title}
 let pageDir;
+let snapshotsDir;
 let diskQuota;
+let quota;
 let handler;
 let sharedDb = null;
 const userDbs = new Map();
@@ -71,6 +74,7 @@ function openDb(file) {
   const db = new DatabaseSync(file);
   // WAL: readers (snapshots, the draining worker) never block the writer.
   db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+  quota.track(db);
   return db;
 }
 
@@ -99,6 +103,8 @@ function closeAll() {
 // the guard that keeps database paths inside the page directory.
 function installSqliteGuard(dir) {
   globalThis[Symbol.for('specola.pageDir')] = dir;
+  // Databases the backend opens itself count against the quota too.
+  globalThis[Symbol.for('specola.trackDb')] = (db) => quota.track(db);
   const guardURL = new URL('./sqlite-guard.mjs', import.meta.url).href;
   if (typeof module.registerHooks === 'function') {
     module.registerHooks({
@@ -118,8 +124,11 @@ function installSqliteGuard(dir) {
 async function init(msg) {
   page = msg.page;
   pageDir = msg.pageDir;
+  snapshotsDir = msg.snapshotsDir;
   diskQuota = msg.diskQuota;
   fs.mkdirSync(pageDir, { recursive: true });
+  quota = new PageQuota(pageDir, diskQuota, (text) => log('warn', [text]));
+  await quota.refresh();
   const guardURL = installSqliteGuard(pageDir);
   const guard = await import(guardURL);
   const getBuiltin = process.getBuiltinModule?.bind(process);
@@ -152,7 +161,7 @@ function makeCtx(msg, call) {
     user,
     role: msg.role,
     link: msg.link ? Object.freeze({ id: msg.link.id, label: msg.link.label }) : null,
-    page: Object.freeze({ ...page }),
+    page: Object.freeze({ ...(msg.page ?? page) }),
     get db() {
       sharedDb ??= openDb(path.join(pageDir, 'shared.sqlite'));
       return sharedDb;
@@ -161,7 +170,7 @@ function makeCtx(msg, call) {
       return user ? userDbFor(user.sub) : null;
     },
     get files() {
-      files ??= new FileStore(pageDir, diskQuota);
+      files ??= new FileStore(pageDir, diskQuota, snapshotsDir);
       return files;
     },
     secrets: Object.freeze({ ...(msg.secrets ?? {}) }),
@@ -253,6 +262,7 @@ async function handle(msg) {
     for (let n = 0; n < call.waits.length; n = call.waits.length) await Promise.all(call.waits.slice(n));
     calls.delete(msg.id);
     send({ t: 'done', id: msg.id });
+    quota.refresh().catch((err) => logError('measuring the page\'s disk use failed', err));
   }
 }
 

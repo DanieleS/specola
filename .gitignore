@@ -25,3 +25,6 @@ web/dist/
 plugin/node_modules/
 plugin/test/fixture/dist/
 plugin/*.tgz
+
+# Page backends: the plugin dev server's data (vite dev on an app with a backend)
+.specola-dev/

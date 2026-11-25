@@ -38,9 +38,10 @@ function checkKey(key) {
 }
 
 /**
- * Bytes the page's data uses on disk: databases (with their WAL and shared
- * memory files) and file store, snapshots excluded (they have their own
- * quota, see Limits).
+ * Bytes the page's directory uses on disk: databases (with their WAL and
+ * shared memory files), the file store (writes in progress included) and
+ * anything else the code wrote there. Snapshots live elsewhere and have their
+ * own quota (see Limits).
  */
 export async function pageUsage(pageDir) {
   let total = 0;
@@ -51,11 +52,9 @@ export async function pageUsage(pageDir) {
     if (err.code === 'ENOENT') return 0;
     throw err;
   }
-  const snapshots = path.join(pageDir, 'snapshots');
   for (const e of entries) {
     if (!e.isFile()) continue;
     const dir = e.parentPath ?? e.path;
-    if (dir === snapshots || dir.startsWith(snapshots + path.sep)) continue;
     try {
       total += (await fs.lstat(path.join(dir, e.name))).size;
     } catch (err) {
@@ -67,15 +66,22 @@ export async function pageUsage(pageDir) {
 
 export class FileStore {
   #pageDir;
+  #snapshotsDir;
   #quota;
   #db = null;
   // Blobs written by a put that has not reached the index yet, which a
   // concurrent delete must not collect.
   #pending = new Map();
 
-  constructor(pageDir, quotaBytes) {
+  /**
+   * @param {string} pageDir
+   * @param {number} quotaBytes the page's disk quota
+   * @param {string} snapshotsDir the page's snapshots, whose indexes keep blobs
+   */
+  constructor(pageDir, quotaBytes, snapshotsDir) {
     this.#pageDir = pageDir;
     this.#quota = quotaBytes;
+    this.#snapshotsDir = snapshotsDir;
   }
 
   get #blobs() {
@@ -140,6 +146,11 @@ export class FileStore {
         }.bind(this),
         createWriteStream(tmp),
       );
+      // Measured again with the write on disk: concurrent puts each saw
+      // the room left before any of them wrote, and the last of them to get
+      // here sees every other one's bytes (in files/tmp or committed).
+      const now = await pageUsage(this.#pageDir);
+      if (now > this.#quota) throw new QuotaExceededError(now - size, this.#quota);
     } catch (err) {
       await fs.rm(tmp, { force: true });
       throw err;
@@ -224,13 +235,17 @@ export class FileStore {
     if (this.#pending.has(sha)) return;
     const live = this.#index().prepare('SELECT 1 FROM files WHERE sha256 = ? LIMIT 1').get(sha);
     if (live) return;
-    const snapshots = path.join(this.#pageDir, 'snapshots');
+    const snapshots = this.#snapshotsDir;
+    if (!snapshots) return;
     let names = [];
     try {
       names = await fs.readdir(snapshots);
     } catch (err) {
       if (err.code !== 'ENOENT') throw err;
     }
+    // A snapshot being written may yet name the blob: the runner's own
+    // collection, after the snapshot, deletes it if not.
+    if (names.some((n) => n.startsWith('.tmp-'))) return;
     for (const name of names) {
       const file = path.join(snapshots, name, 'files.sqlite');
       try {

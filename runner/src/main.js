@@ -13,7 +13,7 @@ try {
 }
 
 const runner = createRunner(config);
-await runner.code.sweep();
+await runner.sweep();
 const addr = await runner.listen();
 console.log(`specola-runner ${RUNNER_VERSION} listening on ${addr.address}:${addr.port}, data in ${config.dataDir}`);
 

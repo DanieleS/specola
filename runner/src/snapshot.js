@@ -14,6 +14,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 const VERSION_SNAPSHOT = /^\d{8}T\d{6}\.\d{3}Z-v\d+$/;
 const BLOB_GRACE_MS = 60 * 60 * 1000;
+// SQLite's "not a database" and "malformed": a file the page's code broke.
+const SQLITE_BROKEN = new Set([11, 26]);
+// The databases the runner itself creates in a page's directory. Anything
+// else there is the page code's own business and is not snapshotted.
+const USER_DB = /^[0-9a-f]{64}\.sqlite$/;
 
 /** "20261125T101500.123Z": sortable, and no ":" in a file name. */
 export function stamp(date = new Date()) {
@@ -21,17 +26,45 @@ export function stamp(date = new Date()) {
 }
 
 /**
- * Snapshots the page's data, labelled with the version that is leaving, and
- * keeps the last `keep` version snapshots. Returns the snapshot's directory,
- * or null when the page has no data yet.
+ * Snapshots the page's data (pageDir) into snapshotsDir, labelled with the
+ * version that is leaving, then keeps the last `keep` version snapshots
+ * within maxBytes. snapshotsDir is outside the page's directory, where the
+ * page's code can't reach it: a snapshot must survive the code it protects
+ * from. Resolves to {dir, skipped}: the snapshot's directory (null when the
+ * page has no data yet) and the databases left out because they are broken.
  */
-export function takeVersionSnapshot(pageDir, oldVersion, keep) {
+export function takeVersionSnapshot({ pageDir, snapshotsDir, oldVersion, keep, maxBytes }) {
   return new Promise((resolve, reject) => {
-    const w = new Worker(new URL(import.meta.url), { workerData: { pageDir, oldVersion, keep } });
-    w.once('message', (m) => (m.error ? reject(new Error(m.error)) : resolve(m.dir)));
+    const w = new Worker(new URL(import.meta.url), { workerData: { pageDir, snapshotsDir, oldVersion, keep, maxBytes } });
+    w.once('message', (m) => (m.error ? reject(new Error(m.error)) : resolve(m.result)));
     w.once('error', reject);
     w.once('exit', (code) => code && reject(new Error(`snapshot thread exited with ${code}`)));
   });
+}
+
+/**
+ * Removes snapshots a previous runner process left half written (it died
+ * while taking them): under {dataDir}/snapshots/{pageId}/.tmp-*.
+ */
+export async function sweepSnapshots(dataDir) {
+  const root = path.join(dataDir, 'snapshots');
+  let pages = [];
+  try {
+    pages = await fs.readdir(root);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  for (const p of pages) {
+    let names = [];
+    try {
+      names = await fs.readdir(path.join(root, p));
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (n.startsWith('.tmp-')) await fs.rm(path.join(root, p, n), { recursive: true, force: true });
+    }
+  }
 }
 
 async function exists(p) {
@@ -51,7 +84,7 @@ async function databases(pageDir) {
   }
   try {
     for (const name of (await fs.readdir(path.join(pageDir, 'users'))).sort()) {
-      if (name.endsWith('.sqlite')) dbs.push(path.join('users', name));
+      if (USER_DB.test(name)) dbs.push(path.join('users', name));
     }
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
@@ -68,34 +101,61 @@ function vacuumInto(src, dest) {
   }
 }
 
-async function snapshot({ pageDir, oldVersion, keep }) {
+async function snapshot({ pageDir, snapshotsDir, oldVersion, keep, maxBytes }) {
   const dbs = await databases(pageDir);
-  if (dbs.length === 0) return null;
-  const root = path.join(pageDir, 'snapshots');
+  if (dbs.length === 0) return { dir: null, skipped: [] };
   let name = `${stamp()}-v${oldVersion}`;
-  while (await exists(path.join(root, name))) name = `${stamp()}-v${oldVersion}`;
-  const tmp = path.join(root, `.tmp-${name}`);
-  await fs.rm(tmp, { recursive: true, force: true });
-  await fs.mkdir(path.join(tmp, 'users'), { recursive: true });
-  for (const rel of dbs) vacuumInto(path.join(pageDir, rel), path.join(tmp, rel));
-  const dir = path.join(root, name);
-  await fs.rename(tmp, dir);
-  await prune(pageDir, keep);
-  return dir;
+  while (await exists(path.join(snapshotsDir, name))) name = `${stamp()}-v${oldVersion}`;
+  const tmp = path.join(snapshotsDir, `.tmp-${name}`);
+  const skipped = [];
+  try {
+    await fs.mkdir(path.join(tmp, 'users'), { recursive: true });
+    for (const rel of dbs) {
+      try {
+        vacuumInto(path.join(pageDir, rel), path.join(tmp, rel));
+      } catch (err) {
+        // A database the page's code broke can't be copied, now or ever:
+        // refusing the switch for it would keep the page's backend down
+        // for good. Anything else (a full disk) fails the switch.
+        if (!SQLITE_BROKEN.has(err.errcode)) throw err;
+        skipped.push(`${rel} (${err.message})`);
+        await fs.rm(path.join(tmp, rel), { force: true });
+      }
+    }
+    await fs.rename(tmp, path.join(snapshotsDir, name));
+  } catch (err) {
+    // A failed attempt leaves nothing: it is retried on the next request,
+    // and partial copies would pile up.
+    await fs.rm(tmp, { recursive: true, force: true });
+    throw err;
+  }
+  await prune(snapshotsDir, keep, maxBytes);
+  await collectBlobs(pageDir, snapshotsDir);
+  return { dir: path.join(snapshotsDir, name), skipped };
 }
 
-// Keeps the newest `keep` version snapshots, then deletes the blobs that no
-// index names any more.
-async function prune(pageDir, keep) {
-  const root = path.join(pageDir, 'snapshots');
-  const names = (await fs.readdir(root)).filter((n) => VERSION_SNAPSHOT.test(n)).sort();
-  const old = names.slice(0, Math.max(0, names.length - keep));
-  if (old.length === 0) return;
-  for (const n of old) await fs.rm(path.join(root, n), { recursive: true, force: true });
-  await collectBlobs(pageDir);
+async function dirBytes(dir) {
+  let total = 0;
+  for (const e of await fs.readdir(dir, { recursive: true, withFileTypes: true })) {
+    if (e.isFile()) total += (await fs.lstat(path.join(e.parentPath ?? e.path, e.name))).size;
+  }
+  return total;
 }
 
-async function collectBlobs(pageDir) {
+// Keeps the newest `keep` version snapshots, and of those only as many as
+// fit in maxBytes, oldest going first (the newest is always kept).
+async function prune(snapshotsDir, keep, maxBytes) {
+  const names = (await fs.readdir(snapshotsDir)).filter((n) => VERSION_SNAPSHOT.test(n)).sort().reverse();
+  let total = 0;
+  for (const [i, n] of names.entries()) {
+    const dir = path.join(snapshotsDir, n);
+    total += await dirBytes(dir);
+    if (i > 0 && (i >= keep || total > maxBytes)) await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+// Deletes the blobs that neither the live index nor a snapshot's names.
+async function collectBlobs(pageDir, snapshotsDir) {
   const blobs = path.join(pageDir, 'files', 'blobs');
   let names;
   try {
@@ -106,8 +166,10 @@ async function collectBlobs(pageDir) {
   }
   const named = new Set();
   const indexes = [path.join(pageDir, 'files.sqlite')];
-  for (const n of await fs.readdir(path.join(pageDir, 'snapshots'))) {
-    if (!n.startsWith('.tmp-')) indexes.push(path.join(pageDir, 'snapshots', n, 'files.sqlite'));
+  for (const n of await fs.readdir(snapshotsDir)) {
+    // A snapshot being written may name blobs its index does not show yet.
+    if (n.startsWith('.tmp-')) return;
+    indexes.push(path.join(snapshotsDir, n, 'files.sqlite'));
   }
   for (const file of indexes) {
     if (!(await exists(file))) continue;
@@ -131,7 +193,7 @@ async function collectBlobs(pageDir) {
 
 if (!isMainThread && workerData?.pageDir) {
   snapshot(workerData).then(
-    (dir) => parentPort.postMessage({ dir }),
+    (result) => parentPort.postMessage({ result }),
     (err) => parentPort.postMessage({ error: err.stack || String(err) }),
   );
 }

@@ -141,6 +141,10 @@ export function serveStorage(
           // A header fetch can't send: dropped, as a browser would.
         }
       }
+      // The page's headers, listed apart: the request also carries what the
+      // browser adds (the user's HTTP credentials) and what a proxy in front
+      // of Specola adds, none of which may reach the page's backend.
+      headers.set("X-Specola-Headers", encodeHeaders([...headers]));
       headers.set("X-Specola-Version", String(backend.version));
       const method = String(m.method || "GET").toUpperCase();
       let res: Response;
@@ -224,6 +228,13 @@ export function backendURL(id: string, path: unknown): string | null {
   const prefix = `/api/pages/${encodeURIComponent(id)}/x`;
   const out = new URL(prefix + u.pathname + u.search, location.href);
   return out.pathname.startsWith(prefix + "/") ? out.href : null;
+}
+
+// X-Specola-Headers: base64url of the JSON [[name, value]…].
+export function encodeHeaders(h: [string, string][]): string {
+  let bin = "";
+  for (const b of new TextEncoder().encode(JSON.stringify(h))) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 // A chunk's bytes as an ArrayBuffer of their own, to transfer.

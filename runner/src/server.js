@@ -14,6 +14,7 @@ import { CodeCache } from './code.js';
 import { RunnerError, sendError, sendJSON } from './errors.js';
 import { Logs } from './log.js';
 import { Pages } from './pages.js';
+import { sweepSnapshots } from './snapshot.js';
 
 export const RUNNER_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
@@ -142,12 +143,22 @@ export function createRunner(config, { fetch: f } = {}) {
   });
   // The runner's own limits apply per request; Node's must not cut first.
   server.requestTimeout = config.limits.requestMs + 10_000;
+  // Specola keeps idle connections for up to 90 s (Go's default). Were Node
+  // to close one first, a call sent on it just then would fail with nothing
+  // run, and one with a body can't be retried: the runner keeps them longer.
+  server.keepAliveTimeout = 100_000;
+  server.headersTimeout = 110_000;
 
   return {
     server,
     pages,
     logs,
     code,
+    /** Removes what a previous process left half written. */
+    async sweep() {
+      await code.sweep();
+      await sweepSnapshots(config.dataDir);
+    },
     listen(port = config.listen.port, host = config.listen.host) {
       return new Promise((resolve, reject) => {
         server.once('error', reject);

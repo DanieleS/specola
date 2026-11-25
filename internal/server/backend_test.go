@@ -61,6 +61,17 @@ func newFakeRunner(t *testing.T) *fakeRunner {
 			return
 		}
 		path, _, _ := strings.Cut(c.head.Request.Path, "?")
+		if path == "/early" {
+			// The head first, then the body: as a handler that streams while
+			// it reads its request.
+			_ = http.NewResponseController(w).EnableFullDuplex()
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, "reading ")
+			w.(http.Flusher).Flush()
+			n, err := io.Copy(io.Discard, r.Body)
+			fmt.Fprintf(w, "%d %v", n, err)
+			return
+		}
 		if path == "/big" {
 			_, _ = io.Copy(io.Discard, r.Body)
 		} else {
@@ -89,6 +100,10 @@ func newFakeRunner(t *testing.T) *fakeRunner {
 			case <-r.Context().Done():
 				fr.gone <- struct{}{}
 			}
+		case "/hangup":
+			// The runner goes away before any answer.
+			conn, _, _ := http.NewResponseController(w).Hijack()
+			conn.Close()
 		case "/abort":
 			// Half an answer, then the runner goes away.
 			w.Header().Set("Content-Length", "100")
@@ -107,6 +122,10 @@ func newFakeRunner(t *testing.T) *fakeRunner {
 			w.Header().Set("Connection", "X-Hop")
 			w.Header().Set("X-Hop", "1")
 			w.Header().Set("X-Kept", "yes")
+			w.Header().Set("Clear-Site-Data", `"cookies", "storage"`)
+			w.Header().Set("NEL", `{"report_to":"x","max_age":31536000}`)
+			w.Header().Set("Report-To", `{"group":"x","max_age":31536000,"endpoints":[{"url":"https://evil.example/r"}]}`)
+			w.Header().Set("Access-Control-Allow-Origin", "https://evil.example")
 			w.WriteHeader(http.StatusCreated)
 			io.WriteString(w, `{"ok":true}`)
 		}
@@ -174,15 +193,24 @@ func publishBackendPage(t *testing.T, ts *httptest.Server) string {
 var noGzip = &http.Client{Transport: &http.Transport{DisableCompression: true}}
 
 // callBackend sends a backend call as user, showing version v, and returns
-// the response.
+// the response. h are the page's headers: sent, and listed in
+// X-Specola-Headers, as the viewer does.
 func callBackend(t *testing.T, ts *httptest.Server, ctx context.Context, user, method, path string, v int, body io.Reader, h http.Header) *http.Response {
 	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, method, ts.URL+path, body)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var page [][2]string
 	for k, vs := range h {
 		req.Header[k] = vs
+		for _, v := range vs {
+			page = append(page, [2]string{k, v})
+		}
+	}
+	if page != nil {
+		b, _ := json.Marshal(page)
+		req.Header.Set("X-Specola-Headers", base64.RawURLEncoding.EncodeToString(b))
 	}
 	req.Header.Set(userHeader, user)
 	if v > 0 {
@@ -229,6 +257,11 @@ func TestBackendCalls(t *testing.T) {
 		if res.StatusCode != http.StatusCreated || body != `{"ok":true}` {
 			t.Fatalf("call: %d %s", res.StatusCode, body)
 		}
+		for _, h := range []string{"Clear-Site-Data", "NEL", "Report-To", "Access-Control-Allow-Origin"} {
+			if res.Header.Get(h) != "" {
+				t.Errorf("response header %s reached the caller", h)
+			}
+		}
 		if res.Header.Get("Set-Cookie") != "" || res.Header.Get("X-Hop") != "" || res.Header.Get("X-Kept") != "yes" ||
 			res.Header.Get("Content-Encoding") != "" || res.Header.Get("X-Content-Type-Options") != "nosniff" ||
 			!strings.HasPrefix(res.Header.Get("Content-Security-Policy"), "sandbox") {
@@ -259,6 +292,74 @@ func TestBackendCalls(t *testing.T) {
 		readBody(t, res)
 		if c2 := fr.last(t); c2.head.Request.Path != "/" || c2.head.CodeHash != c.head.CodeHash || c2.body != "" {
 			t.Fatalf("root call: %+v", c2.head.Request)
+		}
+	})
+
+	t.Run("only the page's headers", func(t *testing.T) {
+		// What the browser or a proxy in front adds on the way is not the
+		// page's: only what the viewer listed reaches the handler.
+		req, _ := http.NewRequest("GET", ts.URL+x+"/h", nil)
+		req.Header.Set(userHeader, "alice")
+		req.Header.Set("X-Specola-Version", "1")
+		req.Header.Set("Authorization", "Basic YWxpY2U6c2VjcmV0")
+		req.Header.Set("X-Forwarded-Access-Token", "idp-token")
+		req.Header.Set("X-Mine", "1")
+		req.Header.Set("X-Specola-Headers", base64.RawURLEncoding.EncodeToString([]byte(`[["X-Mine","1"],["Accept","text/plain"]]`)))
+		readBody(t, mustDo(t, req))
+		if got := fr.last(t).head.Request.Headers; fmt.Sprint(got) != "[[accept text/plain] [x-mine 1]]" {
+			t.Fatalf("headers = %v", got)
+		}
+		// None listed: none forwarded.
+		req.Header.Del("X-Specola-Headers")
+		readBody(t, mustDo(t, req))
+		if got := fr.last(t).head.Request.Headers; got == nil || len(got) != 0 {
+			t.Fatalf("headers = %#v", got)
+		}
+		req.Header.Set("X-Specola-Headers", "not json")
+		wantBackendError(t, mustDo(t, req), http.StatusBadRequest, "bad-request")
+	})
+
+	t.Run("one id per page", func(t *testing.T) {
+		// Postgres reads a uuid in upper case or without hyphens too; the
+		// runner must still see one page.
+		for _, spelling := range []string{strings.ToUpper(page), strings.ReplaceAll(page, "-", "")} {
+			readBody(t, callBackend(t, ts, ctx, "alice", "GET", "/api/pages/"+spelling+"/x/a", 1, nil, nil))
+			if c := fr.last(t); c.head.Page.ID != page || c.head.Request.Path != "/a" {
+				t.Fatalf("%s: runner got page %q path %q", spelling, c.head.Page.ID, c.head.Request.Path)
+			}
+		}
+		code, body := call(t, ts, "alice", "GET", "/api/pages/"+strings.ToUpper(page)+"/backend/logs", "")
+		if code != http.StatusOK || !strings.Contains(body, "page="+page+" ") {
+			t.Fatalf("logs: %d %s", code, body)
+		}
+	})
+
+	t.Run("full duplex", func(t *testing.T) {
+		// The runner's head arrives while the page is still uploading: the
+		// rest of the body must still reach it, and the answer the page.
+		pr, pw := io.Pipe()
+		const size = 200_000
+		go func() {
+			chunk := make([]byte, 16<<10)
+			for sent := 0; sent < size; sent += len(chunk) {
+				if size-sent < len(chunk) {
+					chunk = chunk[:size-sent]
+				}
+				time.Sleep(15 * time.Millisecond)
+				if _, err := pw.Write(chunk); err != nil {
+					return
+				}
+			}
+			pw.Close()
+		}()
+		req, _ := http.NewRequest("POST", ts.URL+x+"/early", pr)
+		req.ContentLength = size
+		req.Header.Set(userHeader, "alice")
+		req.Header.Set("X-Specola-Version", "1")
+		res := mustDo(t, req)
+		b, err := io.ReadAll(res.Body)
+		if err != nil || res.StatusCode != http.StatusAccepted || string(b) != fmt.Sprintf("reading %d <nil>", size) {
+			t.Fatalf("early head: %d %q %v", res.StatusCode, b, err)
 		}
 	})
 
@@ -308,6 +409,13 @@ func TestBackendCalls(t *testing.T) {
 		rest, _ := io.ReadAll(rd)
 		if string(rest) != `{"part":2}`+"\n" {
 			t.Fatalf("rest %q", rest)
+		}
+	})
+
+	t.Run("no answer", func(t *testing.T) {
+		wantBackendError(t, callBackend(t, ts, ctx, "alice", "GET", x+"/hangup", 1, nil, nil), http.StatusBadGateway, "backend-crashed")
+		if !s.runner.Available() {
+			t.Fatal("a runner that answered nothing, but was reached, is still available")
 		}
 	})
 
@@ -446,6 +554,16 @@ func TestBackendCalls(t *testing.T) {
 	})
 }
 
+func mustDo(t *testing.T, req *http.Request) *http.Response {
+	t.Helper()
+	res, err := noGzip.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { res.Body.Close() })
+	return res
+}
+
 type zeros struct{}
 
 func (zeros) Read(p []byte) (int, error) {
@@ -465,6 +583,12 @@ func TestBackendVersionsAndServing(t *testing.T) {
 	}
 	var pinned struct{ URL string }
 	mustJSON(t, body, &pinned)
+	// With backends on, even a static version isn't cached for good: a
+	// backend version becoming current later closes it.
+	if res := get(t, ts, "", "/view/"+page+"?v=1", http.Header{userHeader: {"alice"}}); res.StatusCode != http.StatusOK ||
+		res.Header.Get("Cache-Control") != "private, no-cache" {
+		t.Fatalf("static v1: %d %v", res.StatusCode, res.Header)
+	}
 	publishBundle(t, ts, mintBundle(t, ts, "alice", `{"kind":"version","id":"`+page+`"}`), backendBundle, "")
 
 	_, body = call(t, ts, "alice", "GET", "/api/pages/"+page+"/versions", "")

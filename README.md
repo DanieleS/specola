@@ -14,8 +14,10 @@ scripts can run without being able to touch Specola's session or API.
 > Status: early. Publish, browse, version with notes, view, share, public
 > links, favorites,
 > full-text search, offline viewing as an installable PWA, SPA bundles
-> (multi-file apps built with the Specola Vite plugin), and an
-> OAuth-protected MCP endpoint for agents.
+> (multi-file apps built with the Specola Vite plugin), optional page
+> backends (server code shipped in a bundle, run by a separate runner; first
+> step: calls, databases, files, logs), and an OAuth-protected MCP endpoint
+> for agents.
 
 ## Stack
 
@@ -45,6 +47,10 @@ tokens), not by email.
   in its files' URLs.
 - **asset_version_file** — a bundle version's other files: path, content
   type, size and the sha256 of their content.
+- `asset_version.backend` / `backend_hash` — on a bundle version with a
+  [page backend](#page-backends), its validated manifest and the hash that
+  identifies its server code. The backend's data is not in Postgres: it
+  lives on the runner's volume.
 - **bundle_blob** — bundle file contents by sha256, deduplicated across all
   versions and pages, stored uncompressed as `bytea` (up to 25 MiB per file,
   100 MiB per bundle). A periodic sweep deletes blobs no version uses (and no
@@ -90,7 +96,8 @@ accept it; pages with their data inlined shrink several times over.
 
 - `/view/{id}?v=N` is immutable: `Cache-Control: private, max-age=31536000,
   immutable`. The viewer always asks for a numbered version, so reopening a
-  page costs no download.
+  page costs no download. Not on a page with a backend, whose versions can
+  stop being openable: there it is `private, no-cache`.
 - `/view/{id}` (the current version) carries a weak `ETag` from the version's
   content hash and `Cache-Control: private, no-cache`; a matching
   `If-None-Match` answers 304 without reading the HTML out of the database.
@@ -248,6 +255,103 @@ API: `GET /api/pages/{id}/data`; `PATCH` with
 `{"clear": bool, "set": {...}, "remove": [...]}`, applied at once;
 `DELETE` to clear.
 
+## Page backends
+
+A bundle can carry **server code** for its page: a `fetch(request, ctx)`
+handler with standard `Request`/`Response`, built by the Vite plugin from
+`server/index.ts` into the bundle's `.specola/` directory and reached from
+the app with `specola.fetch("/api/…")`. It runs in Node, in the **runner**,
+a separate and optional service ([`runner/`](runner/README.md)), with a
+SQLite database shared by everyone on the page (`ctx.db`), one per user
+(`ctx.userDb`) and a file store (`ctx.files`). Responses stream, uploads are
+`FormData`. The contract is [docs/page-backends.md](docs/page-backends.md);
+the plugin side is in [plugin/README.md](plugin/README.md).
+
+```js
+// server/index.ts
+export default {
+  async fetch(request, ctx) {
+    ctx.db.exec("CREATE TABLE IF NOT EXISTS votes (by TEXT PRIMARY KEY, choice TEXT)");
+    if (request.method === "POST") {
+      ctx.db.prepare("INSERT OR REPLACE INTO votes VALUES (?, ?)").run(ctx.user.sub, await request.text());
+    }
+    return Response.json(ctx.db.prepare("SELECT choice, count(*) AS n FROM votes GROUP BY choice").all());
+  },
+};
+```
+
+- **Optional.** Without a runner configured, backends are *disabled*:
+  everything else works as before, a bundle with a backend is refused at
+  upload (`backend-disabled`), and the API (`GET /api/me` has
+  `backends: {enabled, available}`), the MCP instructions, the publish form
+  and the viewer all say so. A page published with a backend while they
+  were on still opens; its `specola.fetch` rejects with `BackendUnavailable`.
+  When the runner is configured but not answering (Specola checks its health
+  every 30 s), calls answer 503 `backend-unavailable` until it is back.
+- **Calls** go frame → viewer (the page's `MessagePort`) →
+  `ANY /api/pages/{id}/x/{path}` with the user's session → runner. Specola
+  checks access, that the frame shows the current version, the body size
+  (25 MiB) and that the user has at most 8 calls running on the page, then
+  streams the answer through. Errors Specola or the runner produce carry an
+  `X-Specola-Error` code and a JSON body; an uncaught exception answers 500
+  `backend-error` with a `ref` to the line of the **backend log**
+  (`GET /api/pages/{id}/backend/logs?since=`, owners and editors, and the
+  viewer's *Backend log* panel).
+- **Only the current version is live.** On a page whose current version has
+  a backend, older versions stay in the history (marked *not viewable*) and
+  can be restored, but can't be opened: `/view/{id}?v=N`, the token view and
+  pinned public links answer 410. A frame still showing an older version
+  gets 409 `superseded` on its calls and the viewer offers to reload it.
+  Public links on a backend page can't be pinned.
+- **Data belongs to the page, not the version.** It survives new versions;
+  the code migrates its own schema. When a new version becomes current the
+  runner first snapshots every database (`VACUUM INTO`, the last 5 kept, on
+  the runner's volume). Restoring a version restores code, not data.
+  Snapshots protect from bad code, not from losing the volume: **back up the
+  runner's volume** with the database. (Snapshot restore, export, import and
+  wipe come in a later step.)
+- **Offline**, a backend page is kept at its current version only, and its
+  `specola.fetch` rejects with `BackendUnavailable` (`reason: "offline"`).
+- Not yet: page secrets, the egress allowlist (outbound `fetch` from a
+  backend is unrestricted for now), push to open pages, scheduled jobs and
+  backend routes on public links.
+
+### Security model
+
+- **For an instance among trusted people.** Whoever can publish a bundle can
+  run Node code on the runner. Workers run one process per page under
+  Node's permission model (their code and their own data only, no child
+  processes), with memory, time and disk limits: enough to stop accidents
+  and keep pages apart, not a sandbox against a deliberately malicious
+  author. Put the runner on a private network; for more, an OS-level
+  sandbox around its container.
+- **Viewer = may call the backend.** Whoever can open the page can send any
+  request with any body to its backend, also from devtools: handlers must
+  check `ctx.user` and `ctx.role` on every request.
+- **Editor = may change the backend**, and so read all its data. Share
+  editor access on a backend page accordingly.
+- The page still never reaches Specola directly and holds no credential:
+  calls go through the viewer as the signed-in user. The internal hop
+  (Specola ↔ runner) is authenticated with a shared bearer token both ways;
+  `/internal/` answers 404 to anything else.
+
+### Running the runner
+
+Set all three on Specola, or none (Specola refuses to start with only some):
+
+| Var | Meaning |
+| --- | --- |
+| `SPECOLA_RUNNER_URL` | the runner's base URL on the private network, e.g. `http://runner:8081`; unset = backends disabled |
+| `SPECOLA_RUNNER_TOKEN` | shared bearer for the internal API (the runner needs the same value), at least 16 characters, e.g. `openssl rand -base64 32` |
+| `SPECOLA_SECRETS_KEY` | 32 bytes, base64 (`openssl rand -base64 32`); will encrypt page secrets |
+
+The runner (`node:24-slim` image built from `runner/`, single replica) takes
+`SPECOLA_URL` (Specola's internal base URL, where it fetches code),
+`SPECOLA_RUNNER_TOKEN`, `RUNNER_DATA_DIR` (its volume, default `/data`) and
+`RUNNER_LISTEN` (default `:8081`), plus `RUNNER_*` limits listed in
+[runner/README.md](runner/README.md). `docker-compose.yaml` has the service,
+network and volume commented out, ready to enable.
+
 ## Search
 
 The search box (and `GET /api/search?q=`, and the MCP `search` tool) searches
@@ -273,6 +377,9 @@ All via environment variables (see [`specola.env.example`](./specola.env.example
 | `SPECOLA_VIEW_ORIGIN` | no | serve rendered pages from this separate origin, e.g. `https://view.example.com` (needs `SPECOLA_SESSION_SECRET`) |
 | `SPECOLA_DEV_AUTH_EMAIL` | dev | bypass OIDC; treat every request as this user (used as both `sub` and email) |
 | `SPECOLA_LISTEN` | no | listen address (default `:8080`) |
+| `SPECOLA_RUNNER_URL` | no | the page backend runner; with `SPECOLA_RUNNER_TOKEN` and `SPECOLA_SECRETS_KEY`, enables [page backends](#page-backends) |
+| `SPECOLA_RUNNER_TOKEN` | with the runner | shared bearer for the internal API (≥ 16 characters) |
+| `SPECOLA_SECRETS_KEY` | with the runner | 32 bytes, base64 |
 
 \* Not required when `SPECOLA_DEV_AUTH_EMAIL` is set.
 
@@ -293,6 +400,15 @@ cd web && npm install && npm run dev
 
 Migrations run automatically on boot.
 
+To try page backends locally, run the runner next to it (Node 22 or later)
+and give Specola the same token:
+
+```sh
+export SPECOLA_RUNNER_TOKEN=$(openssl rand -base64 32)
+(cd runner && SPECOLA_URL=http://localhost:8080 RUNNER_DATA_DIR=./data npm start) &
+SPECOLA_RUNNER_URL=http://localhost:8081 SPECOLA_SECRETS_KEY=$(openssl rand -base64 32) go run ./cmd/specola
+```
+
 Tests that need a database create a throwaway one per test on the server named
 by `SPECOLA_TEST_DATABASE_URL`, and are skipped when it is unset:
 
@@ -300,8 +416,13 @@ by `SPECOLA_TEST_DATABASE_URL`, and are skipped when it is unset:
 SPECOLA_TEST_DATABASE_URL="postgres://postgres:dev@localhost:5432/postgres?sslmode=disable" go test ./...
 ```
 
-`node e2e/bundles.mjs` (or `make e2e`) publishes a real SPA bundle and checks
-it in Chromium; see [`e2e/README.md`](e2e/README.md).
+The runner's tests run with `cd runner && npm test`, the plugin's with
+`cd plugin && node --test test/*.test.js` (both: `make test`).
+
+`node e2e/bundles.mjs` publishes a real SPA bundle and checks it in Chromium,
+`node e2e/backends.mjs` does the same for a bundle with a backend, against a
+real runner, and `node e2e/sdk-bridge.mjs` checks the page ↔ viewer bridge of
+backend calls (all three: `make e2e`); see [`e2e/README.md`](e2e/README.md).
 
 ## Production (container)
 
@@ -325,8 +446,8 @@ user**, so they land in that user's gallery.
 | `publish_page` | `title`, `html`, `folder_id?`, `note?` | `{id, version, url}` |
 | `new_version` | `id`, `html`, `note?` | `{version, url}` |
 | `list` | `folder_id?`, `shared_with_me?` or `archived?` | folders and pages |
-| `get_page` | `id`, `version?` | metadata and the HTML of that version (default current) |
-| `list_versions` | `id` | the history, newest first, with notes |
+| `get_page` | `id`, `version?` | metadata and the HTML of that version (default current); for a version that can't be opened (a backend page's older one), a note saying so |
+| `list_versions` | `id` | the history, newest first, with notes, and per version `backend` and `viewable` |
 | `search` | `query`, `limit?` | matching pages with snippets |
 | `create_folder` | `name`, `parent_id?` | `{id}` |
 | `rename` | `kind`, `id`, `name` | `{ok}` |
@@ -337,7 +458,7 @@ user**, so they land in that user's gallery.
 | `list_public_links` | `id` | the page's public links, with expiry and views |
 | `revoke_public_link` | `id`, `link_id` | `{ok}` |
 | `create_upload_grant` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | one-time upload URL and a `curl` example |
-| `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx --no -- specola-publish` command to run, and the plugin install command |
+| `create_bundle_upload` | `kind` (`new` / `version`), `title?`, `folder_id?`, `id?`, `note?` | bundle upload URL, the `npx --no -- specola-publish` command to run, the plugin install command, and `backend: {enabled, available, reason?}` |
 
 `list` (on a folder), `publish_page`, `create_upload_grant` and
 `create_bundle_upload` also return a `conventions` object when preferences or
@@ -347,6 +468,14 @@ Apps with a build step are published as **SPA bundles** with the Vite plugin
 in [`plugin/`](plugin/README.md), which each instance serves at
 `/tools/specola-vite-plugin-<version>.tgz`; the server instructions steer
 agents there. See [`docs/spa-bundles.md`](docs/spa-bundles.md).
+
+The instructions also follow [page backends](#page-backends): with backends
+disabled they carry one line saying so (bundles are static, `server/` code
+and `specola.fetch` are unavailable, don't design apps that need them) and
+nothing else about them; with backends enabled, a *PAGE BACKENDS* section on
+how to add one, what `ctx` offers, who may call it, and what is not
+available yet. MCP tools to call a backend, read its log or query its data
+come in a later step.
 
 The same access rules as the UI apply to every tool. Tools carry MCP
 annotations: the reading ones (`list`, `get_page`, `list_versions`, `search`,
@@ -414,6 +543,11 @@ CIMD clients then connect without being registered in advance.
   They also allow CORS reads from the app origin, which is how the app keeps
   pages for offline viewing; offline, a kept page is rendered from the app
   origin in the sandboxed iframe, without the separate origin.
+- Page backends run page authors' code on the runner: see
+  [their security model](#security-model). Backend answers are relayed to
+  the viewer's `fetch` only, never rendered on the app origin
+  (`X-Specola-Version` is required, and they carry `Content-Security-Policy:
+  sandbox`).
 - No secrets are committed; only `*.env.example` placeholders.
 
 ## License

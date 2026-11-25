@@ -7,7 +7,6 @@ import { fork } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { RunnerError, sendError } from './errors.js';
 
@@ -15,6 +14,7 @@ const WORKER_DIR = fileURLToPath(new URL('./worker/', import.meta.url));
 const BOOTSTRAP = path.join(WORKER_DIR, 'bootstrap.mjs');
 const STOP_GRACE_MS = 5000;
 const STDERR_TAIL = 4096;
+const MAX_LINE = 16 * 1024;
 
 // Never forwarded to the handler: credentials of the viewer's session,
 // specola's own headers, and connection-level headers that describe the hop
@@ -28,15 +28,69 @@ export function requestHeaders(headers) {
   });
 }
 
+// Response headers a browser applies to the whole origin they come from, not
+// to the one response. The viewer's fetch receives the handler's answer on
+// specola's origin, so these would let one page's backend sign every viewer
+// out (Clear-Site-Data), install reporting of all their requests (NEL,
+// Report-To) or change how the browser reaches specola. Specola drops the
+// same list (internal/server/backend.go, originWide).
+export const ORIGIN_WIDE = new Set([
+  'clear-site-data',
+  'nel',
+  'report-to',
+  'reporting-endpoints',
+  'strict-transport-security',
+  'alt-svc',
+  'accept-ch',
+  'critical-ch',
+  'origin-agent-cluster',
+  'service-worker-allowed',
+  'set-login',
+  'refresh',
+]);
+
 // The handler's response headers, minus what it may not set: cookies (the
 // frame has no cookies of its own, and specola's must stay specola's),
-// hop-by-hop headers, the length (the body is re-chunked on the way) and
+// hop-by-hop headers, the length (the body is re-chunked on the way),
 // X-Specola-* (a handler must not be able to pose as a specola error such
-// as "superseded").
+// as "superseded"), headers with an effect on the whole origin and CORS
+// ones (the call is same-origin; a handler must not open it to others).
 export function responseHeaders(headers) {
   return headers.filter(([k]) => {
     const n = k.toLowerCase();
-    return n !== 'set-cookie' && n !== 'content-length' && !n.startsWith('x-specola-') && !HOP_BY_HOP.has(n);
+    return (
+      n !== 'set-cookie' &&
+      n !== 'content-length' &&
+      !n.startsWith('x-specola-') &&
+      !n.startsWith('access-control-') &&
+      !HOP_BY_HOP.has(n) &&
+      !ORIGIN_WIDE.has(n)
+    );
+  });
+}
+
+// Calls onLine for each line of a stream, cutting lines longer than
+// MAX_LINE: page code can write megabytes without a newline, which must not
+// pile up in the runner, shared by every page.
+function eachLine(stream, onLine) {
+  let buf = '';
+  let cut = false;
+  stream.setEncoding('utf8');
+  stream.on('data', (chunk) => {
+    const parts = (buf + chunk).split('\n');
+    buf = parts.pop();
+    for (const l of parts) {
+      if (!cut) onLine(l.length > MAX_LINE ? l.slice(0, MAX_LINE) + '… (truncated)' : l.replace(/\r$/, ''));
+      cut = false;
+    }
+    if (buf.length > MAX_LINE && !cut) {
+      onLine(buf.slice(0, MAX_LINE) + '… (truncated)');
+      cut = true;
+    }
+    if (cut) buf = '';
+  });
+  stream.on('end', () => {
+    if (buf && !cut) onLine(buf);
   });
 }
 
@@ -54,6 +108,7 @@ export class PageWorker {
   #stopping = false;
   #killReason = null;
   #stderrTail = '';
+  #startTimer = null;
 
   /**
    * @param {object} o
@@ -61,12 +116,13 @@ export class PageWorker {
    * @param {string} o.codeDir
    * @param {string} o.entry absolute path of the entry file
    * @param {string} o.pageDir
+   * @param {string} o.snapshotsDir the page's snapshots, which it may read only
    * @param {object} o.limits
    * @param {import('./log.js').Logs} o.logs
    * @param {(w: PageWorker) => void} o.onGone called once the process is gone
    */
-  constructor({ page, codeDir, entry, pageDir, limits, logs, onGone }) {
-    Object.assign(this, { page, codeDir, entry, pageDir, limits, logs, onGone });
+  constructor({ page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone }) {
+    Object.assign(this, { page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone });
     this.state = 'new'; // new → starting → ready → (draining) → stopped; or failed
     this.#ready = new Promise((resolve, reject) => {
       this.#readyCb = { resolve, reject };
@@ -92,11 +148,14 @@ export class PageWorker {
 
   start() {
     fs.mkdirSync(this.pageDir, { recursive: true });
+    fs.mkdirSync(this.snapshotsDir, { recursive: true });
     this.state = 'starting';
     const execArgv = [
       '--permission',
       `--allow-fs-read=${this.codeDir}`,
       `--allow-fs-read=${this.pageDir}`,
+      // Read-only: the file store checks which blobs snapshots still name.
+      `--allow-fs-read=${this.snapshotsDir}`,
       `--allow-fs-read=${WORKER_DIR}`,
       `--allow-fs-write=${this.pageDir}`,
       `--max-old-space-size=${this.limits.workerMemoryMb}`,
@@ -119,8 +178,8 @@ export class PageWorker {
     child.on('message', (m) => this.#onMessage(m));
     child.on('exit', (code, signal) => this.#onExit(code, signal));
     child.on('error', (err) => this.#log('error', `worker process error: ${err.message}`));
-    readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', (l) => this.#log('log', l));
-    readline.createInterface({ input: child.stderr, crlfDelay: Infinity }).on('line', (l) => {
+    eachLine(child.stdout, (l) => this.#log('log', l));
+    eachLine(child.stderr, (l) => {
       this.#stderrTail = (this.#stderrTail + l + '\n').slice(-STDERR_TAIL);
       this.#log('error', l);
     });
@@ -128,11 +187,25 @@ export class PageWorker {
       t: 'init',
       page: this.page,
       pageDir: this.pageDir,
+      snapshotsDir: this.snapshotsDir,
       entry: this.entry,
       diskQuota: this.limits.pageDiskBytes,
     });
     this.#log('info', `worker started for version ${this.page.version} (pid ${child.pid})`);
+    // An entry whose top-level await never settles would leave every call
+    // waiting for a worker that never gets ready (while it still answers
+    // pings): it gets as long as a handler gets to answer.
+    this.#startTimer = setTimeout(() => this.#startTimeout(), this.limits.firstByteMs);
     this.#armIdle();
+  }
+
+  #startTimeout() {
+    if (this.state !== 'starting') return;
+    const ref = newRef();
+    this.#log('error', `the backend entry did not finish loading within ${seconds(this.limits.firstByteMs)} (a top-level await that never settles?)`, ref);
+    this.state = 'failed';
+    this.#readyCb.reject(new RunnerError(500, 'backend-error', 'The backend failed to start.', ref));
+    this.stop('it did not finish loading');
   }
 
   #send(msg, cb) {
@@ -146,6 +219,7 @@ export class PageWorker {
    * RunnerError when the request cannot be taken.
    */
   handle(inv, req, res) {
+    if (res.destroyed) return; // the caller is gone already
     if (this.gone || this.state === 'draining') {
       throw new RunnerError(503, 'backend-unavailable', 'The backend worker is shutting down; retry.');
     }
@@ -187,7 +261,8 @@ export class PageWorker {
   }
 
   #dispatch(call) {
-    if (call.finished) {
+    if (call.finished || call.res.destroyed) {
+      call.finished = true;
       this.#settle(call);
       return;
     }
@@ -196,6 +271,8 @@ export class PageWorker {
     this.#send({
       t: 'req',
       id: call.id,
+      // Per call: the title changes when the page is renamed.
+      page: inv.page,
       user: inv.user,
       role: inv.role,
       link: inv.link,
@@ -320,11 +397,13 @@ export class PageWorker {
       return;
     }
     if (m.t === 'ready') {
+      clearTimeout(this.#startTimer);
       if (this.state === 'starting') this.state = 'ready';
       this.#readyCb.resolve();
       return;
     }
     if (m.t === 'fatal') {
+      clearTimeout(this.#startTimer);
       this.state = 'failed';
       this.#readyCb.reject(new RunnerError(500, 'backend-error', 'The backend failed to start.', m.ref));
       this.stop('the backend failed to start');
@@ -389,6 +468,7 @@ export class PageWorker {
     this.state = this.state === 'failed' ? 'failed' : 'stopped';
     clearTimeout(this.#idleTimer);
     clearTimeout(this.#pingTimer);
+    clearTimeout(this.#startTimer);
     let ref;
     if (!wasStopping || this.#calls.size > 0) {
       ref = newRef();

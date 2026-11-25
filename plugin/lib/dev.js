@@ -22,6 +22,10 @@ export const DEV_DATA_DIR = '.specola-dev';
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+// Response headers with an effect on the whole origin, which specola and the
+// runner drop (runner/src/process.js, ORIGIN_WIDE): dropped here too, so a
+// handler that relies on one finds out in dev.
+const ORIGIN_WIDE = new Set(['clear-site-data', 'nel', 'report-to', 'reporting-endpoints', 'strict-transport-security', 'alt-svc', 'accept-ch', 'critical-ch', 'origin-agent-cluster', 'service-worker-allowed', 'set-login', 'refresh']);
 const require = createRequire(import.meta.url);
 
 /** The headers a handler sees: the page's, minus cookies, hop-by-hop ones and X-Specola-*. */
@@ -35,11 +39,14 @@ export function requestHeaders(raw) {
   return headers;
 }
 
-/** The response headers sent to the page: Set-Cookie and hop-by-hop ones are dropped. */
+/**
+ * The response headers sent to the page: Set-Cookie, hop-by-hop, X-Specola-*,
+ * CORS and origin-wide ones are dropped, as specola does.
+ */
 export function responseHeaders(headers) {
   const out = {};
   for (const [k, v] of headers) {
-    if (k === 'set-cookie' || HOP_BY_HOP.has(k)) continue;
+    if (k === 'set-cookie' || HOP_BY_HOP.has(k) || ORIGIN_WIDE.has(k) || k.startsWith('x-specola-') || k.startsWith('access-control-')) continue;
     out[k] = k in out ? `${out[k]}, ${v}` : v;
   }
   return out;
@@ -52,6 +59,24 @@ export function devUser(value = process.env.SPECOLA_DEV_USER) {
   const email = m ? m[2].trim() : raw;
   const name = (m && m[1].trim()) || email.split('@')[0];
   return Object.freeze({ sub: email, email, name });
+}
+
+/**
+ * Whether a request comes from another site. The dev backend runs as the
+ * developer, as owner, on their dev data: a page they visit elsewhere must
+ * not be able to post to it (a form needs no preflight). Tools without these
+ * headers (curl) are let through.
+ */
+export function crossSite(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return true;
+  const origin = req.headers.origin;
+  if (!origin || origin === 'null') return Boolean(origin);
+  try {
+    return new URL(origin).host !== req.headers.host;
+  } catch {
+    return true;
+  }
 }
 
 /** Answers one of the runner's own errors: X-Specola-Error and a JSON body. */
@@ -145,6 +170,11 @@ export function createDevBackend({ root, load, manifest, env = process.env, logg
     // Mounted under DEV_PREFIX: req.url is the rest of the path.
     const path = req.url.startsWith('/') ? req.url : '/' + req.url;
     const method = req.method ?? 'GET';
+    if (crossSite(req)) {
+      sendError(res, 403, 'forbidden', 'The dev backend only answers the dev server\'s own pages.');
+      req.resume();
+      return;
+    }
     const abort = new AbortController();
     res.on('close', () => {
       if (!res.writableFinished) abort.abort(new DOMException('The request was aborted.', 'AbortError'));
@@ -212,7 +242,8 @@ export function createDevBackend({ root, load, manifest, env = process.env, logg
       if (response.body && method !== 'HEAD') {
         for await (const chunk of response.body) {
           if (abort.signal.aborted) break;
-          if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+          // 'close' too: a caller gone mid-stream never drains.
+          if (!res.write(chunk)) await new Promise((r) => (res.once('drain', r), res.once('close', r)));
         }
       }
       res.end();

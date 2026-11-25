@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -161,28 +163,59 @@ func dropped(name string, h http.Header, extra ...string) bool {
 	return false
 }
 
+// pageHeadersHeader carries the headers the page set on its call. The
+// call's own headers are not the page's: the browser adds the viewer's
+// credentials to a same-origin fetch (HTTP basic auth), and a proxy in front
+// of specola adds its own (an access token, the user's email…). None of
+// that may reach code the page's editors write, so the viewer lists the
+// page's headers here and only those are forwarded.
+const pageHeadersHeader = "X-Specola-Headers"
+
 // callHeaders are the page's request headers as the handler gets them,
-// sorted by name: without cookies, hop-by-hop headers, anything X-Specola-*,
-// and what describes this hop rather than the page's request (Host, the
-// length, the encodings this hop accepts, the trusted identity header).
-func (s *Server) callHeaders(h http.Header) [][2]string {
+// sorted by name: those the viewer listed in X-Specola-Headers (base64url
+// JSON [[name, value]…]; none without it), without cookies, hop-by-hop
+// headers, anything X-Specola-*, and what describes this hop rather than
+// the page's request (Host, the length, the encodings this hop accepts, the
+// trusted identity header).
+func (s *Server) callHeaders(h http.Header) ([][2]string, error) {
+	var page [][2]string
+	if v := h.Get(pageHeadersHeader); v != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(v, "="))
+		if err != nil || json.Unmarshal(raw, &page) != nil {
+			return nil, errors.New(pageHeadersHeader + " must be base64url JSON [[name, value]…]")
+		}
+	}
 	extra := []string{"cookie", "host", "content-length", "accept-encoding"}
 	if s.cfg.TrustedUserHeader != "" {
 		extra = append(extra, strings.ToLower(s.cfg.TrustedUserHeader))
 	}
-	var out [][2]string
-	for name, values := range h {
-		n := strings.ToLower(name)
-		if strings.HasPrefix(n, "x-specola-") || dropped(n, h, extra...) {
-			continue
-		}
-		for _, v := range values {
-			out = append(out, [2]string{n, v})
+	connection := http.Header{}
+	for _, kv := range page {
+		if strings.EqualFold(kv[0], "connection") {
+			connection.Add("Connection", kv[1])
 		}
 	}
+	out := [][2]string{}
+	for _, kv := range page {
+		n := strings.ToLower(kv[0])
+		if strings.HasPrefix(n, "x-specola-") || dropped(n, connection, extra...) {
+			continue
+		}
+		out = append(out, [2]string{n, kv[1]})
+	}
 	slices.SortStableFunc(out, func(a, b [2]string) int { return strings.Compare(a[0], b[0]) })
-	return out
+	return out, nil
 }
+
+// originWide are response headers a browser applies to the whole origin they
+// come from, not to the one response. A handler's answer reaches the viewer's
+// fetch on specola's origin, so these would let one page's backend sign every
+// viewer out (Clear-Site-Data), have their browser report every request to
+// the page's author (NEL, Report-To) or change how it reaches specola. The
+// runner drops the same list (runner/src/process.js, ORIGIN_WIDE).
+var originWide = []string{"clear-site-data", "nel", "report-to", "reporting-endpoints",
+	"strict-transport-security", "alt-svc", "accept-ch", "critical-ch", "origin-agent-cluster",
+	"service-worker-allowed", "set-login", "refresh"}
 
 // limitedBody reads a call's body and remembers whether it went over the
 // limit, so that the failed call is answered 413 rather than as a runner
@@ -220,6 +253,10 @@ func (b *limitedBody) Read(p []byte) (int, error) {
 // without a CORS preflight, which is never granted, so a page elsewhere
 // can't call a backend with the user's cookie.
 func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
+	// The runner may answer, and its head be relayed, before the page's body
+	// is all here (a handler that refuses early, or streams while it reads).
+	// Over HTTP/1 Go would then cut the body still being forwarded.
+	_ = http.NewResponseController(w).EnableFullDuplex()
 	ctx, sub, id := r.Context(), subOf(r.Context()), chi.URLParam(r, "id")
 	version, err := strconv.Atoi(r.Header.Get("X-Specola-Version"))
 	if err != nil || version < 1 {
@@ -251,7 +288,13 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 		backendError(w, http.StatusRequestEntityTooLarge, "body-too-large", fmt.Sprintf("a request body can be at most %d MiB", maxBackendBody>>20))
 		return
 	}
-	key := sub + "\x00" + id
+	headers, err := s.callHeaders(r.Header)
+	if err != nil {
+		backendError(w, http.StatusBadRequest, "bad-request", err.Error())
+		return
+	}
+	// t.ID, not id: one page, whatever spelling of its uuid the URL used.
+	key := sub + "\x00" + t.ID
 	if !s.calls.acquire(key, maxCallsPerUserPage) {
 		backendError(w, http.StatusTooManyRequests, "too-many-requests",
 			fmt.Sprintf("at most %d requests to this page's backend can run at once", maxCallsPerUserPage))
@@ -267,7 +310,7 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 		path += "?" + r.URL.RawQuery
 	}
 	head, err := backend.EncodeInvoke(&backend.Invoke{
-		Page:      backend.Page{ID: id, Version: t.Version, Title: t.Title},
+		Page:      backend.Page{ID: t.ID, Version: t.Version, Title: t.Title},
 		VersionID: t.VersionID,
 		CodeHash:  t.CodeHash,
 		User:      &t.User,
@@ -275,7 +318,7 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 		// Secrets come in a later step; until then a backend gets none.
 		Secrets: map[string]string{},
 		Egress:  t.Manifest.Egress,
-		Request: backend.Request{Method: r.Method, Path: path, Headers: s.callHeaders(r.Header)},
+		Request: backend.Request{Method: r.Method, Path: path, Headers: headers},
 	})
 	if err != nil {
 		backendAccessError(w, err)
@@ -325,13 +368,14 @@ func (s *Server) callFailed(w http.ResponseWriter, r *http.Request, callCtx cont
 
 // relayResponse streams the runner's response to the caller, chunk by
 // chunk as it comes: a handler may stream (LLM output, long exports), so
-// nothing is buffered. Set-Cookie and hop-by-hop headers stay behind: the
-// app origin's cookies are Specola's own.
+// nothing is buffered. Set-Cookie, hop-by-hop, origin-wide and CORS headers
+// stay behind: the app origin's cookies and policies are Specola's own.
 func relayResponse(w http.ResponseWriter, res *http.Response) {
 	h := w.Header()
 	for name, values := range res.Header {
 		n := strings.ToLower(name)
-		if n == "set-cookie" || n == "content-length" || dropped(n, res.Header) {
+		if n == "set-cookie" || n == "content-length" || strings.HasPrefix(n, "access-control-") ||
+			dropped(n, res.Header, originWide...) {
 			continue
 		}
 		h[name] = values
@@ -394,7 +438,7 @@ func (s *Server) handleBackendLogs(w http.ResponseWriter, r *http.Request) {
 		backendError(w, http.StatusServiceUnavailable, "backend-disabled", "page backends are not enabled on this instance")
 		return
 	}
-	res, err := s.runner.Logs(ctx, id, since)
+	res, err := s.runner.Logs(ctx, t.ID, since)
 	if err != nil {
 		if backend.Unreachable(err) {
 			s.runner.MarkUnavailable()

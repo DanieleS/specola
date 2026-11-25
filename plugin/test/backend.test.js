@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { build, createLogger, createServer } from 'vite';
 import specola, { devSpecola } from '../index.js';
-import { DevFileStore, devUser } from '../lib/dev.js';
+import { DevFileStore, crossSite, devUser, responseHeaders } from '../lib/dev.js';
 
 const fixture = fileURLToPath(new URL('./fixture-backend', import.meta.url));
 const scratch = mkdtempSync(join(tmpdir(), 'specola-plugin-backend-'));
@@ -285,6 +285,13 @@ test('the dev server runs the handler at /__specola/x/', async () => {
     assert.equal(res.status, 413);
     assert.equal(res.headers.get('x-specola-error'), 'body-too-large');
 
+    // Another site's page can't post to the dev backend.
+    res = await x('/api/notes', { method: 'POST', body: '{}', headers: { origin: 'https://evil.example' } });
+    assert.equal(res.status, 403);
+    assert.equal(res.headers.get('x-specola-error'), 'forbidden');
+    assert.equal((await x('/api/notes', { headers: { 'sec-fetch-site': 'cross-site' } })).status, 403);
+    assert.equal((await x('/api/notes', { headers: { origin: base, 'sec-fetch-site': 'same-origin' } })).status, 200);
+
     // Editing the server code applies to the next request.
     writeFileSync(join(root, 'server', 'greet.ts'), 'export const greet = (name: string): string => `hi again, ${name}`;\n');
     let hello;
@@ -303,4 +310,16 @@ test('the dev server runs the handler at /__specola/x/', async () => {
     delete process.env.API_KEY_FOR_TEST_ONLY;
     await server.close();
   }
+});
+
+test('dev: cross-site requests and response headers', () => {
+  const req = (headers) => ({ headers: { host: 'localhost:5173', ...headers } });
+  assert.equal(crossSite(req({})), false, 'curl');
+  assert.equal(crossSite(req({ 'sec-fetch-site': 'same-origin', origin: 'http://localhost:5173' })), false);
+  assert.equal(crossSite(req({ 'sec-fetch-site': 'none' })), false, 'typed in the address bar');
+  assert.equal(crossSite(req({ 'sec-fetch-site': 'same-site' })), true);
+  assert.equal(crossSite(req({ origin: 'http://localhost:9999' })), true);
+  assert.equal(crossSite(req({ origin: 'null' })), true);
+  const h = new Headers({ 'clear-site-data': '"*"', nel: '{}', 'access-control-allow-origin': '*', 'x-specola-error': 'superseded', 'set-cookie': 'a=b', 'content-type': 'text/plain', 'x-mine': '1' });
+  assert.deepEqual(responseHeaders(h), { 'content-type': 'text/plain', 'x-mine': '1' });
 });

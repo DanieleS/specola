@@ -78,10 +78,13 @@ func (s *Store) CreatePublicLink(ctx context.Context, sub, assetID string, req P
 		if req.Version < 1 || req.Version > current {
 			return "", nil, &ErrInvalid{fmt.Sprintf("version must be between 1 and %d", current)}
 		}
+		// The pinned version must stay openable: neither it nor the
+		// current one may have a backend (see viewable).
 		var hasBackend bool
 		if err := s.pool.QueryRow(ctx, `
-			SELECT backend IS NOT NULL FROM asset_version WHERE asset_id = $1::uuid AND version = $2`,
-			assetID, current).Scan(&hasBackend); err != nil {
+			SELECT COALESCE(bool_or(backend IS NOT NULL), false) FROM asset_version
+			WHERE asset_id = $1::uuid AND version IN ($2, $3)`,
+			assetID, current, req.Version).Scan(&hasBackend); err != nil {
 			return "", nil, err
 		}
 		if hasBackend {

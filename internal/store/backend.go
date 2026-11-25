@@ -28,9 +28,10 @@ var ErrSuperseded = errors.New("this page has a backend: only its current versio
 var ErrBackendDisabled = errors.New("this bundle has a backend (.specola/backend.json), but page backends are not enabled on this Specola instance: it has no backend runner. " +
 	"Publish the app without its server code, or ask the instance's operator to enable backends.")
 
-// ErrBackendPinned means a public link can't be pinned to a version of a
-// backend page: it always follows the current one.
-var ErrBackendPinned = errors.New("this page has a backend: its public links follow the current version and can't be pinned to one")
+// ErrBackendPinned means a public link can't be pinned to that version: the
+// page has a backend, so its links follow the current version, or the
+// version has one and is not current, so it can't be opened.
+var ErrBackendPinned = errors.New("a public link can't be pinned to a version with a backend, nor on a page whose current version has one: only the current version of a page with a backend can be opened")
 
 // viewable is the SQL for "version v of page a can be opened", where cur is
 // a's current version.
@@ -87,6 +88,11 @@ func (s *Store) ServeVersion(ctx context.Context, sub, id string, n int) (*Serve
 // BackendTarget is what a call to a page's backend needs to know: the
 // caller's role and identity, and the page's current version.
 type BackendTarget struct {
+	// ID is the page's id in its one canonical spelling. Postgres reads a
+	// uuid in upper case or with its hyphens moved too, and the runner keys
+	// a page's worker, data and log on the id as written: anything sent to
+	// the runner uses this, never the id from the URL.
+	ID        string
 	Role      Role
 	User      backend.User
 	Title     string
@@ -107,14 +113,14 @@ func (s *Store) BackendTarget(ctx context.Context, sub, id string) (*BackendTarg
 		manifest []byte
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT r.level, a.name, a.current_version, v.id::text, v.backend_hash, v.backend,
+		SELECT a.id::text, r.level, a.name, a.current_version, v.id::text, v.backend_hash, v.backend,
 		       COALESCE(u.email, ''), COALESCE(u.name, '')
 		FROM asset a
 		CROSS JOIN LATERAL (SELECT asset_access($2, a.id) AS level) r
 		JOIN asset_version v ON v.asset_id = a.id AND v.version = a.current_version
 		LEFT JOIN app_user u ON u.sub = $2
 		WHERE a.id = $1::uuid AND a.deleted_at IS NULL AND a.archived_at IS NULL`, id, sub).
-		Scan(&t.Role, &t.Title, &t.Version, &t.VersionID, &hash, &manifest, &t.User.Email, &t.User.Name)
+		Scan(&t.ID, &t.Role, &t.Title, &t.Version, &t.VersionID, &hash, &manifest, &t.User.Email, &t.User.Name)
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidText(err) {
 		return nil, ErrNotFound
 	}

@@ -3,6 +3,7 @@
 // worker could open (and create) a database anywhere the runner's user can
 // write. The guard keeps database paths inside the page's directory. It is a
 // guard against accidents, not a sandbox: SQL `ATTACH` still names any path.
+// Databases opened through it get the page's disk quota (quota.mjs).
 // This file runs inside page workers: it must only import node: modules.
 
 import path from 'node:path';
@@ -35,6 +36,7 @@ export class DatabaseSync extends real.DatabaseSync {
   constructor(...args) {
     checkPath(args[0], 'DatabaseSync');
     super(...args);
+    globalThis[Symbol.for('specola.trackDb')]?.(this);
   }
 }
 

@@ -31,6 +31,7 @@ export function backend(source, extra = {}) {
 export async function fakeSpecola() {
   const versions = new Map();
   const hits = [];
+  const state = { delayMs: 30 };
   const server = http.createServer((req, res) => {
     hits.push({ url: req.url, auth: req.headers.authorization });
     const m = /^\/internal\/runner\/code\/([^/]+)$/.exec(req.url);
@@ -46,13 +47,17 @@ export async function fakeSpecola() {
     // A little latency so concurrent first requests overlap.
     setTimeout(() => {
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(code));
-    }, 30);
+    }, state.delayMs);
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     versions,
     hits,
+    /** How long code downloads take. */
+    set delayMs(ms) {
+      state.delayMs = ms;
+    },
     close: () => new Promise((r) => server.close(r)),
   };
 }
@@ -100,7 +105,7 @@ export async function startRunner(limits = {}) {
  */
 export function invoke(url, o) {
   const head = {
-    page: { id: o.page ?? 'page-1', version: o.version ?? 1, title: 'Test page' },
+    page: { id: o.page ?? 'page-1', version: o.version ?? 1, title: o.title ?? 'Test page' },
     versionId: o.versionId,
     codeHash: o.codeHash,
     user: o.user === undefined ? { sub: 'user-1', email: 'u1@example.com', name: 'User One' } : o.user,

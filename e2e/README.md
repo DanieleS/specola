@@ -21,18 +21,49 @@ form's commands are dropped when the title changes, and that files of a
 version nobody keeps are pruned when the app starts, unless another tab is
 storing it.
 
-Run it from the repository root:
+`backends.mjs` checks page backends
+([docs/page-backends.md](../docs/page-backends.md)) end to end. It starts the
+real runner (`runner/`, its data in a temporary directory) and Specola in
+front of it on free ports, builds [`app-backend/`](app-backend) (an app whose
+`server/index.ts` uses `ctx.db`, `ctx.userDb` and `ctx.files`, streams an
+answer and throws on one route), publishes it with `specola-publish` and opens
+it through the viewer in Chromium. It checks that the shared counter counts
+and persists, that a `FormData` upload round-trips byte for byte, that
+streamed chunks reach the page as the backend writes them, that a throwing
+route answers 500 `backend-error` with a `ref` found in the backend log (and
+in the viewer's log panel), and that a viewer-only user (a second Specola on
+the same database, behind a trusted user header) may call the backend with a
+database of their own but gets 403 on the log. Then it publishes version 2
+and checks that version 1 answers 410 and is no longer viewable, that the
+frame still showing it gets `superseded` and the viewer's reload notice, that
+the data survived and that the runner snapshotted it. Last, it restarts
+Specola without the backend variables and checks that `/api/me`, the MCP
+instructions, the upload grant, the CLI and the manifest step all say
+backends are disabled, and that the page still opens with the disabled
+notice while `specola.fetch` rejects with `BackendUnavailable`.
+
+`sdk-bridge.mjs` checks the frame ↔ viewer half of backend calls on its own,
+without Go or Postgres: the page SDK (`internal/server/pagesdk.js`) in a
+sandboxed frame and the viewer's relay (`web/src/lib/pagedata.ts`, bundled
+with esbuild) in its parent, against a small Node server playing Specola and
+the runner: streaming, queueing before the port, headers, `FormData` bodies,
+aborts, the `BackendUnavailable` reasons, redirects and path checks.
+
+Run them from the repository root:
 
 ```sh
 (cd web && npm install && npm run build)   # the SPA, embedded in the server
-(cd plugin && npm install)                 # Vite, to build the app
-node e2e/bundles.mjs                       # or: make e2e
+(cd plugin && npm install)                 # Vite, to build the apps
+node e2e/bundles.mjs                       # or: make e2e (all three)
+node e2e/sdk-bridge.mjs
+node e2e/backends.mjs
 ```
 
-It needs Go, `psql` and a PostgreSQL where it may create and drop throwaway
-databases (`SPECOLA_E2E_DATABASE_URL`, default
-`postgres://postgres:dev@localhost:5432/postgres?sslmode=disable`), port 18080
-free (`SPECOLA_E2E_PORT`), and Playwright with Chromium (`require('playwright')`
-must resolve, e.g. installed globally). The web build overwrites the committed
-placeholder `internal/webui/dist/index.html`: restore it with
-`git checkout internal/webui/dist/index.html` before committing.
+`bundles.mjs` and `backends.mjs` need Go, `psql` and a PostgreSQL where they
+may create and drop throwaway databases (`SPECOLA_E2E_DATABASE_URL`, default
+`postgres://postgres:dev@localhost:5432/postgres?sslmode=disable`);
+`bundles.mjs` needs port 18080 free (`SPECOLA_E2E_PORT`), `backends.mjs` Node
+22 or later (the runner uses `node:sqlite`). All three need Playwright with
+Chromium (`require('playwright')` must resolve, e.g. installed globally).
+The web build overwrites the committed placeholder
+`internal/webui/dist/index.html`: restore it with `git checkout internal/webui/dist/index.html` before committing.

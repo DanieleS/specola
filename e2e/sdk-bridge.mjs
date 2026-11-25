@@ -12,8 +12,9 @@
 // - calls made before the port arrives wait for it; specola.backend follows
 //   the port's handover;
 // - the request goes out with its method, the page's headers (not its
-//   X-Specola-* ones), X-Specola-Version, and a FormData body whose bytes
-//   and multipart boundary the backend parses back;
+//   X-Specola-* ones), listed in X-Specola-Headers too (only those reach a
+//   handler), X-Specola-Version, and a FormData body whose bytes and
+//   multipart boundary the backend parses back;
 // - aborting (before the answer and while it streams) rejects with an
 //   AbortError and cancels the viewer's request; so does the frame going;
 // - backend-disabled / backend-unavailable / superseded become a
@@ -134,6 +135,7 @@ const server = createServer(async (req, res) => {
         version: req.headers['x-specola-version'] ?? null,
         custom: req.headers['x-custom'] ?? null,
         specolaFoo: req.headers['x-specola-foo'] ?? null,
+        listed: req.headers['x-specola-headers'] ? JSON.parse(Buffer.from(req.headers['x-specola-headers'], 'base64url').toString('utf8')) : null,
         contentType: req.headers['content-type'] ?? null,
         size: body.length,
         sha256: createHash('sha256').update(body).digest('hex'),
@@ -301,6 +303,11 @@ try {
   check(echo.body.method === 'PUT' && echo.body.query === '?x=1' && echo.body.text === 'hello', 'method, query and body arrive', echo.body);
   check(echo.body.custom === 'yes' && echo.body.specolaFoo === null, "the page's headers arrive, its X-Specola-* ones don't", echo.body);
   check(echo.body.version === '3', 'X-Specola-Version is the version the frame shows', echo.body.version);
+  check(
+    JSON.stringify(echo.body.listed) === JSON.stringify([['content-type', 'text/plain;charset=UTF-8'], ['x-custom', 'yes']]),
+    "X-Specola-Headers lists the page's headers, and only those",
+    echo.body.listed,
+  );
   check(/^text\/plain/.test(echo.body.contentType ?? ''), 'a string body gets its content type', echo.body.contentType);
 
   const json = await f.evaluate(async () => (await specola.fetch(new Request('/echo', { method: 'POST', body: new URLSearchParams({ a: '1' }) }))).json());

@@ -54,13 +54,14 @@ func TestBackends(t *testing.T) {
 		enabled             bool
 	}{
 		"none":        {},
-		"all":         {url: "http://runner:8090/", token: "t", secrets: key, enabled: true},
+		"all":         {url: "http://runner:8090/", token: "t123456789abcdef", secrets: key, enabled: true},
+		"short token": {url: "http://runner:8090", token: "devtoken1", secrets: key, wantErr: "at least 16 characters"},
 		"url only":    {url: "http://runner:8090", wantErr: "missing: SPECOLA_RUNNER_TOKEN, SPECOLA_SECRETS_KEY"},
 		"no key":      {url: "http://runner:8090", token: "t", wantErr: "missing: SPECOLA_SECRETS_KEY"},
 		"no url":      {token: "t", secrets: key, wantErr: "missing: SPECOLA_RUNNER_URL"},
-		"short key":   {url: "http://runner", token: "t", secrets: "c2hvcnQ=", wantErr: "32 bytes"},
-		"bad url":     {url: "runner:8090", token: "t", secrets: key, wantErr: "SPECOLA_RUNNER_URL"},
-		"not base64!": {url: "http://runner", token: "t", secrets: "!!!", wantErr: "32 bytes"},
+		"short key":   {url: "http://runner", token: "t123456789abcdef", secrets: "c2hvcnQ=", wantErr: "32 bytes"},
+		"bad url":     {url: "runner:8090", token: "t123456789abcdef", secrets: key, wantErr: "SPECOLA_RUNNER_URL"},
+		"not base64!": {url: "http://runner", token: "t123456789abcdef", secrets: "!!!", wantErr: "32 bytes"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("SPECOLA_DATABASE_URL", "postgres://x")
@@ -81,7 +82,7 @@ func TestBackends(t *testing.T) {
 			if c.BackendsEnabled() != tc.enabled {
 				t.Fatalf("enabled = %v", c.BackendsEnabled())
 			}
-			if tc.enabled && (c.RunnerURL != "http://runner:8090" || c.RunnerToken != "t" || len(c.SecretsKey) != 32) {
+			if tc.enabled && (c.RunnerURL != "http://runner:8090" || c.RunnerToken != "t123456789abcdef" || len(c.SecretsKey) != 32) {
 				t.Fatalf("config = %+v", c)
 			}
 		})
