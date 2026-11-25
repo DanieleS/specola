@@ -5,18 +5,20 @@
 // MessagePort handed to the page on its first hello. Offline, the same port
 // hands a kept bundle's files to the page (see offline.svelte.ts), and it
 // carries the page's calls to its backend (docs/page-backends.md, "Frame ↔
-// viewer"): see relay below.
+// viewer"): see relay below, and its subscriptions to what the backend
+// pushes: see pushStream.
 // A numbered version is cached for a year with the runtime it was served with,
 // so this side must keep answering older runtimes: extend the protocol, don't
 // change it.
 
-import { api, UNAUTHORIZED_EVENT } from "./api";
+import { api, UNAUTHORIZED_EVENT, type PushMessage } from "./api";
 import { index as offlineIndex, type BundleFile } from "./offline.svelte";
 
 type Write = { op: "write"; clear?: boolean; set?: Record<string, string>; remove?: string[] };
 type Reply = { ok: true } | { ok: false; error: string };
 type Fetch = { op: "fetch"; id: number; method: string; path: string; headers: [string, string][]; body?: ArrayBuffer };
 type Abort = { op: "abort"; id: number };
+type Sub = { op: "sub" | "unsub"; topic: string };
 
 /** The backend of the page shown in a frame, for serveStorage to relay its calls to. */
 export type Backend = {
@@ -26,7 +28,7 @@ export type Backend = {
   version: number;
   /** The frame shows the copy kept offline: calls fail with reason "offline". */
   offline?: boolean;
-  /** A call was refused because a newer version is current. */
+  /** A call or the push stream was refused because a newer version is current. */
   onSuperseded?: () => void;
 };
 
@@ -66,8 +68,9 @@ export async function storageName(id: string): Promise<string | null> {
  * then are its writes saved, so a page that never saw the data can't write
  * over it. files, when given, are the kept bundle shown offline in frame:
  * they go to the page over the port when its hello asks for them. backend,
- * when the version shown has one, is where its specola.fetch calls go; the
- * returned function also aborts the calls under way.
+ * when the version shown has one, is where its specola.fetch calls go and
+ * where its specola.subscribe pushes come from; the returned function also
+ * aborts the calls under way and closes the push stream.
  */
 export function serveStorage(
   frame: HTMLIFrameElement,
@@ -80,6 +83,8 @@ export function serveStorage(
   // The backend calls under way, to abort when the page asks or goes.
   const calls = new Map<number, AbortController>();
   let gone = false;
+  // The frame's push stream, opened on its first subscription.
+  let push: PushStream | null = null;
 
   function onMessage(e: MessageEvent) {
     if (e.source !== frame.contentWindow || e.data?.specola !== "hello") return;
@@ -90,8 +95,20 @@ export function serveStorage(
     }
     const ch = new MessageChannel();
     const p = (port = ch.port1);
-    p.onmessage = (m: MessageEvent<Write | Fetch | Abort>) => {
+    p.onmessage = (m: MessageEvent<Write | Fetch | Abort | Sub>) => {
       const d = m.data;
+      if (d?.op === "sub" || d?.op === "unsub") {
+        if (gone || !backend || backend.offline || typeof d.topic !== "string") return;
+        push ??= pushStream(
+          (topics) => eventsURL(id, backend.version, topics),
+          (topic, data) => p.postMessage({ op: "event", topic, data }),
+          () => backend.onSuperseded?.(),
+          () => backend.status().enabled,
+        );
+        if (d.op === "sub") push.sub(d.topic);
+        else push.unsub(d.topic);
+        return;
+      }
       if (d?.op === "fetch") {
         if (!gone) void relay(p, d);
         return;
@@ -210,6 +227,168 @@ export function serveStorage(
     gone = true;
     for (const ac of calls.values()) ac.abort();
     calls.clear();
+    push?.close();
+  };
+}
+
+/** What a frame's push stream may be asked for; see pushStream. */
+export type PushStream = { sub: (topic: string) => void; unsub: (topic: string) => void; close: () => void };
+
+/** A push topic, as ctx.publish and the event stream take it. */
+export const TOPIC = /^[A-Za-z0-9_.:/-]{1,128}$/;
+/** The most topics one event stream takes. */
+export const MAX_TOPICS = 20;
+
+// The event stream of a page's pushes on topics, for the version the frame shows.
+export function eventsURL(id: string, version: number, topics: string[]): string {
+  const q = new URLSearchParams({ v: String(version) });
+  for (const t of topics) q.append("topic", t);
+  return new URL(`/api/pages/${encodeURIComponent(id)}/events?${q}`, location.href).href;
+}
+
+// The stream errors that end a frame's pushes for good: asking again would
+// get the same answer.
+const PUSH_FINAL = new Set(["forbidden", "not-found", "no-backend", "backend-disabled", "bad-request", "not-public", "link-expired"]);
+
+/**
+ * The viewer's side of a frame's subscriptions (docs/page-backends.md,
+ * "Realtime push"): one EventSource for the frame's current topic set, made
+ * by url, reopened 100 ms after the set last changed (so a page subscribing
+ * to several topics at start opens one stream, not several), closed when the
+ * set is empty. Each event on a topic in the set goes to deliver. The stream
+ * ends for good on superseded (calling onSuperseded, as a superseded call
+ * does) and on forbidden. A stream that fails to open is asked about once
+ * with a plain request, since EventSource can't see the status: a final
+ * error ends pushes, anything else (Specola restarting, a proxy) is retried
+ * with a growing delay. While the network drops, EventSource reconnects on
+ * its own. enabled says whether backends are on at all: off, no stream is
+ * opened. Best effort, as the SDK says: no replay.
+ */
+export function pushStream(
+  url: (topics: string[]) => string,
+  deliver: (topic: string, data: unknown) => void,
+  onSuperseded?: () => void,
+  enabled: () => boolean = () => true,
+): PushStream {
+  const topics = new Set<string>();
+  let es: EventSource | null = null;
+  let openFor = ""; // the topic set es was opened for, as a key
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let probe: AbortController | null = null;
+  let backoff = 0;
+  let stopped = false;
+
+  function changed() {
+    if (stopped) return;
+    clearTimeout(timer);
+    timer = setTimeout(reopen, 100);
+  }
+
+  function shut() {
+    es?.close();
+    es = null;
+    openFor = "";
+    probe?.abort();
+    probe = null;
+  }
+
+  function stop() {
+    stopped = true;
+    clearTimeout(timer);
+    shut();
+  }
+
+  function reopen() {
+    timer = undefined;
+    if (stopped) return;
+    const list = [...topics].sort();
+    const key = list.join("\n");
+    if ((es || probe) && key === openFor) return;
+    shut();
+    if (!list.length || !enabled()) return;
+    openFor = key;
+    const s = new EventSource(url(list));
+    es = s;
+    s.onopen = () => {
+      if (es === s) backoff = 0;
+    };
+    s.addEventListener("message", (e) => {
+      if (es !== s) return;
+      let m: Partial<PushMessage> | null;
+      try {
+        m = JSON.parse((e as MessageEvent<string>).data);
+      } catch {
+        return;
+      }
+      // The stream may be one opened for an older set, still closing.
+      if (typeof m?.topic === "string" && topics.has(m.topic)) deliver(m.topic, m.data);
+    });
+    s.addEventListener("superseded", () => {
+      if (es !== s) return;
+      stop();
+      onSuperseded?.();
+    });
+    s.addEventListener("forbidden", () => {
+      if (es === s) stop();
+    });
+    s.onerror = () => {
+      // CONNECTING: the browser tries again by itself. CLOSED: it won't
+      // (the answer was not a stream), and the reason is only in the status.
+      if (es !== s || s.readyState !== EventSource.CLOSED) return;
+      es = null;
+      void refused(s.url, key);
+    };
+  }
+
+  async function refused(href: string, key: string) {
+    const ac = new AbortController();
+    probe = ac;
+    let code = "";
+    let status = 0;
+    try {
+      const res = await fetch(href, { credentials: "same-origin", cache: "no-store", signal: ac.signal });
+      status = res.status;
+      code = res.headers.get("X-Specola-Error") ?? "";
+      // A stream that opens this time is not read here: it is reopened.
+      ac.abort();
+    } catch {
+      // Unreachable: retried below.
+    }
+    if (probe !== ac || stopped) return;
+    probe = null;
+    if (status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    if (code === "superseded") {
+      stop();
+      onSuperseded?.();
+      return;
+    }
+    if (PUSH_FINAL.has(code) || status === 401) {
+      console.warn(`specola: pushes for this page stopped: ${code || status}`);
+      stop();
+      return;
+    }
+    backoff = Math.min(Math.max(1000, backoff * 2), 60_000);
+    openFor = key;
+    timer = setTimeout(() => {
+      openFor = "";
+      reopen();
+    }, backoff);
+  }
+
+  return {
+    sub(topic) {
+      if (stopped || !TOPIC.test(topic) || topics.has(topic)) return;
+      if (topics.size >= MAX_TOPICS) {
+        console.warn(`specola: a page takes at most ${MAX_TOPICS} push topics at once; ${topic} is left out`);
+        return;
+      }
+      topics.add(topic);
+      changed();
+    },
+    unsub(topic) {
+      if (topics.delete(topic)) changed();
+    },
+    close: stop,
   };
 }
 

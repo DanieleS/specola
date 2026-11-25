@@ -34,6 +34,7 @@ import { entryOf } from './code.js';
 import { SLOTS, commitSwap, exportZip, finishSwap, prepareExport, removeDb, stageImport, stageSwapImport, stageSwapRestore, swapNew, usersBytes, userHash, wipeSlots } from './data.js';
 import { RunnerError } from './errors.js';
 import { PageWorker } from './process.js';
+import { QUERY_TIMEOUT_MS, runQuery } from './query.js';
 import { blobNames, collectBlobs, findSnapshot, keep, listSnapshots, publicSnapshot, snapshotBytes, takeSnapshot, vacuumCopy } from './snapshot.js';
 import { pageUsage } from './worker/usage.mjs';
 
@@ -44,14 +45,23 @@ export class Pages {
   #transfers = 0; // running in all (see #transfer)
 
   /**
-   * @param {{config: object, code: import('./code.js').CodeCache, logs: import('./log.js').Logs, now?: () => number}} o
-   * now is the clock of snapshots and of the daily one (tests move it).
+   * @param {object} o
+   * @param {object} o.config
+   * @param {import('./code.js').CodeCache} o.code
+   * @param {import('./log.js').Logs} o.logs
+   * @param {() => number} [o.now] the clock of snapshots and of the daily
+   *   one (tests move it)
+   * @param {Promise<object>|object|null} [o.egress] the egress proxy
+   *   (egress.js), or a promise of it while it starts
+   * @param {import('./push.js').Publisher} [o.publisher] where ctx.publish goes
    */
-  constructor({ config, code, logs, now = Date.now }) {
+  constructor({ config, code, logs, now = Date.now, egress = null, publisher = null }) {
     this.config = config;
     this.code = code;
     this.logs = logs;
     this.now = now;
+    this.egress = egress;
+    this.publisher = publisher;
   }
 
   get limits() {
@@ -182,29 +192,53 @@ export class Pages {
       gone = true;
     };
     res.once('close', onClose);
-    const deadline = Date.now() + this.limits.firstByteMs;
     try {
-      for (;;) {
-        const page = await this.#page(inv.page.id);
-        if (page.offline) {
-          await waitOnline(page, deadline);
-          if (gone) return;
-          continue; // a purge replaced the page's state: look again
-        }
-        // Cheap refusal first: no need to fetch code that will not run.
-        refuseOld(page, inv.page.version);
-        const codeDir = await this.code.ensure(inv.versionId, inv.codeHash);
-        // Inside the lock, a maintenance that started meanwhile wins.
-        const worker = await this.#locked(page, () => (page.offline || page.purged ? null : this.#workerFor(page, inv, codeDir)));
-        if (!worker) continue;
-        if (gone || res.destroyed) return;
-        page.title = inv.page.title;
-        worker.handle(inv, req, res);
-        res.once('close', () => this.#afterCall(page));
-        return;
-      }
+      const got = await this.#acquire(inv, () => gone || res.destroyed);
+      if (!got) return;
+      got.worker.handle(inv, req, res);
+      res.once('close', () => this.#afterCall(got.page));
     } finally {
       res.off('close', onClose);
+    }
+  }
+
+  /**
+   * Runs one /scheduled (inv carries the event) → {status, ref?}. The same
+   * rules as a call: it waits for a maintenance, an older version is
+   * superseded, a newer one switches, and it counts as the page's activity
+   * (the worker's idle time, the daily snapshot). Throws a RunnerError when
+   * it cannot be taken.
+   */
+  async scheduled(inv) {
+    const { page, worker } = await this.#acquire(inv, () => false);
+    try {
+      return await worker.runJob(inv);
+    } finally {
+      this.#afterCall(page);
+    }
+  }
+
+  // The worker that runs inv's version, started if need be: after any
+  // maintenance in progress, and after the version switch when inv is for
+  // a newer version. Null when the caller went away (isGone) meanwhile.
+  async #acquire(inv, isGone) {
+    const deadline = Date.now() + this.limits.firstByteMs;
+    for (;;) {
+      const page = await this.#page(inv.page.id);
+      if (page.offline) {
+        await waitOnline(page, deadline);
+        if (isGone()) return null;
+        continue; // a purge replaced the page's state: look again
+      }
+      // Cheap refusal first: no need to fetch code that will not run.
+      refuseOld(page, inv.page.version);
+      const codeDir = await this.code.ensure(inv.versionId, inv.codeHash);
+      // Inside the lock, a maintenance that started meanwhile wins.
+      const worker = await this.#locked(page, () => (page.offline || page.purged ? null : this.#workerFor(page, inv, codeDir)));
+      if (!worker) continue;
+      if (isGone()) return null;
+      page.title = inv.page.title;
+      return { page, worker };
     }
   }
 
@@ -242,6 +276,12 @@ export class Pages {
         if (page.worker === w) page.worker = null;
         page.draining.delete(w);
       },
+      proxy: await this.egress,
+      // A version's egress list and secrets never change: those of the
+      // call that starts the worker are those of every call it takes.
+      egress: inv.egress,
+      secretNames: await declaredSecretNames(codeDir),
+      onPublish: (pageId, m) => this.publisher?.publish(pageId, m),
     });
     page.worker = worker;
     worker.start();
@@ -660,16 +700,30 @@ export class Pages {
     });
   }
 
+  /**
+   * POST /pages/{id}/query: one read-only statement on the page's shared
+   * database (query.js), stopped after 5 s. 404 no-data when the page has
+   * none.
+   */
+  async query(id, sql, params) {
+    if (!(await exists(path.join(this.pageDir(id), 'shared.sqlite')))) {
+      throw new RunnerError(404, 'no-data', 'This page has no shared database yet: its backend has not used ctx.db.');
+    }
+    return runQuery({ pageDir: this.pageDir(id), sql, params, timeoutMs: QUERY_TIMEOUT_MS });
+  }
+
   /** Removes what a previous process left in the scratch space. */
   async sweep() {
     await fs.rm(this.tmpDir, { recursive: true, force: true });
   }
 
-  /** Stops every worker (shutdown). */
+  /** Stops every worker (shutdown), and lets background work finish. */
   async stopAll() {
     const workers = [];
+    const background = [];
     for (const p of this.#pages.values()) {
       const page = await p;
+      background.push(page.background);
       for (const w of [page.worker, ...page.draining]) {
         if (w) {
           workers.push(w);
@@ -678,6 +732,9 @@ export class Pages {
       }
     }
     await Promise.all(workers.map((w) => w.exited()));
+    // A daily snapshot in progress: finished rather than cut (a cut one
+    // would only be swept at the next start).
+    await Promise.all(background);
   }
 }
 
@@ -695,6 +752,17 @@ async function waitOnline(page, deadline) {
   clearTimeout(timer);
   if (timedOut) {
     throw new RunnerError(503, 'backend-unavailable', `The page's backend is offline for ${o.what}; retry in a moment.`);
+  }
+}
+
+// The secret names a version's manifest declares (normalised by specola, so
+// a list of names; anything else declares none).
+async function declaredSecretNames(codeDir) {
+  try {
+    const manifest = JSON.parse(await fs.readFile(path.join(codeDir, 'backend.json'), 'utf8'));
+    return Array.isArray(manifest?.secrets) ? manifest.secrets.filter((n) => typeof n === 'string') : [];
+  } catch {
+    return []; // entryOf, just before, said what is wrong with it
   }
 }
 

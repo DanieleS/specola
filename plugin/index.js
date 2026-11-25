@@ -5,47 +5,25 @@
 import { readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { buildServer, isServerModule, listOutput, resolveBackend } from './lib/backend.js';
-import { DEV_DATA_DIR, DEV_PREFIX, createDevBackend } from './lib/dev.js';
+import { CRON_PREFIX, DEV_DATA_DIR, DEV_PREFIX, EVENTS_PATH, createDevBackend, describeCron } from './lib/dev.js';
 import { escapeHTML, injectBody, injectHead, rewriteIndexRefs } from './lib/html.js';
 import { BACKEND_PREFIX } from './lib/manifest.js';
 import { DEFAULT_LIMITS, bundleProblems, isHTMLPath, isJunk } from './lib/rules.js';
 import { findSprites, spriteWarning } from './lib/sprites.js';
+import { standInScript } from './lib/standin.js';
 import { VERSION } from './lib/version.js';
 
 export { VERSION };
 
 /**
  * Stand-in for what the Specola page SDK provides, so that apps that read
- * window.specola run under `vite dev`. Storage is the browser's own.
- * specola.fetch goes to the dev backend when the app has one, and otherwise
- * rejects as it does on a page without a backend.
+ * window.specola run under `vite dev` (lib/standin.js). Storage is the
+ * browser's own. specola.fetch and specola.subscribe go to the dev backend
+ * when the app has one; otherwise fetch rejects as it does on a page without
+ * a backend, and subscribe hears nothing.
  */
 export function devSpecola(hasBackend) {
-  const b = hasBackend ? 'true' : 'false';
-  return (
-    'if (typeof window.specola === "undefined") { (() => {' +
-    ' class BackendUnavailable extends Error { constructor(reason, message) { super(message); this.name = "BackendUnavailable"; this.reason = reason; } }' +
-    ` const backend = Object.freeze({ enabled: ${b}, available: ${b} });` +
-    ' const reasons = { "backend-disabled": "disabled", "backend-unavailable": "unavailable", "superseded": "superseded" };' +
-    ' window.specola = { base: "/", basename: "", persistent: false, flush: async () => {}, backend,' +
-    ' fetch: async (input, init) => {' +
-    // The same inputs as the page SDK's specola.fetch: a path starting with
-    // "/", or a URL or Request on the page's own origin.
-    '  const bad = () => new TypeError("specola.fetch takes a path starting with / (it is resolved against the page\'s backend), got " + String(input));' +
-    '  const P = "https://page.invalid"; let u;' +
-    '  if (typeof input === "string") { if (input[0] !== "/") throw bad(); u = new URL(input, P); if (u.origin !== P) throw bad(); }' +
-    '  else if (input instanceof URL || (typeof Request !== "undefined" && input instanceof Request)) { u = new URL(input instanceof URL ? input.href : input.url); if (u.origin !== P && u.origin !== (window.location && window.location.origin)) throw bad(); }' +
-    '  else throw bad();' +
-    '  if (typeof input !== "string" && !(input instanceof URL)) init = { method: input.method, headers: input.headers, body: input.body ? await input.arrayBuffer() : undefined, signal: input.signal, ...init };' +
-    '  input = u.pathname + u.search;' +
-    '  if (!backend.enabled) throw new BackendUnavailable("disabled", "this app has no backend: add server to specola() in vite.config");' +
-    ` const res = await fetch(${JSON.stringify(DEV_PREFIX)} + input, init);` +
-    '  const reason = reasons[res.headers.get("X-Specola-Error")];' +
-    '  if (reason) { const body = await res.json().catch(() => ({})); throw new BackendUnavailable(reason, body.message || reason); }' +
-    '  return res;' +
-    ' } };' +
-    ' })(); }'
-  );
+  return standInScript(hasBackend);
 }
 
 /**
@@ -122,9 +100,26 @@ export function specola(options = {}) {
         manifest: backend.manifest,
         load: () => server.ssrLoadModule(backend.entry),
         env: () => ({ ...(envDir ? loadEnv(server.config.mode, envDir, '') : {}), ...process.env }),
-        logger: { warn: (m) => server.config.logger.warn(m), error: (...a) => console.error(...a) },
+        logger: {
+          info: (m) => server.config.logger.info(m, { timestamp: true }),
+          warn: (m) => server.config.logger.warn(m, { timestamp: true }),
+          error: (...a) => console.error(...a),
+        },
       });
       server.middlewares.use(DEV_PREFIX, devBackend.middleware);
+      server.middlewares.use(EVENTS_PATH, devBackend.events);
+      server.middlewares.use(CRON_PREFIX, devBackend.cron);
+      // Jobs don't run on their schedule here: say which there are and how
+      // to run one.
+      if (backend.manifest.cron.length > 0) {
+        const print = () => {
+          const addr = server.httpServer?.address();
+          const port = addr && typeof addr === 'object' ? addr.port : server.config.server.port;
+          server.config.logger.info(describeCron(backend.manifest, `http://localhost:${port ?? 5173}`));
+        };
+        if (server.httpServer && !server.httpServer.listening) server.httpServer.once('listening', print);
+        else print();
+      }
     },
 
     closeBundle() {

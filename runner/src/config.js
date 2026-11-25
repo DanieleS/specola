@@ -10,6 +10,8 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxResponseBytes: 100 * MiB,
   firstByteMs: 30_000,
   requestMs: 5 * 60_000,
+  // A scheduled(event, ctx) run ("Limits": wall time per cron run).
+  cronMs: 5 * 60_000,
   workerMemoryMb: 256,
   workerConcurrency: 32,
   pageDiskBytes: 1024 * MiB,
@@ -66,8 +68,20 @@ export function loadConfig(env = process.env) {
   for (const [key, name] of Object.entries(LIMIT_ENV)) {
     if (env[name]) limits[key] = positiveInt(name, env[name]);
   }
+  // Test only: lets the egress proxy reach loopback (egress.js), so an
+  // end-to-end test can serve an "outside" host locally. It opens the
+  // runner's own host to page code, so production refuses it outright.
+  const loopback = env.RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS ?? '';
+  if (loopback !== '' && loopback !== '1' && loopback !== '0') {
+    throw new Error(`RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS must be 1 or unset, got ${JSON.stringify(loopback)}`);
+  }
+  const egressAllowLoopbackForTests = loopback === '1';
+  if (egressAllowLoopbackForTests && env.NODE_ENV === 'production') {
+    throw new Error('RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS is for tests only and is refused with NODE_ENV=production');
+  }
   return {
     listen: parseListen(env.RUNNER_LISTEN || ':8081'),
+    egressAllowLoopbackForTests,
     token,
     specolaUrl: specolaUrl.replace(/\/+$/, ''),
     // Absolute: it ends up in the workers' --allow-fs-* flags.

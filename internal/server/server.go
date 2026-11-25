@@ -60,6 +60,12 @@ type Server struct {
 	// change them.
 	now        func() time.Time
 	purgeEvery time.Duration
+	// push holds this replica's push streams (push.go); publicLimits the
+	// public links' call budgets (publicshell.go).
+	push         pushHub
+	publicLimits rateLimiter
+	// cron runs the pages' scheduled jobs (cron.go).
+	cron cronState
 }
 
 // New builds the server. a is nil unless Specola runs its own OIDC login.
@@ -67,6 +73,11 @@ type Server struct {
 // "oauth"; it is ignored otherwise.
 func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.TokenVerifier) *Server {
 	s := &Server{cfg: cfg, st: st, auth: a, now: time.Now, purgeEvery: purgeEvery}
+	// Test hooks (config.go: dev bypass only), for e2e/backends.mjs.
+	s.cron.every = cfg.TestCronEvery
+	if off := cfg.TestClockOffset; off != 0 {
+		s.now = func() time.Time { return time.Now().Add(off) }
+	}
 	if cfg.BackendsEnabled() {
 		s.runner = backend.NewRunner(cfg.RunnerURL, cfg.RunnerToken)
 	}
@@ -99,6 +110,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	// for the runner only (its token); anything else under /internal/ is
 	// 404 rather than the SPA shell.
 	r.Get("/internal/runner/code/{versionId}", s.handleRunnerCode)
+	s.routesPush(r)
 	r.Handle("/internal/*", http.NotFoundHandler())
 
 	// The token is the credential: no session needed, so agents can curl it.
@@ -118,8 +130,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 	// Pages are served for any path below their own too, so an app using the
 	// History API can reload and deep link (docs/spa-bundles.md, "Routing").
 	if cfg.ViewOrigin == "" {
-		r.Get("/s/{token}", s.handlePublicLink)
-		r.Get("/s/{token}/*", s.handlePublicLink)
+		s.routesPublic(r)
 		// Bundle files: the key is the capability. HEAD too, so a client
 		// checking a file isn't answered by the SPA shell.
 		r.Get("/b/{key}/*", s.handleBundleFile)
@@ -138,8 +149,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		vr.Get("/t/{token}/view/{id}/*", s.handleTokenView)
 		vr.Get("/view/{id}", s.handleTokenView)
 		vr.Get("/view/{id}/*", s.handleTokenView)
-		vr.Get("/s/{token}", s.handlePublicLink)
-		vr.Get("/s/{token}/*", s.handlePublicLink)
+		s.routesPublic(vr)
 		vr.Get("/b/{key}/*", s.handleBundleFile)
 		vr.Head("/b/{key}/*", s.handleBundleFile)
 		s.viewMux = vr
@@ -185,6 +195,8 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 			r.Get("/pages/{id}/links", s.handleListLinks)
 			r.Post("/pages/{id}/links", s.handleCreateLink)
 			r.Delete("/pages/{id}/links/{link}", s.handleRevokeLink)
+			s.routesSecrets(r)
+			s.routesCron(r)
 			r.Get("/shared", s.handleShared)
 			r.Get("/archived", s.handleArchived)
 			r.Get("/favorites", s.handleFavorites)
@@ -210,6 +222,7 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		r.Get("/s/*", func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "public links are served from "+cfg.ViewOrigin, http.StatusNotFound)
 		})
+		r.HandleFunc("/p/*", http.NotFound)
 		bundleElsewhere := func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "bundle files are served from "+cfg.ViewOrigin, http.StatusNotFound)
 		}
@@ -233,6 +246,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Range") != "" || isBackendCall(r.URL.Path) || isBackendDownload(r.URL.Path) {
 		r.Header.Del("Accept-Encoding")
 	}
+	r = withPeer(r)
 	if s.viewMux != nil && strings.EqualFold(r.Host, s.viewHost) {
 		s.viewMux.ServeHTTP(w, r)
 		return
@@ -286,6 +300,7 @@ func (s *Server) mountMCP(r chi.Router, tokens mcpauth.TokenVerifier) {
 			return mcpserver.BackendState{Enabled: b.Enabled, Available: b.Available, Reason: b.Reason}
 		},
 	}
+	s.mcpBackendOptions(&opts)
 	switch s.cfg.MCPMode() {
 	case "oauth":
 		// RFC 9728 metadata, at the root and at the path-suffixed location
@@ -460,6 +475,9 @@ type pageMetaResp struct {
 	ViewURL        string     `json:"viewUrl"`
 	BackendData    bool       `json:"backendData"`
 	BackendPurgeAt *time.Time `json:"backendPurgeAt,omitempty"`
+	// BackendSecretsMissing: for owners and editors of a backend page
+	// (secrets.go).
+	BackendSecretsMissing []string `json:"backendSecretsMissing,omitzero"`
 }
 
 func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
@@ -468,9 +486,15 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
+	missing, err := s.backendSecretsMissing(r, meta)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, pageMetaResp{
 		PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID),
 		BackendData: meta.BackendData, BackendPurgeAt: s.backendPurgeAt(meta.BackendDormantSince),
+		BackendSecretsMissing: missing,
 	})
 }
 

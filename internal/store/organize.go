@@ -114,9 +114,12 @@ func (s *Store) RestoreVersion(ctx context.Context, sub, id string, from int, no
 			return err
 		}
 		if key != "" {
-			return copyBundleFiles(ctx, tx, id, from, version)
+			if err := copyBundleFiles(ctx, tx, id, from, version); err != nil {
+				return err
+			}
 		}
-		return nil
+		// The restored version's scheduled jobs replace the page's (cron.go).
+		return syncBackendCron(ctx, tx, id, time.Now())
 	})
 	return version, err
 }

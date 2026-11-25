@@ -97,6 +97,23 @@ function eachLine(stream, onLine) {
 const newRef = () => randomBytes(5).toString('hex');
 const seconds = (ms) => (ms % 1000 ? `${ms} ms` : `${ms / 1000} s`);
 
+// Identifies a worker to the egress proxy (its credential's user, w-<id>).
+// Unique within the runner process, which is the proxy's lifetime.
+let nextWorkerId = 1;
+
+const JOB_STATUSES = new Set(['ok', 'no-handler', 'error']);
+
+// Only the secrets the version's manifest declares reach its code. Specola
+// sends only those already; this keeps it so whatever specola sends.
+function declaredSecrets(secrets, names) {
+  const out = {};
+  if (!names) return out;
+  for (const n of names) {
+    if (typeof n === 'string' && Object.hasOwn(secrets ?? {}, n) && typeof secrets[n] === 'string') out[n] = secrets[n];
+  }
+  return out;
+}
+
 export class PageWorker {
   #child = null;
   #ready;
@@ -111,6 +128,7 @@ export class PageWorker {
   #startTimer = null;
   #forgets = new Map(); // id → resolve, for forgetUser
   #nextForget = 1;
+  #jobs = new Map(); // id → a scheduled run (ids shared with #calls)
 
   /**
    * @param {object} o
@@ -122,9 +140,16 @@ export class PageWorker {
    * @param {object} o.limits
    * @param {import('./log.js').Logs} o.logs
    * @param {(w: PageWorker) => void} o.onGone called once the process is gone
+   * @param {{register: Function, unregister: Function} | null} [o.proxy]
+   *   the egress proxy (egress.js); null: outbound HTTP is not proxied
+   *   (tests of other things only, the runner always has one)
+   * @param {string[]} [o.egress] the version's egress list, from the head
+   * @param {string[]} [o.secretNames] the secrets the version declares
+   * @param {(pageId: string, m: object) => void} [o.onPublish] a ctx.publish
    */
-  constructor({ page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone }) {
-    Object.assign(this, { page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone });
+  constructor({ page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone, proxy = null, egress = [], secretNames = [], onPublish }) {
+    Object.assign(this, { page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone, proxy, egress, secretNames, onPublish });
+    this.id = nextWorkerId++;
     this.state = 'new'; // new → starting → ready → (draining) → stopped; or failed
     this.#ready = new Promise((resolve, reject) => {
       this.#readyCb = { resolve, reject };
@@ -136,8 +161,9 @@ export class PageWorker {
     return this.page.version;
   }
 
+  /** Requests and scheduled runs that count against the worker. */
   get inflight() {
-    return this.#calls.size;
+    return this.#calls.size + this.#jobs.size;
   }
 
   get gone() {
@@ -162,13 +188,24 @@ export class PageWorker {
       `--allow-fs-write=${this.pageDir}`,
       `--max-old-space-size=${this.limits.workerMemoryMb}`,
       '--disable-warning=ExperimentalWarning',
+      // Node 22 says, on stderr (so in the backend log as an error), that
+      // the agent behind NODE_USE_ENV_PROXY is experimental, at the first
+      // fetch of every worker.
+      '--disable-warning=UNDICI-EHPA',
     ];
     // A minimal environment: nothing of the runner's (its token above all)
     // reaches page code.
-    // Outbound fetch is unrestricted for now: the egress proxy that limits it
-    // to the manifest's hosts (HTTPS_PROXY + NODE_USE_ENV_PROXY here) is a
-    // later delivery step (docs/page-backends.md, "Delivery plan").
     const env = { TZ: 'UTC', NODE_ENV: 'production', LANG: 'C.UTF-8' };
+    if (this.proxy) {
+      // The global fetch goes through the egress proxy ("Egress proxy (step
+      // 3)"): NODE_USE_ENV_PROXY makes it honour HTTP(S)_PROXY (Node ≥
+      // 22.21 and 24; checked by the tests), and the credential tells the
+      // proxy which page, and so which egress list, a connection is for.
+      // NO_PROXY empty: nothing bypasses it, localhost included.
+      const { user, token } = this.proxy.register(this.id, this.page.id, this.egress);
+      const url = `http://${encodeURIComponent(user)}:${token}@127.0.0.1:${this.proxy.port}`;
+      Object.assign(env, { NODE_USE_ENV_PROXY: '1', HTTP_PROXY: url, HTTPS_PROXY: url, NO_PROXY: '' });
+    }
     const child = fork(BOOTSTRAP, [], {
       execArgv,
       env,
@@ -225,7 +262,7 @@ export class PageWorker {
     if (this.gone || this.state === 'draining') {
       throw new RunnerError(503, 'backend-unavailable', 'The backend worker is shutting down; retry.');
     }
-    if (this.#calls.size >= this.limits.workerConcurrency) {
+    if (this.inflight >= this.limits.workerConcurrency) {
       throw new RunnerError(429, 'too-many-requests', `The backend is already handling ${this.limits.workerConcurrency} requests; retry later.`);
     }
     const length = Number(req.headers['content-length'] ?? 0);
@@ -278,7 +315,7 @@ export class PageWorker {
       user: inv.user,
       role: inv.role,
       link: inv.link,
-      secrets: inv.secrets,
+      secrets: declaredSecrets(inv.secrets, this.secretNames),
       request: { method: inv.request.method, path: inv.request.path, headers: requestHeaders(inv.request.headers) },
     });
     const m = inv.request.method;
@@ -308,6 +345,92 @@ export class PageWorker {
     });
   }
 
+  /**
+   * Runs the entry's scheduled(event, ctx) for one /scheduled (the head is
+   * inv, with inv.event). Resolves with the answer, {status, ref?}: "ok",
+   * "no-handler", "error" (the handler threw, the backend failed to start
+   * or crashed; ref names the log line) or "timeout" (still running after
+   * the cron limit; it no longer counts against the worker then, as work
+   * after a response does not). Throws a RunnerError when the run cannot
+   * be taken at all.
+   */
+  runJob(inv) {
+    if (this.gone || this.state === 'draining') {
+      throw new RunnerError(503, 'backend-unavailable', 'The backend worker is shutting down; retry.');
+    }
+    if (this.inflight >= this.limits.workerConcurrency) {
+      throw new RunnerError(429, 'too-many-requests', `The backend is already handling ${this.limits.workerConcurrency} requests; retry later.`);
+    }
+    let resolve;
+    const answer = new Promise((r) => (resolve = r));
+    const job = { id: this.#nextId++, inv, resolve, answered: false, settled: false, started: Date.now(), timer: null };
+    this.#jobs.set(job.id, job);
+    clearTimeout(this.#idleTimer);
+    job.timer = setTimeout(() => this.#jobTimeout(job), this.limits.cronMs);
+    this.#ready.then(
+      () => {
+        if (job.answered) return;
+        this.#send({
+          t: 'job',
+          id: job.id,
+          page: inv.page,
+          secrets: declaredSecrets(inv.secrets, this.secretNames),
+          event: { name: inv.event.name, scheduledTime: inv.event.scheduledTime },
+        });
+      },
+      (err) => {
+        this.#answerJob(job, { status: 'error', ...(err.ref ? { ref: err.ref } : {}) });
+        this.#settleJob(job);
+      },
+    );
+    return answer;
+  }
+
+  // Answers the /scheduled once, and puts the outcome in the backend log
+  // ("Observability": cron outcomes). An error's stack is in the line the
+  // worker logged under the ref.
+  #answerJob(job, result) {
+    if (job.answered) return;
+    job.answered = true;
+    const name = JSON.stringify(job.inv.event.name);
+    const took = `${Date.now() - job.started} ms`;
+    switch (result.status) {
+      case 'ok':
+        this.#log('info', `scheduled job ${name}: ok (${took})`);
+        break;
+      case 'no-handler':
+        this.#log('warn', `scheduled job ${name}: the backend has no scheduled handler (its default export needs a scheduled(event, ctx) method)`);
+        break;
+      case 'error':
+        this.#log('error', `scheduled job ${name}: failed (${took})`);
+        break;
+      // timeout: logged where it is decided, with its ref
+    }
+    job.resolve(result);
+  }
+
+  #settleJob(job) {
+    if (job.settled) return;
+    job.settled = true;
+    clearTimeout(job.timer);
+    this.#jobs.delete(job.id);
+    this.#maybeIdle();
+  }
+
+  #jobTimeout(job) {
+    if (!job.answered) {
+      const ref = newRef();
+      this.#log('error', `scheduled job ${JSON.stringify(job.inv.event.name)}: not finished within ${seconds(this.limits.cronMs)}; no longer waited for`, ref);
+      this.#answerJob(job, { status: 'timeout', ref });
+      // One stuck in a busy loop blocks every call of the page: a worker
+      // that does not even answer a ping is killed.
+      this.#checkAlive();
+    } else {
+      this.#log('warn', `scheduled job ${JSON.stringify(job.inv.event.name)}: work after it (waitUntil) still running after ${seconds(this.limits.cronMs)}; no longer counted`);
+    }
+    this.#settleJob(job);
+  }
+
   #abort(call) {
     if (call.sent && !call.abortSent) {
       call.abortSent = true;
@@ -331,7 +454,13 @@ export class PageWorker {
     call.settled = true;
     for (const t of call.timers) clearTimeout(t);
     this.#calls.delete(call.id);
-    if (this.#calls.size === 0) {
+    this.#maybeIdle();
+  }
+
+  // Once nothing is in flight: a draining worker stops, another starts its
+  // idle countdown.
+  #maybeIdle() {
+    if (this.inflight === 0) {
       if (this.state === 'draining') this.stop('drained');
       else this.#armIdle();
     }
@@ -340,7 +469,7 @@ export class PageWorker {
   #armIdle() {
     clearTimeout(this.#idleTimer);
     this.#idleTimer = setTimeout(() => {
-      if (this.#calls.size === 0 && !this.gone) this.stop('idle');
+      if (this.inflight === 0 && !this.gone) this.stop('idle');
     }, this.limits.idleMs);
     this.#idleTimer.unref();
   }
@@ -389,6 +518,8 @@ export class PageWorker {
       this.#log('error', `the worker sent an invalid message (${err.message})`, ref);
       const call = this.#calls.get(m?.id);
       if (call) this.#fail(call, 500, 'backend-error', 'The backend sent an invalid response.', ref);
+      const job = this.#jobs.get(m?.id);
+      if (job) this.#answerJob(job, { status: 'error', ref });
     }
   }
 
@@ -419,6 +550,23 @@ export class PageWorker {
     if (m.t === 'pong') {
       clearTimeout(this.#pingTimer);
       this.#pingTimer = null;
+      return;
+    }
+    if (m.t === 'publish') {
+      // Checked by the publisher: page code may send anything here.
+      this.onPublish?.(this.page.id, { topic: m.topic, data: m.data, to: m.to });
+      return;
+    }
+    const job = this.#jobs.get(m.id);
+    if (job) {
+      if (m.t === 'jobEnd') {
+        if (!JOB_STATUSES.has(m.status)) throw new TypeError(`job status ${m.status}`);
+        this.#answerJob(job, { status: m.status, ...(typeof m.ref === 'string' ? { ref: m.ref.slice(0, 32) } : {}) });
+      } else if (m.t === 'done') {
+        // The handler and its waitUntil work are over.
+        if (!job.answered) this.#answerJob(job, { status: 'ok' });
+        this.#settleJob(job);
+      }
       return;
     }
     const call = this.#calls.get(m.id);
@@ -476,12 +624,14 @@ export class PageWorker {
     clearTimeout(this.#idleTimer);
     clearTimeout(this.#pingTimer);
     clearTimeout(this.#startTimer);
+    this.proxy?.unregister(this.id);
     let ref;
-    if (!wasStopping || this.#calls.size > 0) {
+    if (!wasStopping || this.inflight > 0) {
       ref = newRef();
       const oom = /heap out of memory|Allocation failed/.test(this.#stderrTail);
       const why = this.#killReason ?? (oom ? `it ran out of memory (${this.limits.workerMemoryMb} MiB)` : signal ? `signal ${signal}` : `exit code ${code}`);
-      this.#log('error', `worker crashed: ${why}; ${this.#calls.size} request(s) in flight answered 502`, ref);
+      const jobs = this.#jobs.size ? ` and ${this.#jobs.size} scheduled run(s) answered error` : '';
+      this.#log('error', `worker crashed: ${why}; ${this.#calls.size} request(s) in flight answered 502${jobs}`, ref);
     }
     this.#readyCb.reject(new RunnerError(502, 'backend-crashed', 'The backend crashed while starting.', ref));
     for (const call of [...this.#calls.values()]) {
@@ -490,6 +640,10 @@ export class PageWorker {
         sendError(call.res, 502, 'backend-crashed', 'The backend crashed.', ref);
       }
       this.#settle(call);
+    }
+    for (const job of [...this.#jobs.values()]) {
+      this.#answerJob(job, { status: 'error', ...(ref ? { ref } : {}) });
+      this.#settleJob(job);
     }
     for (const done of [...this.#forgets.values()]) done();
     this.onGone?.(this);
@@ -526,8 +680,8 @@ export class PageWorker {
   drain() {
     if (this.gone) return;
     this.state = 'draining';
-    this.#log('info', `worker for version ${this.page.version} draining (${this.#calls.size} request(s) in flight)`);
-    if (this.#calls.size === 0) this.stop('drained');
+    this.#log('info', `worker for version ${this.page.version} draining (${this.inflight} request(s) in flight)`);
+    if (this.inflight === 0) this.stop('drained');
   }
 
   /** Stops the process: gracefully, then by force. */

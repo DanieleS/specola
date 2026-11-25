@@ -12,10 +12,21 @@ try {
   process.exit(2);
 }
 
+if (config.egressAllowLoopbackForTests) {
+  console.warn('specola-runner: WARNING: RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS=1, page code may reach this host through the egress proxy; for tests only');
+}
 const runner = createRunner(config);
 await runner.sweep();
-const addr = await runner.listen();
-console.log(`specola-runner ${RUNNER_VERSION} listening on ${addr.address}:${addr.port}, data in ${config.dataDir}`);
+let addr;
+try {
+  addr = await runner.listen();
+} catch (err) {
+  // The listener, or the egress proxy (without which no worker may start).
+  console.error(`specola-runner: ${err.message}`);
+  process.exit(1);
+}
+const proxy = await runner.egress();
+console.log(`specola-runner ${RUNNER_VERSION} listening on ${addr.address}:${addr.port}, data in ${config.dataDir}; egress proxy on 127.0.0.1:${proxy.port}`);
 
 let closing = false;
 for (const sig of ['SIGTERM', 'SIGINT']) {

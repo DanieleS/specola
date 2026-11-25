@@ -46,6 +46,8 @@ export type PageMeta = {
   backendData?: boolean;
   /** When that data will be purged, for a dormant page, from a week ahead (RFC 3339). */
   backendPurgeAt?: string;
+  /** Secrets the current version declares with no value set (owners and editors only). */
+  backendSecretsMissing?: string[];
   /** Set when this is a copy kept by the service worker, read offline. */
   offline?: boolean;
 };
@@ -415,3 +417,69 @@ export const api = {
     req<FolderConventions>("PUT", `/api/folders/${id}/conventions`, { text, styleRefId }),
   deleteFolderConventions: (id: string) => req<FolderConventions>("DELETE", `/api/folders/${id}/conventions`),
 };
+
+// --- secrets & cron (web-A) ---
+// Page secrets and scheduled jobs (docs/page-backends.md, "Wire formats for
+// steps 3–7"), for the Secrets and Jobs tabs of the Backend panel.
+
+/**
+ * A secret's name and state: never its value, which nobody can read back.
+ * declared: the current version names it; set: it has a value.
+ */
+export type SecretInfo = {
+  name: string;
+  declared: boolean;
+  set: boolean;
+  /** RFC 3339, when set. */
+  updatedAt?: string;
+  /** Who set it last. */
+  updatedBy?: string;
+};
+
+/** What a secret's name must look like, as the manifest and the server check it. */
+export const SECRET_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+/** Longest secret value, in UTF-8 bytes. */
+export const MAX_SECRET_BYTES = 8 << 10;
+
+/** How a scheduled job's last run ended ("unavailable": the runner couldn't be reached; "skipped": not run). */
+export type CronStatus = "ok" | "no-handler" | "error" | "timeout" | "unavailable" | "skipped";
+
+/** A scheduled job the current version declares, and how it last ran. */
+export type CronJob = {
+  name: string;
+  /** Five cron fields, UTC. */
+  schedule: string;
+  /** RFC 3339; null while none is due (the page is archived, say). */
+  nextRunAt: string | null;
+  lastRunAt?: string;
+  lastStatus?: CronStatus | string;
+  /** The message and the log ref of a failed run, "message (ref r…)". */
+  lastError?: string;
+  lastDurationMs?: number;
+};
+
+/** The page meta's backendSecretsMissing (owners and editors): declared names with no value. */
+export function secretsMissing(meta: PageMeta | null | undefined): string[] {
+  const m = meta?.backendSecretsMissing;
+  return Array.isArray(m) ? m : [];
+}
+
+export const secretsApi = {
+  /** Names declared by the current version plus any set (owners and editors). */
+  list: (id: string) => req<{ secrets: SecretInfo[] | null }>("GET", `/api/pages/${id}/secrets`),
+  /** Sets or replaces a value (owners). */
+  set: (id: string, name: string, value: string) =>
+    req<void>("PUT", `/api/pages/${id}/secrets/${encodeURIComponent(name)}`, { value }),
+  /** Removes a value (owners); fine when there is none. */
+  remove: (id: string, name: string) => req<void>("DELETE", `/api/pages/${id}/secrets/${encodeURIComponent(name)}`),
+  /** The current version's scheduled jobs (owners and editors). */
+  cron: (id: string) => req<{ jobs: CronJob[] | null }>("GET", `/api/pages/${id}/backend/cron`),
+};
+
+// --- push (sdk-B) ---
+// A page backend's pushes (docs/page-backends.md, "Realtime push"): the data
+// of each `event: message` on GET /api/pages/{id}/events, relayed to the frame
+// as {op:"event", topic, data} by pagedata.ts.
+
+/** One push, as the event stream sends it: what ctx.publish(topic, data) published. */
+export type PushMessage = { topic: string; data: unknown };

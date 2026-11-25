@@ -53,12 +53,40 @@ instructions, the upload grant, the CLI and the manifest step all say
 backends are disabled, and that the page still opens with the disabled
 notice while `specola.fetch` rejects with `BackendUnavailable`.
 
+Before the purge, it covers steps 3–7, with Specola restarted with its test
+hooks (`SPECOLA_TEST_CRON_EVERY=1s`, `SPECOLA_TEST_CLOCK_OFFSET=1m`, honoured
+only with the dev auth bypass) and the runner started with
+`RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS=1` (refused under
+`NODE_ENV=production`). **Secrets**: `backendSecretsMissing` before and
+after, the owner setting the value from the viewer's notice and *Secrets*
+tab at 375 px, the handler seeing it (its length only), an editor refused,
+the value never in the API and stored encrypted, an undeclared name never
+passed. **Egress**: a backend `fetch` to `localhost` (served by the script)
+goes through, a host not on the list is refused and logged. **Scheduled
+jobs**: the every-minute job runs `scheduled()` (role `cron`), writes to
+`ctx.db`, and shows `ok` in the API and the *Jobs* tab. **MCP**: the
+instructions, `call_backend`, `backend_logs`, `backend_query` on the
+counter (and a write refused), `list_secrets` and `get_page`. **Push**: two
+users in two browser contexts, on the two Specolas (so through `NOTIFY`): a
+call from one publishes, the other's `specola.subscribe` callback fires, a
+targeted push reaches only its user, `unsubscribe()` stops it, and a new
+version ends the streams with `superseded` and the viewer's reload notice.
+**Public link**: the shell's CSP and headers, a public route answering as
+role `public` with `ctx.link`, a private one answering 403 `not-public`, a
+public topic's push reaching the page, a private topic refused, the per-IP
+rate limit (429 with `Retry-After`), and a revoked link stopping calls.
+
 `sdk-bridge.mjs` checks the frame ↔ viewer half of backend calls on its own,
 without Go or Postgres: the page SDK (`internal/server/pagesdk.js`) in a
 sandboxed frame and the viewer's relay (`web/src/lib/pagedata.ts`, bundled
 with esbuild) in its parent, against a small Node server playing Specola and
 the runner: streaming, queueing before the port, headers, `FormData` bodies,
-aborts, the `BackendUnavailable` reasons, redirects and path checks.
+aborts, the `BackendUnavailable` reasons, redirects and path checks. It also
+checks `specola.subscribe` (shared subscriptions, unsubscribe, events
+through the port), the viewer's push stream against a fake events endpoint
+(one `EventSource` per topic set, `superseded`), and the public-link shell
+(`internal/server/publicshell.html`) under its real CSP against fake
+`/s/…`, `/p/…/x` and `/p/…/events` endpoints.
 
 Run them from the repository root:
 

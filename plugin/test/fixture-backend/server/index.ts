@@ -1,5 +1,5 @@
 // The fixture's backend: a router, the shared and per-user databases, the
-// file store, secrets and a streamed response.
+// file store, secrets, a streamed response, push and a scheduled job.
 import type { Ctx, Handler } from '@specola/vite-plugin/server';
 import { greet } from './greet.ts';
 
@@ -55,11 +55,34 @@ const handler: Handler = {
       }
       case 'GET /api/publish':
         ctx.publish('t', { x: 1 });
+        ctx.publish('t', { mine: true }, { to: ctx.user!.sub });
+        ctx.publish('t', { theirs: true }, { to: 'someone-else' });
+        ctx.publish('other', 'not subscribed');
         return new Response('sent');
+      case 'GET /api/publish-bad': {
+        const errors: string[] = [];
+        for (const f of [() => ctx.publish('bad topic', 1), () => ctx.publish('t', 'x'.repeat(8 * 1024)), () => ctx.publish('t', 1n), () => ctx.publish('t', 1, { to: '' })]) {
+          try {
+            f();
+          } catch (err) {
+            errors.push(`${(err as Error).name}: ${(err as Error).message}`);
+          }
+        }
+        return Response.json(errors);
+      }
+      case 'GET /api/runs':
+        ctx.db.exec('CREATE TABLE IF NOT EXISTS runs (name TEXT, at INTEGER, role TEXT, user TEXT, userdb TEXT)');
+        return Response.json(ctx.db.prepare('SELECT * FROM runs').all());
       case 'GET /api/throw':
         throw new Error('boom');
     }
     return new Response('not found', { status: 404 });
+  },
+  async scheduled(event, ctx) {
+    if (event.name === 'broken') throw new Error('cron boom');
+    ctx.db.exec('CREATE TABLE IF NOT EXISTS runs (name TEXT, at INTEGER, role TEXT, user TEXT, userdb TEXT)');
+    ctx.db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?, ?)').run(event.name, event.scheduledTime, ctx.role, JSON.stringify(ctx.user), JSON.stringify(ctx.userDb));
+    ctx.publish('t', { ran: event.name, secret: ctx.secrets.API_KEY ?? null });
   },
 };
 

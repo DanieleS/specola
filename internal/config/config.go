@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -53,10 +54,25 @@ type Config struct {
 	RunnerURL   string
 	RunnerToken string
 	SecretsKey  []byte
+	// TrustForwarded makes the first X-Forwarded-For hop the client's IP
+	// for the public links' rate limits (SPECOLA_TRUST_FORWARDED=1); set it
+	// only behind a proxy that sets the header. Otherwise the IP is the
+	// connection's.
+	TrustForwarded bool
 	// BackendPurgeAfterDays deletes the backend data of pages dormant (archived,
 	// or whose current version has no backend) for longer than this many
 	// days. 0, the default, never does.
 	BackendPurgeAfterDays int
+
+	// Test hooks, for end-to-end tests only (e2e/backends.mjs), honoured
+	// only with SPECOLA_DEV_AUTH_EMAIL (a dev bypass is never production):
+	// TestCronEvery (SPECOLA_TEST_CRON_EVERY, a Go duration) replaces the
+	// scheduled jobs' 30 s tick, and TestClockOffset
+	// (SPECOLA_TEST_CLOCK_OFFSET) moves the server's scheduling clock
+	// (scheduled jobs and the purge) ahead, so a job due a minute from now
+	// runs at once.
+	TestCronEvery   time.Duration
+	TestClockOffset time.Duration
 }
 
 func Load() (*Config, error) {
@@ -71,12 +87,16 @@ func Load() (*Config, error) {
 		TrustedUserHeader: os.Getenv("SPECOLA_TRUSTED_USER_HEADER"),
 		DevAuthEmail:      os.Getenv("SPECOLA_DEV_AUTH_EMAIL"),
 		ViewOrigin:        strings.TrimRight(os.Getenv("SPECOLA_VIEW_ORIGIN"), "/"),
+		TrustForwarded:    os.Getenv("SPECOLA_TRUST_FORWARDED") == "1",
 	}
 	c.AppBaseURL = strings.TrimRight(c.AppBaseURL, "/")
 	if err := c.loadBackends(); err != nil {
 		return nil, err
 	}
 	if err := c.loadPurge(); err != nil {
+		return nil, err
+	}
+	if err := c.loadTestHooks(); err != nil {
 		return nil, err
 	}
 	c.MCPResource = env("SPECOLA_MCP_RESOURCE", c.AppBaseURL+"/mcp")
@@ -154,6 +174,35 @@ func (c *Config) loadPurge() error {
 		return fmt.Errorf("SPECOLA_BACKEND_PURGE_AFTER_DAYS must be a positive number of days (leave it unset to never purge), got %q", v)
 	}
 	c.BackendPurgeAfterDays = n
+	return nil
+}
+
+// loadTestHooks reads the SPECOLA_TEST_* variables. They are refused
+// without the dev auth bypass rather than ignored, so a test that sets them
+// against the wrong setup fails loudly instead of waiting for a tick that
+// never comes.
+func (c *Config) loadTestHooks() error {
+	for _, h := range []struct {
+		name string
+		dst  *time.Duration
+		min  time.Duration
+	}{
+		{"SPECOLA_TEST_CRON_EVERY", &c.TestCronEvery, 100 * time.Millisecond},
+		{"SPECOLA_TEST_CLOCK_OFFSET", &c.TestClockOffset, 0},
+	} {
+		v := strings.TrimSpace(os.Getenv(h.name))
+		if v == "" {
+			continue
+		}
+		if c.DevAuthEmail == "" {
+			return fmt.Errorf("%s is a test hook and needs SPECOLA_DEV_AUTH_EMAIL; unset it", h.name)
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil || d < h.min {
+			return fmt.Errorf("%s must be a duration of at least %v (e.g. 1s), got %q", h.name, h.min, v)
+		}
+		*h.dst = d
+	}
 	return nil
 }
 

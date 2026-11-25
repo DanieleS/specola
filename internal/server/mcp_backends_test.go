@@ -108,8 +108,8 @@ func TestMCPBackendsEnabled(t *testing.T) {
 		t.Fatal("enabled instance says backends are off")
 	}
 	for _, want := range []string{"PAGE BACKENDS", "server: 'server/index.ts'", "fetch(request, ctx)", "ctx.user", "userDb",
-		"specola.fetch('/api/items'", "relative paths", "survives new versions", "Only the current version", "Not available yet",
-		"secrets", "egress", "cron", "push", "server code goes in a page backend"} {
+		"specola.fetch('/api/items'", "relative paths", "survives new versions", "Only the current version", "specola.subscribe(", "ctx.secrets", "scheduled(event, ctx)",
+		"secrets", "egress", "cron", "UTC", "public", "call_backend", "backend_logs", "backend_query", "list_secrets", "server code goes in a page backend"} {
 		if !strings.Contains(ins, want) {
 			t.Errorf("instructions lack %q", want)
 		}
@@ -152,11 +152,11 @@ func TestMCPBackendsEnabled(t *testing.T) {
 	}
 	var got struct {
 		HTML    string
-		Backend bool
+		Backend *struct{ Manifest map[string]any }
 		Note    string
 	}
 	callTool(t, cs, "get_page", map[string]any{"id": page, "version": 1}, &got)
-	if got.HTML != backendBundle["index.html"] || !got.Backend || !strings.Contains(got.Note, "can't be opened") ||
+	if got.HTML != backendBundle["index.html"] || got.Backend == nil || got.Backend.Manifest == nil || !strings.Contains(got.Note, "can't be opened") ||
 		!strings.Contains(got.Note, "bundle") {
 		t.Fatalf("get_page v1 = %+v", got)
 	}

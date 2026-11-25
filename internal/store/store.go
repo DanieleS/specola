@@ -210,8 +210,11 @@ func (s *Store) AddVersion(ctx context.Context, assetID, html, note, sub string)
 		return 0, err
 	}
 	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		version, err = addVersion(ctx, tx, assetID, html, n, sub, nil)
-		return err
+		if version, err = addVersion(ctx, tx, assetID, html, n, sub, nil); err != nil {
+			return err
+		}
+		// A plain version: the page's scheduled jobs end (cron.go).
+		return syncBackendCron(ctx, tx, assetID, time.Now())
 	})
 	return version, err
 }

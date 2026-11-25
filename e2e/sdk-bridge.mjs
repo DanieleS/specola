@@ -23,7 +23,23 @@
 //   a Response; a redirect is not followed;
 // - only paths are accepted, and dot segments can't leave the page's /x/;
 // - opened raw, offline, or without a backend, calls reject at once with the
-//   right reason.
+//   right reason;
+// - specola.subscribe, against a fake parent that records the port: one sub
+//   per topic however many subscribe, unsub after the last, subscriptions
+//   made before the port wait for it, events reach every callback even when
+//   one throws, bad topics and callbacks are a TypeError;
+// - the viewer's push stream (pagedata.ts), against a fake
+//   /api/pages/{id}/events: one EventSource for the frame's topics, opened
+//   once for a burst of subscriptions, reopened when the set changes,
+//   closed when it empties or the frame goes; superseded tells the viewer
+//   and forbidden stops it; a stream refused for good is not retried, one
+//   that fails for a while is;
+// - the public-link shell (internal/server/publicshell.html), served with
+//   its CSP by a fake /s/{token} and /p/{token}/…: it frames the page in the
+//   viewer's sandbox, hands the port once with the boot data's backend
+//   state and no localStorage data, relays calls to /p/{token}/x/… without
+//   cookies (streaming, abort, headers, version, dot segments), pushes from
+//   /p/{token}/events, and shows its notice on superseded.
 //
 // Needs: the web dependencies (cd web && npm install, for esbuild) and
 // Playwright with Chromium. Run: node e2e/sdk-bridge.mjs
@@ -72,6 +88,25 @@ const bridge = await esbuild.build({
 const bridgeJS = bridge.outputFiles[0].text;
 const sdk = readFileSync(join(root, 'internal/server/pagesdk.js'), 'utf8');
 const sdkFor = (boot) => sdk.replace(/SPECOLA_BOOT\)\s*;?\s*$/, `${JSON.stringify(boot)});`);
+const shell = readFileSync(join(root, 'internal/server/publicshell.html'), 'utf8');
+// The shell's own CSP, as publicshell.go sends it (docs/page-backends.md,
+// "Public links (step 6)").
+const SHELL_CSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self'; connect-src 'self'; style-src 'unsafe-inline'";
+// JSON as Go's json.Marshal writes it into the shell: <, > and & escaped.
+const goJSON = (v) => JSON.stringify(v).replace(/[<>&]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+
+// The event streams opened, in order: {where, v, topics, res, open}.
+const streams = [];
+let flaky = 0;
+const sse = (st, event, data) => st.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+async function until(cond, what, ms = 3000) {
+  for (const end = Date.now() + ms; Date.now() < end; ) {
+    if (await cond()) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  console.log(`  (timed out waiting for ${what})`);
+  return false;
+}
 
 // Gates the streaming answer waits on, opened from here.
 const gates = new Map();
@@ -104,7 +139,68 @@ const server = createServer(async (req, res) => {
 <script>
   window.early = specola.backend;
   window.earlyCall = specola.fetch("/echo?early=1").then((r) => r.json(), (e) => ({ name: e.name, reason: e.reason, message: e.message }));
+  ${url.searchParams.has('sub') ? 'window.earlyGot = []; window.earlyUnsub = specola.subscribe("early", (d, t) => window.earlyGot.push([t, d]));' : ''}
 </script><body>frame</body>`);
+    return;
+  }
+  if (url.pathname === '/fakeparent.html') {
+    // A parent that hands the port and records what the frame sends on it.
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`<!doctype html><meta charset="utf-8"><script>
+  window.portLog = [];
+  addEventListener('message', (e) => {
+    if (!e.data || e.data.specola !== 'hello' || window.port) return;
+    const ch = new MessageChannel();
+    window.port = ch.port1;
+    ch.port1.onmessage = (m) => window.portLog.push(m.data);
+    // Late, so subscriptions made at start are queued first.
+    setTimeout(() => e.source.postMessage({ specola: 'port', backend: { enabled: true, available: true } }, '*', [ch.port2]), 150);
+  });
+  window.sendEvent = (topic, data) => window.port.postMessage({ op: 'event', topic, data });
+</script><body><iframe sandbox="allow-scripts" name="fake" src="/frame.html?sub=1"></iframe></body>`);
+    return;
+  }
+  if (url.pathname === '/s/tok' || url.pathname.startsWith('/s/tok/')) {
+    if (url.pathname.startsWith('/s/tok/~page')) {
+      const boot = { base: '', basename: '/s/tok/~page', backend: true };
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`<!doctype html><meta charset="utf-8"><script>${sdkFor(boot)}</script>
+<script>
+  window.early = specola.backend;
+  window.earlyCall = specola.fetch("/echo?early=1").then((r) => r.json(), (e) => ({ name: e.name, reason: e.reason, message: e.message }));
+</script><body>public frame</body>`);
+      return;
+    }
+    // As internal/server/publicshell.go serves it.
+    const rest = url.pathname.slice('/s/tok'.length);
+    const boot = { token: 'tok', version: 3, backend: { enabled: true, available: true }, pageSrc: '/s/tok/~page' + rest + url.search };
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': SHELL_CSP,
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+    });
+    res.end(shell.replace('SPECOLA_SHELL_BOOT', () => goJSON(boot)));
+    return;
+  }
+  const ev = /^\/(?:api\/pages\/p1|p\/tok)\/events$/.exec(url.pathname);
+  if (ev) {
+    const st = { where: url.pathname, v: url.searchParams.get('v'), topics: url.searchParams.getAll('topic'), res, open: true };
+    streams.push(st);
+    if (st.topics.includes('denied')) {
+      st.open = false;
+      return specolaError(res, 403, 'forbidden', 'you can no longer see this page');
+    }
+    if (st.topics.includes('flaky') && ++flaky <= 2) {
+      // The stream, then the shell's question about it: a proxy's error.
+      st.open = false;
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end('bad gateway');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
+    res.write(': open\n\n');
+    req.on('close', () => (st.open = false));
     return;
   }
   if (url.pathname === '/api/pages/p1/secret') {
@@ -112,7 +208,7 @@ const server = createServer(async (req, res) => {
     res.end('secret');
     return;
   }
-  const m = /^\/api\/pages\/p1\/x(\/.*)$/.exec(url.pathname);
+  const m = /^\/(?:api\/pages\/p1|p\/tok)\/x(\/.*)$/.exec(url.pathname);
   if (!m) {
     res.writeHead(404);
     res.end();
@@ -134,6 +230,8 @@ const server = createServer(async (req, res) => {
         query: url.search,
         version: req.headers['x-specola-version'] ?? null,
         custom: req.headers['x-custom'] ?? null,
+        cookie: req.headers.cookie ?? null,
+        where: url.pathname.split('/x/')[0],
         specolaFoo: req.headers['x-specola-foo'] ?? null,
         listed: req.headers['x-specola-headers'] ? JSON.parse(Buffer.from(req.headers['x-specola-headers'], 'base64url').toString('utf8')) : null,
         contentType: req.headers['content-type'] ?? null,
@@ -516,6 +614,357 @@ try {
   }
   const againErr = await reloaded.evaluate(() => window.earlyCall);
   check(againErr.name === 'BackendUnavailable' && againErr.reason === 'unavailable', 'a second hello is refused: BackendUnavailable (unavailable)', againErr);
+
+  // specola.subscribe, over a fake parent that records the port.
+  {
+    const fp = await context.newPage();
+    fp.on('pageerror', (e) => console.log('  page error:', e.message));
+    await fp.goto(origin + '/fakeparent.html');
+    let ff;
+    for (let i = 0; i < 100 && !ff; i++) {
+      ff = fp.frames().find((x) => x.name() === 'fake');
+      if (!ff) await fp.waitForTimeout(20);
+    }
+    await ff.waitForFunction(() => window.earlyUnsub);
+    await fp.waitForFunction(() => window.portLog.some((m) => m.op === 'sub'));
+    const ops = () => fp.evaluate(() => window.portLog.filter((m) => m.op === 'sub' || m.op === 'unsub'));
+    check(JSON.stringify(await ops()) === '[{"op":"sub","topic":"early"}]', 'a subscription made before the port arrives is sent once it does', await ops());
+    await fp.evaluate(() => window.sendEvent('early', { n: 1 }));
+    await ff.waitForFunction(() => window.earlyGot.length > 0);
+    check(JSON.stringify(await ff.evaluate(() => window.earlyGot)) === '[["early",{"n":1}]]', 'an event reaches the callback as (data, topic)');
+
+    await ff.evaluate(() => {
+      window.got = { a1: [], a2: [], b: [] };
+      window.errors = [];
+      addEventListener('error', (e) => {
+        window.errors.push(String(e.error && e.error.message));
+        e.preventDefault();
+      });
+      window.unA0 = specola.subscribe('orders/a', () => {
+        throw new Error('callback broke');
+      });
+      window.unA1 = specola.subscribe('orders/a', (d) => window.got.a1.push(d));
+      window.unA2 = specola.subscribe('orders/a', (d) => window.got.a2.push(d));
+      window.unB = specola.subscribe('b:1', (d) => window.got.b.push(d));
+    });
+    await fp.waitForTimeout(100);
+    check(
+      JSON.stringify(await ops()) === JSON.stringify([{ op: 'sub', topic: 'early' }, { op: 'sub', topic: 'orders/a' }, { op: 'sub', topic: 'b:1' }]),
+      'several subscriptions to a topic share one sub',
+      await ops(),
+    );
+    await fp.evaluate(() => {
+      window.sendEvent('orders/a', { added: 1 });
+      window.sendEvent('nobody', 1);
+      window.sendEvent('b:1', 'x');
+    });
+    await ff.waitForFunction(() => window.got.b.length === 1);
+    const got = await ff.evaluate(() => ({ got: window.got, errors: window.errors }));
+    check(
+      JSON.stringify(got.got) === JSON.stringify({ a1: [{ added: 1 }], a2: [{ added: 1 }], b: ['x'] }),
+      "every subscriber gets the event, even after one throws; other topics' don't",
+      got.got,
+    );
+    check(got.errors.length === 1 && got.errors[0] === 'callback broke', 'a throwing callback is reported as uncaught', got.errors);
+
+    await ff.evaluate(() => {
+      window.unA0();
+      window.unA1();
+      window.unA1();
+    });
+    await fp.waitForTimeout(100);
+    check(!(await ops()).some((m) => m.op === 'unsub'), 'no unsub while a subscription to the topic is left');
+    await fp.evaluate(() => window.sendEvent('orders/a', 2));
+    await ff.waitForFunction(() => window.got.a2.length === 2);
+    check(JSON.stringify(await ff.evaluate(() => window.got.a1)) === '[{"added":1}]', 'an unsubscribed callback gets no more events');
+    await ff.evaluate(() => {
+      window.unA2();
+      window.unA2();
+      window.unB();
+      window.earlyUnsub();
+    });
+    await fp.waitForTimeout(100);
+    const unsubs = (await ops()).filter((m) => m.op === 'unsub').map((m) => m.topic);
+    check(JSON.stringify(unsubs) === '["orders/a","b:1","early"]', 'unsub after the last subscription, once', unsubs);
+    await fp.evaluate(() => window.sendEvent('orders/a', 3));
+    await fp.waitForTimeout(100);
+    check((await ff.evaluate(() => window.got.a2.length)) === 2, 'nothing after unsubscribing');
+
+    const invalid = await ff.evaluate(() => {
+      const out = [];
+      for (const [t, f] of [
+        ['', () => {}],
+        ['has space', () => {}],
+        ['x'.repeat(129), () => {}],
+        [42, () => {}],
+        ['ok', null],
+      ]) {
+        try {
+          specola.subscribe(t, f);
+          out.push('ok');
+        } catch (e) {
+          out.push(e.name);
+        }
+      }
+      const uns = [];
+      try {
+        for (let i = 0; i < 21; i++) uns.push(specola.subscribe('t' + i, () => {}));
+        out.push('21 topics');
+      } catch (e) {
+        out.push(e.name + ' at ' + uns.length);
+      }
+      uns.forEach((u) => u());
+      // Again a topic of those 20: the room freed is taken.
+      try {
+        specola.subscribe('t0', () => {})();
+        out.push('ok');
+      } catch (e) {
+        out.push(e.name);
+      }
+      return out;
+    });
+    check(
+      JSON.stringify(invalid) === JSON.stringify(['TypeError', 'TypeError', 'TypeError', 'TypeError', 'TypeError', 'TypeError at 20', 'ok']),
+      'a bad topic or callback, or a 21st topic, is a TypeError',
+      invalid,
+    );
+    await fp.close();
+  }
+
+  // The viewer's push stream (pagedata.ts), against a fake events endpoint.
+  {
+    const before = streams.length;
+    const pf = await frame('push');
+    await pf.evaluate(() => {
+      window.pushed = [];
+      window.uns = {};
+      for (const t of ['a', 'b', 'c']) window.uns[t] = specola.subscribe(t, (d, topic) => window.pushed.push([topic, d]));
+    });
+    await until(() => streams.length > before, 'the stream');
+    await page.waitForTimeout(250);
+    let mine = streams.slice(before);
+    check(
+      mine.length === 1 && mine[0].v === '3' && JSON.stringify(mine[0].topics) === '["a","b","c"]',
+      'a burst of subscriptions opens one stream, for the version shown and every topic',
+      mine.map((x) => ({ v: x.v, topics: x.topics })),
+    );
+    const s1 = mine[0];
+    sse(s1, 'message', { topic: 'b', data: { hi: 1 } });
+    sse(s1, 'message', { topic: 'zzz', data: 0 });
+    sse(s1, 'message', { topic: 'a', data: [1, 2] });
+    await pf.waitForFunction(() => window.pushed.length >= 2);
+    await page.waitForTimeout(100);
+    check(JSON.stringify(await pf.evaluate(() => window.pushed)) === '[["b",{"hi":1}],["a",[1,2]]]', 'events reach the page, only on its topics');
+
+    await pf.evaluate(() => window.uns.c());
+    await until(() => streams.length > before + 1 && !s1.open, 'the reopened stream');
+    mine = streams.slice(before);
+    check(mine.length === 2 && JSON.stringify(mine[1].topics) === '["a","b"]' && !s1.open, 'unsubscribing reopens the stream without the topic', mine.map((x) => x.topics));
+    await pf.evaluate(() => {
+      window.uns.d = specola.subscribe('d', () => {});
+      window.uns.d();
+    });
+    await page.waitForTimeout(300);
+    check(streams.length === before + 2, 'a change undone within the debounce reopens nothing');
+    await pf.evaluate(() => {
+      window.uns.a();
+      window.uns.b();
+    });
+    await until(() => !mine[1].open, 'the stream to close');
+    await page.waitForTimeout(200);
+    check(!mine[1].open && streams.length === before + 2, 'the stream closes when no topic is left');
+
+    // superseded: the viewer is told, and the stream stays closed.
+    await pf.evaluate(() => (window.uns.s = specola.subscribe('s', () => {})));
+    await until(() => streams.length > before + 2, 'the stream');
+    const s3 = streams[streams.length - 1];
+    sse(s3, 'superseded', {});
+    s3.res.end();
+    await until(async () => (await page.evaluate(() => window.superseded.push)) === 1, 'superseded');
+    await pf.evaluate(() => specola.subscribe('later', () => {}));
+    await page.waitForTimeout(500);
+    check(
+      (await page.evaluate(() => window.superseded.push)) === 1 && streams.length === before + 3,
+      'superseded tells the viewer, and no stream opens again',
+    );
+
+    // forbidden: stops, without the reload notice.
+    const n0 = streams.length;
+    const ff2 = await frame('forbid');
+    await ff2.evaluate(() => specola.subscribe('f', () => {}));
+    await until(() => streams.length > n0, 'the stream');
+    const s4 = streams[streams.length - 1];
+    sse(s4, 'forbidden', {});
+    s4.res.end();
+    await page.waitForTimeout(300);
+    await ff2.evaluate(() => specola.subscribe('f2', () => {}));
+    await page.waitForTimeout(500);
+    check(streams.length === n0 + 1 && (await page.evaluate(() => window.superseded.forbid)) === 0, 'forbidden stops the stream for good');
+
+    // A stream refused for good is asked about once, then left; one that
+    // fails for a while is tried again.
+    const n1 = streams.length;
+    const fd = await frame('denied');
+    await fd.evaluate(() => specola.subscribe('denied', () => {}));
+    await page.waitForTimeout(2500);
+    check(streams.length === n1 + 2, 'a stream answered 403 forbidden is not retried (the stream, then one question)', streams.length - n1);
+    const n2 = streams.length;
+    const fl = await frame('flaky');
+    await fl.evaluate(() => {
+      window.pushed = [];
+      specola.subscribe('flaky', (d) => window.pushed.push(d));
+    });
+    await until(() => streams.slice(n2).some((st) => st.open), 'the stream to be retried', 5000);
+    const ok = streams.slice(n2).find((st) => st.open);
+    check(!!ok && streams.length - n2 === 3, 'a stream that failed with a 502 is retried', streams.length - n2);
+    if (ok) {
+      sse(ok, 'message', { topic: 'flaky', data: 'back' });
+      await fl.waitForFunction(() => window.pushed.length === 1);
+      check(true, 'and its events arrive');
+      await page.evaluate(() => window.stops.flaky());
+      await until(() => !ok.open, 'the stream to close');
+      check(!ok.open, 'the frame going closes its stream');
+    }
+  }
+
+  // The public-link shell, as Specola serves it, against fake /p/tok routes.
+  {
+    await context.addCookies([{ name: 'session', value: 'secret-session', url: origin }]);
+    const sp = await context.newPage();
+    const cspErrors = [];
+    sp.on('console', (m) => {
+      if (/Content Security Policy|Refused to/i.test(m.text())) cspErrors.push(m.text());
+    });
+    sp.on('pageerror', (e) => console.log('  shell page error:', e.message));
+    await sp.goto(origin + '/s/tok/deep/path?q=1');
+    let pfr;
+    for (let i = 0; i < 100 && !pfr; i++) {
+      pfr = sp.frames().find((x) => x.url().includes('/~page'));
+      if (!pfr) await sp.waitForTimeout(20);
+    }
+    await pfr.waitForFunction(() => window.earlyCall);
+    check(new URL(pfr.url()).pathname + new URL(pfr.url()).search === '/s/tok/~page/deep/path?q=1', 'the shell frames the page at ~page, keeping the path and query', pfr.url());
+    check((await pfr.evaluate(() => self.origin)) === 'null', 'the framed page runs on an opaque origin');
+    const attrs = await sp.evaluate(() => {
+      const f = document.querySelector('iframe');
+      const r = f.getBoundingClientRect();
+      return { sandbox: f.getAttribute('sandbox'), full: r.width === innerWidth && r.height === innerHeight, name: f.name };
+    });
+    check(
+      attrs.sandbox === 'allow-scripts allow-popups allow-forms allow-modals' && attrs.full && attrs.name === '',
+      "the frame has the viewer's sandbox, fills the window and gets no localStorage data",
+      attrs,
+    );
+    check(
+      JSON.stringify(await pfr.evaluate(() => specola.backend)) === '{"enabled":true,"available":true}' &&
+        (await pfr.evaluate(() => specola.persistent)) === false,
+      "specola.backend is the boot data's; localStorage stays in memory",
+    );
+    const pe = await pfr.evaluate(() => window.earlyCall);
+    check(pe.method === 'GET' && pe.query === '?early=1' && pe.where === '/p/tok', 'a call made before the port goes to /p/{token}/x', pe);
+    const pecho = await pfr.evaluate(async () => (await specola.fetch('/echo?x=2', { method: 'POST', headers: { 'X-Custom': 'pub' }, body: 'hi' })).json());
+    check(
+      pecho.version === '3' && pecho.custom === 'pub' && pecho.text === 'hi' && pecho.cookie === null &&
+        JSON.stringify(pecho.listed) === JSON.stringify([['content-type', 'text/plain;charset=UTF-8'], ['x-custom', 'pub']]),
+      'calls carry X-Specola-Version, X-Specola-Headers and the body, and no cookie',
+      pecho,
+    );
+    gate('stream');
+    gate('stream2');
+    await pfr.evaluate(() => {
+      window.got = [];
+      window.streamDone = (async () => {
+        const r = await specola.fetch('/stream');
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) return 'done';
+          window.got.push(dec.decode(value));
+        }
+      })();
+    });
+    await pfr.waitForFunction(() => window.got.join('') === 'one;');
+    openGate('stream');
+    openGate('stream2');
+    check((await pfr.evaluate(() => window.streamDone)) === 'done' && (await pfr.evaluate(() => window.got.join(''))) === 'one;two;three', 'answers stream through the shell');
+    seen.closed.delete('/nohead');
+    const pab = await pfr.evaluate(async () => {
+      const ac = new AbortController();
+      const p = specola.fetch('/nohead', { signal: ac.signal });
+      setTimeout(() => ac.abort(), 200);
+      try {
+        await p;
+        return 'resolved';
+      } catch (e) {
+        return e.name;
+      }
+    });
+    await sp.waitForTimeout(300);
+    check(pab === 'AbortError' && seen.closed.has('/nohead'), "abort reaches the shell's request", pab);
+    seen.paths.length = 0;
+    await pfr.evaluate(() => specola.fetch('/../../events?x=1'));
+    check(seen.paths.length === 1 && seen.paths[0] === '/events?x=1', "dot segments can't leave /p/{token}/x", seen.paths);
+    const perr = await pfr.evaluate(async () => {
+      try {
+        await specola.fetch('/unavailable');
+      } catch (e) {
+        return { name: e.name, reason: e.reason };
+      }
+    });
+    check(perr?.name === 'BackendUnavailable' && perr.reason === 'unavailable', 'backend-unavailable: BackendUnavailable', perr);
+    check(await sp.evaluate(() => document.getElementById('notice').hidden), 'no notice so far');
+
+    // Pushes, from /p/tok/events.
+    const n3 = streams.length;
+    await pfr.evaluate(() => {
+      window.pushed = [];
+      specola.subscribe('pub/1', (d, t) => window.pushed.push([t, d]));
+      specola.subscribe('pub/2', (d, t) => window.pushed.push([t, d]));
+    });
+    await until(() => streams.length > n3, 'the public stream');
+    await sp.waitForTimeout(250);
+    const ps = streams.slice(n3);
+    check(
+      ps.length === 1 && ps[0].where === '/p/tok/events' && ps[0].v === '3' && JSON.stringify(ps[0].topics) === '["pub/1","pub/2"]',
+      'subscriptions open one stream on /p/{token}/events',
+      ps.map((x) => ({ where: x.where, v: x.v, topics: x.topics })),
+    );
+    sse(ps[0], 'message', { topic: 'pub/2', data: { n: 2 } });
+    await pfr.waitForFunction(() => window.pushed.length === 1);
+    check(JSON.stringify(await pfr.evaluate(() => window.pushed)) === '[["pub/2",{"n":2}]]', 'events reach the page through the shell');
+
+    // Superseded: the call rejects, the notice offers a reload.
+    const psup = await pfr.evaluate(async () => {
+      try {
+        await specola.fetch('/superseded');
+      } catch (e) {
+        return { name: e.name, reason: e.reason };
+      }
+    });
+    check(psup?.name === 'BackendUnavailable' && psup.reason === 'superseded', 'superseded: BackendUnavailable (superseded)', psup);
+    const note = await sp.evaluate(() => {
+      const n = document.getElementById('notice');
+      return { hidden: n.hidden, text: n.textContent, reload: !n.querySelector('.reload').hidden };
+    });
+    check(!note.hidden && /new version is available/i.test(note.text) && note.reload, 'superseded shows the reload notice', note);
+    check(cspErrors.length === 0, "the shell runs under its own CSP", cspErrors);
+
+    // One port per load: the frame reloading itself is refused.
+    await pfr.evaluate(() => location.reload());
+    let again2;
+    for (let i = 0; i < 100 && !again2; i++) {
+      again2 = sp.frames().find((x) => x.url().includes('/~page'));
+      try {
+        await again2.waitForFunction(() => window.earlyCall, null, { timeout: 200 });
+      } catch {
+        again2 = null;
+      }
+    }
+    const reErr = await again2.evaluate(() => window.earlyCall);
+    check(reErr.name === 'BackendUnavailable' && reErr.reason === 'unavailable', 'the shell refuses a second hello', reErr);
+    await sp.close();
+  }
 } finally {
   await browser.close();
   server.close();

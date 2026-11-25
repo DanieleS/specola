@@ -31,7 +31,7 @@ export interface PageInfo {
   readonly title: string;
 }
 
-/** The public link a request came through. */
+/** The public link a request came through (ctx.role is then "public"). */
 export interface LinkInfo {
   readonly id: string;
   readonly label: string;
@@ -87,11 +87,23 @@ export interface Ctx {
   readonly userDb: DatabaseSync | null;
   /** The page's file store. */
   readonly files: FileStore;
-  /** The secrets the manifest declares, by name; a secret not set yet is missing. */
+  /**
+   * The secrets the manifest declares that the page's owner has set, by
+   * name; a secret not set yet is missing. Values are set in Specola's UI
+   * only, never by code or agents. Under `vite dev` they come from .env and
+   * the environment (declared names only).
+   */
   readonly secrets: Readonly<Record<string, string>>;
   /**
-   * Pushes data to the pages open on topic (to one user with `to`).
-   * Not available yet: it logs a warning and drops the event.
+   * Pushes data to the pages open on the page that subscribed to topic
+   * (specola.subscribe in the app); with `to` (a user's sub), only to that
+   * user's. topic is 1 to 128 of [A-Za-z0-9_.:/-]; data must be
+   * JSON-serialisable, at most 7 KiB serialised; otherwise it throws a
+   * TypeError. Fire and forget, best effort: no delivery confirmation, no
+   * replay for pages that were not listening, and at most 50 pushes a second
+   * per page (the rest are dropped, with a line in the backend log).
+   * Public-link visitors only get topics in the manifest's topics.public,
+   * and never targeted pushes.
    */
   publish(topic: string, data: unknown, opts?: { to?: string }): void;
   /** Keeps the worker alive, after the response, until p settles. */
@@ -100,10 +112,15 @@ export interface Ctx {
   readonly log: Console;
 }
 
-/** A scheduled job firing (cron in the manifest). */
+/**
+ * A scheduled job firing (cron in the manifest). It runs with
+ * ctx.role "cron", no user (ctx.user and ctx.userDb are null) and at most
+ * 5 minutes. Missed runs are not caught up.
+ */
 export interface ScheduledEvent {
+  /** The job's name, as declared in the manifest's cron. */
   readonly name: string;
-  /** Milliseconds since the epoch. */
+  /** The slot it fires for, in milliseconds since the epoch (UTC schedules). */
   readonly scheduledTime: number;
 }
 
@@ -114,6 +131,11 @@ export interface ScheduledEvent {
  * page can send anything; decide with ctx.user and ctx.role.
  */
 export interface Handler {
+  /** Answers specola.fetch calls (and, for the manifest's public routes, public-link visitors). */
   fetch?(request: Request, ctx: Ctx): Response | Promise<Response>;
+  /**
+   * Runs the manifest's cron jobs, all of them: tell them apart by
+   * event.name. A job without this handler is recorded as "no-handler".
+   */
   scheduled?(event: ScheduledEvent, ctx: Ctx): void | Promise<void>;
 }

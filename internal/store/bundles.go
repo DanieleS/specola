@@ -593,6 +593,10 @@ func (s *Store) CommitBundle(ctx context.Context, token, note string, backends b
 				return err
 			}
 		}
+		// The new version's scheduled jobs replace the page's (cron.go).
+		if err := syncBackendCron(ctx, tx, id, time.Now()); err != nil {
+			return err
+		}
 		_, err = tx.Exec(ctx, `UPDATE asset_grant SET consumed_at = now() WHERE id = $1::uuid`, g.id)
 		return err
 	})

@@ -3,8 +3,11 @@
 // The runner forks it with Node's permission model on and talks to it over
 // the IPC channel (advanced serialization, so bytes travel as Uint8Array):
 //
-//   runner → worker  init, req, body, bodyEnd, abort, ack, ping, forget, stop
-//   worker → runner  ready, fatal, head, chunk, end, fail, done, log, pong, forgot
+//   runner → worker  init, req, body, bodyEnd, abort, ack, ping, forget, stop,
+//                    job (a scheduled run)
+//   worker → runner  ready, fatal, head, chunk, end, fail, done, log, pong, forgot,
+//                    jobEnd (a scheduled run's outcome; done follows once its
+//                    waitUntil work is over), publish (ctx.publish)
 //
 // Bodies stream chunk by chunk in both directions. Response chunks are
 // acknowledged by the runner once its HTTP response took them, so a slow
@@ -25,6 +28,9 @@ import { PageQuota } from './quota.mjs';
 const WINDOW = 8; // response chunks in flight before waiting for an ack
 const PIECE = 64 * 1024; // IPC message size for response bytes
 const MAX_LINE = 16 * 1024;
+// ctx.publish ("Realtime push (step 4)"): the runner checks these again.
+const TOPIC = /^[A-Za-z0-9_.:/-]{1,128}$/;
+const MAX_PUSH_DATA = 7 * 1024;
 
 const send = (msg) => {
   if (process.connected) process.send(msg);
@@ -66,7 +72,6 @@ let handler;
 let sharedDb = null;
 const userDbs = new Map();
 let files = null;
-let publishWarned = false;
 const calls = new Map();
 
 function openDb(file) {
@@ -161,14 +166,49 @@ async function init(msg) {
     return;
   }
   const h = mod.default;
-  if (!h || typeof h.fetch !== 'function') {
+  // Either handler is optional ("Handler contract"), not both.
+  if (!h || (typeof h.fetch !== 'function' && typeof h.scheduled !== 'function')) {
     const ref = newRef();
-    log('error', ['the backend entry has no fetch handler: its default export must be an object with a fetch(request, ctx) method'], ref);
+    log('error', ['the backend entry has no handler: its default export must be an object with a fetch(request, ctx) or a scheduled(event, ctx) method'], ref);
     send({ t: 'fatal', ref });
     return;
   }
   handler = h;
   send({ t: 'ready' });
+}
+
+// --- ctx.publish ----------------------------------------------------------
+
+// Checks a push and hands it to the runner, which queues it: the handler
+// never waits for delivery. A bad push is the code's mistake, said at once
+// with a TypeError; one dropped later (over the page's rate, specola
+// refusing it) only gets a line in the backend log, since delivery is best
+// effort.
+function publish(topic, data, opts) {
+  if (typeof topic !== 'string' || !TOPIC.test(topic)) {
+    throw new TypeError(`ctx.publish: the topic must be 1 to 128 letters, digits, _, ., :, / or -; got ${typeof topic === 'string' ? JSON.stringify(topic.slice(0, 200)) : typeof topic}`);
+  }
+  if (opts !== undefined && opts !== null && typeof opts !== 'object') {
+    throw new TypeError('ctx.publish: the options must be an object ({to})');
+  }
+  const to = opts?.to ?? undefined;
+  if (to !== undefined && (typeof to !== 'string' || to === '')) {
+    throw new TypeError('ctx.publish: to must be a user\'s sub (a non-empty string)');
+  }
+  let json;
+  try {
+    json = JSON.stringify(data);
+  } catch (err) {
+    throw new TypeError(`ctx.publish: the data is not JSON-serialisable (${err.message})`);
+  }
+  if (json === undefined) {
+    throw new TypeError(`ctx.publish: the data is not JSON-serialisable (${typeof data})`);
+  }
+  const size = Buffer.byteLength(json);
+  if (size > MAX_PUSH_DATA) {
+    throw new TypeError(`ctx.publish: the data is ${size} bytes serialised; at most ${MAX_PUSH_DATA}`);
+  }
+  send({ t: 'publish', topic, data: json, ...(to !== undefined ? { to } : {}) });
 }
 
 // --- requests -------------------------------------------------------------
@@ -191,14 +231,10 @@ function makeCtx(msg, call) {
       files ??= new FileStore(pageDir, diskQuota, snapshotsDir);
       return files;
     },
+    // Only the names the version declares: the runner filtered them.
     secrets: Object.freeze({ ...(msg.secrets ?? {}) }),
-    publish() {
-      // Realtime push is a later delivery step (docs/page-backends.md,
-      // "Delivery plan"); say so once instead of failing the handler.
-      if (!publishWarned) {
-        publishWarned = true;
-        log('warn', ['ctx.publish: push is not available yet; the event was dropped']);
-      }
+    publish(topic, data, opts) {
+      publish(topic, data, opts);
     },
     waitUntil(p) {
       call.waits.push(Promise.resolve(p).catch((err) => logError('a waitUntil promise rejected', err)));
@@ -285,6 +321,12 @@ async function handle(msg) {
 }
 
 async function respond(msg, call) {
+  if (typeof handler.fetch !== 'function') {
+    const ref = newRef();
+    log('error', [`${msg.request.method} ${msg.request.path}: the backend has no fetch handler (its default export has only scheduled)`], ref);
+    send({ t: 'fail', id: call.id, status: 500, code: 'backend-error', message: 'The backend has no fetch handler.', ref });
+    return;
+  }
   let response;
   try {
     const request = buildRequest(msg, call);
@@ -319,6 +361,35 @@ async function respond(msg, call) {
   if (!call.aborted) send({ t: 'end', id: call.id });
 }
 
+// --- scheduled runs -------------------------------------------------------
+
+// One scheduled(event, ctx) ("Scheduled jobs (step 5)"): as the cron, with
+// no user. The outcome goes to the runner as soon as the handler settles;
+// done follows once its waitUntil work is over, as for a request.
+async function runJob(msg) {
+  const call = { id: msg.id, waits: [] };
+  const name = String(msg.event?.name);
+  let outcome = { status: 'ok' };
+  try {
+    if (typeof handler.scheduled !== 'function') {
+      outcome = { status: 'no-handler' };
+    } else {
+      const ctx = makeCtx({ page: msg.page, user: null, role: 'cron', link: null, secrets: msg.secrets }, call);
+      const event = Object.freeze({ name, scheduledTime: msg.event.scheduledTime });
+      await handler.scheduled(event, ctx);
+    }
+  } catch (err) {
+    outcome = { status: 'error', ref: logError(`scheduled job ${JSON.stringify(name)} failed`, err) };
+  }
+  send({ t: 'jobEnd', id: msg.id, ...outcome });
+  try {
+    for (let n = 0; n < call.waits.length; n = call.waits.length) await Promise.all(call.waits.slice(n));
+  } finally {
+    send({ t: 'done', id: msg.id });
+    quota.refresh().catch((err) => logError('measuring the page\'s disk use failed', err));
+  }
+}
+
 function onMessage(msg) {
   const call = msg.id === undefined ? null : calls.get(msg.id);
   switch (msg.t) {
@@ -327,6 +398,9 @@ function onMessage(msg) {
       break;
     case 'req':
       handle(msg);
+      break;
+    case 'job':
+      runJob(msg);
       break;
     case 'body':
       try {

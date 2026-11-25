@@ -24,6 +24,18 @@ export interface SpecolaRuntime {
    */
   fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
   /**
+   * Listens to what the page's backend pushes on topic with ctx.publish:
+   * onMessage(data, topic) for each push, until the returned function is
+   * called. topic is 1 to 128 of [A-Za-z0-9_.:/-], at most 20 topics at once
+   * (a TypeError otherwise); subscriptions to one topic share one stream.
+   * Best effort: there is no replay, so a push sent while the page was not
+   * connected (the network dropped, the topic set just changed) is missed;
+   * an app that must not miss anything reloads its state with
+   * specola.fetch, e.g. on each message. Without a backend nothing arrives.
+   * Under `vite dev` it listens to the plugin's dev backend.
+   */
+  subscribe<T = unknown>(topic: string, onMessage: (data: T, topic: string) => void): () => void;
+  /**
    * Whether backends are enabled on this Specola instance and the runner
    * answers right now: {enabled: false, available: false} on a page without
    * a backend, and until the viewer has said.

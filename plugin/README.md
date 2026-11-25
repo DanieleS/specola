@@ -154,7 +154,8 @@ anyone who can open the page can send anything; decide with `ctx.user` and
 | `db` | SQLite (`node:sqlite`) shared by everyone on the page, opened on first use |
 | `userDb` | SQLite private to `ctx.user` (`null` without a user) |
 | `files` | a file store: `put(key, body, {contentType})`, `get(key)`, `delete(key)`, `list(prefix)` |
-| `secrets` | the declared secrets that are set |
+| `secrets` | the declared secrets that are set (see Secrets) |
+| `publish(topic, data, {to})` | push to the open pages subscribed to `topic` (see Push) |
 | `waitUntil(p)`, `log` | keep working after responding; `console` for the backend log |
 
 Data belongs to the page, not to a version: migrate the schema in code
@@ -190,6 +191,114 @@ runner reads it. The build fails when:
   is built in);
 - the app itself puts files under `.specola/` (say, in `public/`).
 
+### Secrets
+
+List the names in the manifest (`secrets: ['OPENAI_API_KEY']`); the code
+reads `ctx.secrets.OPENAI_API_KEY`. The values are set by the page's
+owners in Specola, in the viewer's **Backend** panel, never in code or in
+the bundle: they are stored encrypted, nobody can read one back, and
+`ctx.secrets` only has the declared names that are set (check, and answer
+something useful when one is missing). An agent can see which are missing
+(`list_secrets`, and `get_page`'s `backend.secrets_missing`) but cannot set
+one: ask the page's owner to. A secret is a name of `A`–`Z`, digits and
+`_`, starting with a letter.
+
+### Outbound HTTP (egress)
+
+The backend calls other services with the global `fetch`, but only the
+hosts in the manifest's `egress` (`"api.openai.com"`, or `"*.googleapis.com"`
+for any subdomain; ports 443 and 80 only, no IP addresses):
+
+```js
+specola({ server: 'server/index.ts', backend: { egress: ['api.openai.com'], secrets: ['OPENAI_API_KEY'] } });
+```
+
+```ts
+const res = await fetch('https://api.openai.com/v1/models', {
+  headers: { authorization: `Bearer ${ctx.secrets.OPENAI_API_KEY}` },
+});
+```
+
+On the runner every worker's HTTP goes through Specola's egress proxy: a
+host not listed, or one that resolves to a private, loopback or link-local
+address, makes `fetch` fail, and the backend log says
+`egress refused: <host>:<port> (<reason>)`. Raw sockets (`node:net`,
+`node:tls`) bypass the proxy; an instance that must close them does it with
+a network policy on the runner's container (see the runner's README).
+
+### Push
+
+The backend pushes to the pages open on it; the app subscribes:
+
+```ts
+// server: after a change
+ctx.publish('scores', { team: 'a', score: 3 });
+ctx.publish('inbox', { unread: 2 }, { to: someone.sub }); // only that user's pages
+```
+
+```js
+// app
+const unsubscribe = specola.subscribe('scores', (data, topic) => render(data));
+```
+
+A topic is 1 to 128 of letters, digits and `_.:/-`; `data` is anything
+JSON can carry, at most 7 KiB serialised (a bad topic or data throws a
+`TypeError`); at most 50 pushes a second per page. Several subscriptions to
+one topic share one stream; a page listens to at most 20 topics at once.
+It is **best effort**: there is no replay, so a push sent while a page was
+not connected (offline, reloading, the stream reopening) is not seen. Send
+small notices and let the app reload what it shows with `specola.fetch`
+(on each notice, or when the tab becomes visible again) rather than
+pushing the state itself. Viewers of an older version get no pushes (only
+the current version is live).
+
+### Scheduled jobs (cron)
+
+```js
+backend: { cron: [{ name: 'nightly', schedule: '0 3 * * *' }] }
+```
+
+```ts
+export default {
+  async fetch(request, ctx) { /* … */ },
+  async scheduled(event, ctx) {
+    // event: {name: 'nightly', scheduledTime: <ms>}
+    if (event.name === 'nightly') ctx.db.exec("DELETE FROM sessions WHERE expires < unixepoch()");
+  },
+} satisfies Handler;
+```
+
+Up to 10 jobs, five-field cron schedules **in UTC**, at most once a minute
+(no `@daily`-style macros). Specola runs them while the page is not
+archived: one `scheduled` handler gets every job (tell them apart by
+`event.name`), with `ctx.role` `"cron"`, no user (`ctx.user` and
+`ctx.userDb` are `null`), the secrets and `ctx.publish`, for at most 5
+minutes. A run missed while Specola or the runner was down is not caught
+up. The **Backend** panel shows each job's next and last run and its
+outcome; failures are in the backend log.
+
+### Public routes
+
+A public link (`/s/<token>`) to a page with a backend opens it for anyone
+with the link, without signing in, and lets them call only the routes the
+manifest lists in `public`:
+
+```js
+backend: {
+  public: ['GET /api/stats', 'POST /api/votes', 'GET /api/public/*'], // "*" as the last segment: any rest of the path
+  topics: { public: ['scoreboard'] }, // topics a public visitor may subscribe to
+}
+```
+
+Any other route answers 403 `not-public` without reaching the backend. On
+a public call `ctx.user` and `ctx.userDb` are `null`, `ctx.role` is
+`"public"` and `ctx.link` is `{id, label}` of the link: treat those calls as
+coming from anyone on the internet (validate everything, keep them cheap).
+Public calls are rate-limited (60 a minute per link and visitor, 600 a
+minute per link), public visitors only get the `topics.public` topics and
+never targeted pushes, and revoking the link stops them at once. Links to a
+backend page always open its current version.
+
 ### Under `vite dev`
 
 The handler runs inside the dev server at `/__specola/x/…`, reloaded when
@@ -200,14 +309,38 @@ you edit it, and `specola.fetch` goes there:
 - the databases and files live in `.specola-dev/` in the project: add it
   to `.gitignore`, delete it to start over;
 - `ctx.secrets` come from the environment and `.env` files, only the
-  declared names.
+  declared names;
+- `ctx.publish` reaches the dev pages' `specola.subscribe` (through the
+  event stream at `/__specola/events`); a push `to` a user other than the
+  dev user reaches nobody;
+- scheduled jobs don't run on their schedule: the dev server lists them
+  when it starts, and `POST /__specola/cron/<name>` runs one now (with
+  `role: "cron"` and no user), answering `{"status":"ok"|"no-handler"|"error"|"timeout"}`
+  and logging the outcome in the terminal:
 
-### Not available yet
+  ```sh
+  curl -X POST http://localhost:5173/__specola/cron/nightly
+  ```
 
-`ctx.publish` (push to open pages) logs a warning and drops the event, and
-there is no `specola.subscribe` yet; scheduled jobs (`cron`), public links
-to backend pages, and setting secret values are coming. Outbound `fetch`
-from the backend will be limited to the manifest's `egress` hosts.
+Not simulated: public links (every dev call is the owner's: try public
+routes on the published page, through a public link) and the `egress`
+allowlist (the dev backend's `fetch` reaches any host from your machine;
+the runner enforces the list, so test the published page too).
+
+### Testing a published backend (agents)
+
+Specola's MCP server has tools to check a backend once it is published,
+each acting as the signed-in user with the same access rules as the app:
+
+| Tool | |
+| --- | --- |
+| `call_backend(id, method, path, body?, headers?)` | calls the current version as `specola.fetch` would; returns status, headers and up to 64 KiB of body |
+| `backend_logs(id, since?)` | the backend log: console output, errors with their `ref`, egress refusals, cron outcomes (owners and editors) |
+| `backend_query(id, sql, params?)` | one read-only SQL statement on the shared database (`ctx.db`), up to 1000 rows (owners and editors) |
+| `list_secrets(id)` | the declared secrets and whether each is set; owners set values in the UI only |
+
+A failed call answers `{"error":"backend-error","ref":"…"}`: look the `ref`
+up in `backend_logs`.
 
 ## Writing the app
 
@@ -315,6 +448,9 @@ origin.
 | backend response | 100 MiB, streamed |
 | backend request time | 30 s to the response, 5 min in all |
 | backend data (databases and files) | 1 GiB per page |
+| backend push (`ctx.publish`) | 7 KiB of JSON, 50 a second per page |
+| backend cron jobs | 10 per page, at most once a minute, 5 min per run |
+| backend public calls | 60 a minute per link and visitor, 600 per link |
 
 The backend's files under `.specola/` count toward the bundle limits.
 Paths must not contain `?`, `#`, `%`, `\` or control characters, and

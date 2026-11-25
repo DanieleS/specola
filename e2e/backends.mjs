@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // End-to-end check of page backends (docs/page-backends.md, delivery steps
-// 1 and 2): a real runner (runner/), a real Specola in front of it, and a Vite app
+// 1 to 7): a real runner (runner/), a real Specola in front of it, and a Vite app
 // with a backend (e2e/app-backend) built with the plugin and published with
 // the real specola-publish CLI, then driven in Chromium through the real
 // viewer (/#/p/<id>).
@@ -26,10 +26,33 @@
 //    restore, import or reset; a viewer downloads their own data (a real
 //    SQLite database with their rows), deletes it and then has none; version
 //    1 restored from the history with its data brings that data back.
-// 4. Purge: Specola restarted with SPECOLA_BACKEND_PURGE_AFTER_DAYS; the page
+// 4. Steps 3–7, Specola restarted with its test hooks (a 1 s cron tick and
+//    a clock a minute ahead) and the runner with its loopback allowance:
+//    - secrets: backendSecretsMissing names the declared one (owners and
+//      editors, not viewers); an editor can't set it (403) but sees the
+//      list; the owner sets it from the viewer's notice and Secrets tab;
+//      the handler has it (the test reads its length, never the value),
+//      the API never shows it and the database holds it encrypted; an
+//      undeclared secret never reaches the handler.
+//    - egress: a backend fetch reaches "localhost" (served here), a host
+//      not on the list is refused and the refusal is in the backend log.
+//    - scheduled jobs: "tick" (every minute) runs scheduled() with role
+//      cron, writes to ctx.db, and shows ok in the API and the Jobs tab.
+//    - MCP: the instructions describe backends; call_backend,
+//      backend_logs, backend_query (on the counter) and list_secrets.
+//    - push: two users in two browser contexts (on two Specolas, so through
+//      NOTIFY): a call from one publishes, the other's subscribe callback
+//      fires; a targeted push reaches only its user; a new version makes
+//      the open streams send superseded and the viewer shows its notice.
+//    - public link: /s/<token> serves the shell with its CSP; in a fresh
+//      context the page calls a public route (role public, ctx.link), a
+//      non-public one answers 403 not-public, a public topic's push
+//      arrives, a non-public topic is refused; the per-IP rate limit
+//      answers 429 with Retry-After; a revoked link stops calls.
+// 5. Purge: Specola restarted with SPECOLA_BACKEND_PURGE_AFTER_DAYS; the page
 //    archived, its archive date moved back in the database: the Archived
 //    list shows the purge date, then the purge deletes the runner's data.
-// 5. Specola restarted without the backend variables: /api/me says
+// 6. Specola restarted without the backend variables: /api/me says
 //    disabled, the MCP instructions carry the disabled sentence, a bundle
 //    with a backend is refused (CLI and server, backend-disabled), and the
 //    existing page opens with the disabled notice while its specola.fetch
@@ -42,6 +65,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer as createHTTPServer } from 'node:http';
 import { createServer } from 'node:net';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -59,6 +83,13 @@ const EDITOR = 'editor@example.com';
 const TITLE = 'E2E backend';
 const PURGE_DAYS = 30;
 const USER_HEADER = 'X-E2E-User';
+const SECRET = 'sk-e2e-' + randomBytes(16).toString('hex');
+const LINK_LABEL = 'e2e public';
+// Specola's test hooks (internal/config, dev bypass only): the cron tick
+// every second, and the scheduling clock a minute ahead, so the job "tick"
+// made due a minute from now runs at once.
+const TEST_HOOKS = { SPECOLA_TEST_CRON_EVERY: '1s', SPECOLA_TEST_CLOCK_OFFSET: '1m' };
+const SHELL_CSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src 'self'; connect-src 'self'; style-src 'unsafe-inline'";
 
 let failures = 0;
 function check(ok, what, detail) {
@@ -128,6 +159,9 @@ async function main() {
     SPECOLA_URL: app,
     RUNNER_DATA_DIR: runnerData,
     RUNNER_LISTEN: `127.0.0.1:${runnerPort}`,
+    // Lets the egress check reach the "outside" host this script serves on
+    // loopback (runner/src/egress.js; refused under NODE_ENV=production).
+    RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS: '1',
   });
   await waitFor(async () => (await fetch(`${backendEnv.SPECOLA_RUNNER_URL}/health`, { headers: { authorization: `Bearer ${token}` } })).ok, 'runner start');
 
@@ -147,6 +181,22 @@ async function main() {
   const second = await startSpecola(viewerPort, { SPECOLA_TRUSTED_USER_HEADER: USER_HEADER, ...backendEnv });
   await dataLifecycle(id);
   await stop(second);
+
+  console.log('\n== secrets, egress, scheduled jobs, MCP, push, public links');
+  await stop(server);
+  // The job is made due a minute from now in real time, its last run
+  // forgotten: only the test clock (a minute ahead) finds it due at once,
+  // and a run recorded from here on is one this phase caused.
+  sql(`UPDATE backend_cron SET next_run_at = date_trunc('minute', now()) + interval '1 minute', last_run_at = NULL, last_status = NULL, last_error = NULL, last_duration_ms = NULL WHERE asset_id = '${id}'`);
+  server = await startSpecola(port, { SPECOLA_DEV_AUTH_EMAIL: DEV_USER, ...backendEnv, ...TEST_HOOKS });
+  const third = await startSpecola(viewerPort, { SPECOLA_TRUSTED_USER_HEADER: USER_HEADER, ...backendEnv });
+  await secrets(id);
+  await egress(id);
+  await scheduledJobs(id);
+  await mcp(id);
+  await push(id);
+  await publicLink(id);
+  await stop(third);
 
   console.log('\n== purge');
   await stop(server);
@@ -609,7 +659,322 @@ async function purge(id) {
   check((await api('GET', `/api/pages/${id}`)).backendData === false, 'unarchived: the page has no backend data');
 }
 
+async function secrets(id) {
+  const meta = await api('GET', `/api/pages/${id}`);
+  check(same(meta.backendSecretsMissing, ['OPENAI_API_KEY']), 'backendSecretsMissing names the declared secret', meta.backendSecretsMissing);
+  const edMeta = await (await as(EDITOR, `/api/pages/${id}`)).json();
+  check(same(edMeta.backendSecretsMissing, ['OPENAI_API_KEY']), 'an editor sees it too', edMeta.backendSecretsMissing);
+  const viewerMeta = await (await as(VIEWER, `/api/pages/${id}`)).json();
+  check(viewerMeta.backendSecretsMissing === undefined, 'a viewer does not', viewerMeta.backendSecretsMissing);
+  const none = (await x(id, '/api/secret')).json;
+  check(none?.has === false && same(none.names, []), 'the handler has no secret yet', none);
+
+  // Editors read the list, set nothing; viewers neither.
+  const edList = await as(EDITOR, `/api/pages/${id}/secrets`);
+  const edBody = await edList.json().catch(() => null);
+  check(edList.status === 200 && same(edBody?.secrets, [{ name: 'OPENAI_API_KEY', declared: true, set: false }]), 'an editor lists the secrets: declared, not set', edBody);
+  const edPut = await as(EDITOR, `/api/pages/${id}/secrets/OPENAI_API_KEY`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: 'editor value' }) });
+  check(edPut.status === 403 && edPut.headers.get('x-specola-error') === 'forbidden', 'an editor gets 403 forbidden setting a secret', edPut.status);
+  const vList = await as(VIEWER, `/api/pages/${id}/secrets`);
+  check(vList.status === 403, 'a viewer gets 403 on the secrets list', vList.status);
+
+  // The owner sets it from the viewer, at phone width: the notice opens the
+  // Secrets tab.
+  const ctx = await browser.newContext({ viewport: { width: 375, height: 800 } });
+  const errors = [];
+  ctx.on('weberror', (e) => errors.push(String(e.error())));
+  try {
+    const page = await ctx.newPage();
+    await page.goto(`${app}/#/p/${id}`);
+    await ready(await pageFrame(page, id));
+    const notice = page.locator('[data-secrets-missing]');
+    await notice.waitFor({ timeout: 10000 }).catch(() => {});
+    check(await notice.isVisible(), 'the viewer shows the missing-secret notice');
+    const fits = () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
+    check(await fits(), 'at 375 px, with the notice, the viewer does not scroll sideways');
+    await notice.click();
+    const panel = page.locator('[data-backend-secrets]');
+    const row = panel.locator('[data-secret="OPENAI_API_KEY"]');
+    await row.waitFor();
+    check((await row.getAttribute('data-set')) === 'false', 'the Secrets tab lists it as not set');
+    await row.getByRole('button', { name: 'Set OPENAI_API_KEY' }).click();
+    await panel.getByLabel('Secret value').fill(SECRET);
+    await panel.locator('[data-secret-form] button[type=submit]').click();
+    const set = await waitFor(async () => (await row.getAttribute('data-set')) === 'true', 'the secret set', 10000).catch(() => false);
+    check(set, 'the owner set it from the Secrets tab');
+    check(await fits(), 'nor with the Secrets tab open');
+    check(!(await page.content()).includes(SECRET), 'the value is not left in the viewer');
+    const gone = await waitFor(async () => !(await notice.count()), 'the notice to go', 10000).catch(() => false);
+    check(gone, 'the notice goes once the secret is set');
+    check(errors.length === 0, 'no uncaught errors in the viewer', errors);
+  } finally {
+    await ctx.close();
+  }
+
+  const after = await api('GET', `/api/pages/${id}`);
+  check(same(after.backendSecretsMissing, []), 'backendSecretsMissing is empty once set', after.backendSecretsMissing);
+  const list = await api('GET', `/api/pages/${id}/secrets`);
+  const info = list.secrets?.[0];
+  check(list.secrets?.length === 1 && info.set === true && info.declared === true && info.updatedBy === DEV_USER && !!info.updatedAt, 'GET …/secrets: set, by whom and when', list);
+  check(!JSON.stringify(list).includes(SECRET) && !JSON.stringify(after).includes(SECRET), 'the API never shows the value');
+  const stored = sql(`SELECT count(*) FROM page_secret WHERE asset_id = '${id}' AND name = 'OPENAI_API_KEY' AND position(convert_to('${SECRET}', 'UTF8') in ciphertext) = 0 AND length(nonce) = 12`);
+  check(stored === '1', 'the database holds it encrypted, with a 12-byte nonce', stored);
+  const has = (await x(id, '/api/secret')).json;
+  check(has?.has === true && has.length === SECRET.length && same(has.names, ['OPENAI_API_KEY']) && has.frozen === true, 'the handler has the secret (ctx.secrets, frozen)', has);
+
+  // A name the version does not declare: set, listed, never passed.
+  await api('PUT', `/api/pages/${id}/secrets/UNDECLARED`, { value: 'x' });
+  const both = await api('GET', `/api/pages/${id}/secrets`);
+  check(same(both.secrets.map((s) => [s.name, s.declared, s.set]), [['OPENAI_API_KEY', true, true], ['UNDECLARED', false, true]]), 'an undeclared secret is listed, not declared', both.secrets);
+  check(same((await x(id, '/api/secret')).json?.names, ['OPENAI_API_KEY']), 'and never reaches the handler');
+  const bad = await raw('PUT', `/api/pages/${id}/secrets/not-a-name!`, { headers: { 'Content-Type': 'application/json' }, body: '{"value":"x"}' });
+  check(bad.status === 400 && bad.headers.get('x-specola-error') === 'bad-request', 'an invalid name: 400 bad-request', bad.status);
+  await api('DELETE', `/api/pages/${id}/secrets/UNDECLARED`);
+  check((await raw('DELETE', `/api/pages/${id}/secrets/UNDECLARED`)).status === 204, 'deleting an unset secret answers 204');
+}
+
+async function egress(id) {
+  const seen = [];
+  const outside = createHTTPServer((req, res) => {
+    seen.push(req.url);
+    res.end(`hello from outside ${req.url}`);
+  });
+  await new Promise((r) => outside.listen(0, '127.0.0.1', r));
+  const p = outside.address().port;
+  try {
+    const ok = await x(id, `/api/egress?url=${encodeURIComponent(`http://localhost:${p}/hi`)}`);
+    check(ok.json?.ok === true && ok.json.status === 200 && ok.json.text === 'hello from outside /hi' && seen.includes('/hi'), 'a backend fetch reaches a host on its egress list', ok.json);
+    const refused = await x(id, `/api/egress?url=${encodeURIComponent(`http://refused.example:${p}/no`)}`);
+    check(refused.json && (refused.json.ok === false || refused.json.status === 403) && !seen.includes('/no'), 'a host not on the list is refused', refused.json);
+    const line = `egress refused: refused.example:${p} (not in the backend's egress list)`;
+    const logs = await api('GET', `/api/pages/${id}/backend/logs`);
+    check(logs.lines?.some((l) => l.level === 'warn' && l.text === line), 'the refusal is in the backend log', logs.lines?.slice(-5));
+  } finally {
+    await new Promise((r) => outside.close(r));
+  }
+}
+
+async function scheduledJobs(id) {
+  const job = await waitFor(async () => {
+    const j = (await api('GET', `/api/pages/${id}/backend/cron`)).jobs?.find((j) => j.name === 'tick');
+    return j?.lastStatus && j;
+  }, 'the job "tick" to run', 30000).catch(() => null);
+  check(job?.lastStatus === 'ok' && job.schedule === '* * * * *' && typeof job.lastDurationMs === 'number' && job.lastError === undefined, 'the job "tick" ran: ok', job);
+  check(job && Date.parse(job.nextRunAt) > Date.parse(job.lastRunAt) && new Date(job.nextRunAt).getUTCSeconds() === 0, 'its next run is the next minute', job);
+  const runs = (await x(id, '/api/runs')).json?.runs ?? [];
+  const last = runs.at(-1);
+  check(last?.name === 'tick' && last.role === 'cron' && last.hasUser === 0 && last.scheduledTime % 60000 === 0, 'scheduled() ran with role cron and no user, and wrote to ctx.db', last);
+  const ed = await as(EDITOR, `/api/pages/${id}/backend/cron`);
+  check(ed.status === 200, 'an editor lists the jobs', ed.status);
+  check((await as(VIEWER, `/api/pages/${id}/backend/cron`)).status === 403, 'a viewer gets 403 on the jobs');
+
+  const ctx = await browser.newContext();
+  try {
+    const page = await ctx.newPage();
+    await page.goto(`${app}/#/p/${id}`);
+    await ready(await pageFrame(page, id));
+    await page.getByRole('button', { name: 'Backend', exact: true }).click();
+    await page.locator('[data-backend-panel]').getByRole('tab', { name: 'Jobs' }).click();
+    const row = page.locator('[data-backend-jobs] [data-job="tick"]');
+    await row.waitFor({ timeout: 10000 }).catch(() => {});
+    check((await row.getAttribute('data-status').catch(() => null)) === 'ok', 'the Jobs tab shows "tick" with status ok');
+    check(/\* \* \* \* \*/.test((await row.textContent().catch(() => '')) ?? ''), 'with its schedule');
+  } finally {
+    await ctx.close();
+  }
+}
+
+async function mcp(id) {
+  const init = await mcpRequest('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
+  const instructions = init?.instructions ?? '';
+  check(['call_backend', 'backend_logs', 'backend_query', 'list_secrets', 'publish(topic', 'subscribe', 'egress', 'scheduled', 'public'].every((w) => instructions.includes(w)), 'the MCP instructions describe backends and the testing tools', instructions.slice(0, 200));
+  const tools = (await mcpRequest('tools/list', {}))?.tools?.map((t) => t.name) ?? [];
+  check(['call_backend', 'backend_logs', 'backend_query', 'list_secrets'].every((t) => tools.includes(t)), 'the four backend tools are listed', tools);
+
+  const count = (await x(id, '/api/counter')).json.count;
+  const called = await mcpTool('call_backend', { id, method: 'GET', path: '/api/counter' });
+  const body = called.data?.body && JSON.parse(called.data.body);
+  check(!called.isError && called.data.status === 200 && called.data.body_encoding === 'utf-8' && called.data.truncated === false && body?.count === count, 'call_backend calls the current version as the user', called.data);
+  const thrown = await mcpTool('call_backend', { id, path: '/api/throw' });
+  check(thrown.data?.status === 500 && thrown.data.headers?.['x-specola-error'] === 'backend-error', 'call_backend relays an error answer', thrown.data);
+
+  const logs = await mcpTool('backend_logs', { id });
+  const ref = thrown.data?.body && JSON.parse(thrown.data.body).ref;
+  check(!logs.isError && logs.data?.lines?.some((l) => l.ref === ref && l.text.includes('e2e boom')), 'backend_logs has the error under its ref', logs.data?.lines?.length);
+
+  const q = await mcpTool('backend_query', { id, sql: 'SELECT n FROM counter WHERE id = ?', params: [1] });
+  check(!q.isError && same(q.data?.columns, ['n']) && Number(q.data.rows?.[0]?.[0]) === count && q.data.truncated === false, 'backend_query reads the counter table', q.data);
+  const write = await mcpTool('backend_query', { id, sql: 'UPDATE counter SET n = 0' });
+  check(write.isError && (await x(id, '/api/counter')).json.count === count, 'backend_query refuses a write', write.text);
+
+  const sec = await mcpTool('list_secrets', { id });
+  check(!sec.isError && sec.data?.secrets?.some((s) => s.name === 'OPENAI_API_KEY' && s.set) && same(sec.data.missing ?? [], []) && /owner/i.test(sec.data.note ?? ''), 'list_secrets: names, set, none missing, owners set them in the UI', sec.data);
+  check(!JSON.stringify(sec).includes(SECRET), 'list_secrets never shows a value');
+  const page = await mcpTool('get_page', { id });
+  check(page.data?.backend?.manifest?.cron?.[0]?.name === 'tick' && same(page.data.backend.secrets_missing, []), 'get_page carries backend: {manifest, secrets_missing}', page.data?.backend);
+}
+
+async function push(id) {
+  const ctxA = await browser.newContext();
+  const ctxB = await browser.newContext();
+  // The viewer's identity goes in at the network layer (see viewerData).
+  await ctxB.route((url) => url.origin === viewerApp, (route) => route.continue({ headers: { ...route.request().headers(), [USER_HEADER.toLowerCase()]: VIEWER } }));
+  try {
+    const pageA = await ctxA.newPage();
+    await pageA.goto(`${app}/#/p/${id}`);
+    const frameA = await pageFrame(pageA, id);
+    await ready(frameA);
+    const pageB = await ctxB.newPage();
+    await pageB.goto(`${viewerApp}/#/p/${id}`);
+    const frameB = await pageFrame(pageB, id);
+    await ready(frameB);
+    const listen = (f) => f.evaluate(() => {
+      window.__got = [];
+      window.__unsub = window.specola.subscribe('chat', (data, topic) => window.__got.push({ topic, data }));
+    });
+    await listen(frameA);
+    await listen(frameB);
+    const got = (f) => f.evaluate(() => window.__got);
+    const send = (body) => call(frameA, '/api/publish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+    // Streams open on their own time and push has no replay: publish until
+    // both have heard one.
+    let n = 0;
+    const heard = await waitFor(async () => {
+      await send({ topic: 'chat', data: { hello: 'from the owner', n: ++n } });
+      await sleep(300);
+      return (await got(frameA)).length > 0 && (await got(frameB)).length > 0;
+    }, 'both subscribers to hear a push', 20000).catch(() => false);
+    const b = await got(frameB);
+    check(heard && b[0]?.topic === 'chat' && b[0].data?.hello === 'from the owner', "the owner's call publishes and the viewer's subscribe callback fires (another Specola)", b);
+
+    // Targeted pushes, then a broadcast that marks the end.
+    await frameA.evaluate(() => (window.__got = []));
+    await frameB.evaluate(() => (window.__got = []));
+    await send({ topic: 'chat', data: { for: 'viewer' }, to: VIEWER });
+    await send({ topic: 'chat', data: { for: 'owner' }, to: DEV_USER });
+    await send({ topic: 'chat', data: { end: true } });
+    const ended = await waitFor(async () => (await got(frameA)).some((m) => m.data.end) && (await got(frameB)).some((m) => m.data.end), 'the end marker', 10000).catch(() => false);
+    const a = (await got(frameA)).map((m) => m.data);
+    const v = (await got(frameB)).map((m) => m.data);
+    check(ended && same(a, [{ for: 'owner' }, { end: true }]) && same(v, [{ for: 'viewer' }, { end: true }]), 'a targeted push reaches only its user', { owner: a, viewer: v });
+
+    // Unsubscribed: nothing more arrives.
+    await frameB.evaluate(() => {
+      window.__unsub();
+      window.__got = [];
+    });
+    await send({ topic: 'chat', data: { after: 'unsubscribe' } });
+    await waitFor(async () => (await got(frameA)).some((m) => m.data.after), 'the owner to hear it', 10000).catch(() => {});
+    await sleep(500);
+    check((await got(frameB)).length === 0, 'after unsubscribe() the callback stays quiet');
+
+    // A new version: the open streams send superseded, the viewer notices.
+    const up = await api('POST', '/api/bundle-uploads', { kind: 'version', id, note: 'push superseded' });
+    const published = publish(up.uploadUrl);
+    check(published.ok, 'a new version published', published);
+    const noticed = await waitFor(() => pageA.locator('[data-superseded]').isVisible(), 'the reload notice', 30000).catch(() => false);
+    check(noticed, 'the stream says superseded and the viewer shows its reload notice');
+  } finally {
+    await ctxA.close();
+    await ctxB.close();
+  }
+}
+
+async function publicLink(id) {
+  const link = await api('POST', `/api/pages/${id}/links`, { label: LINK_LABEL });
+  const tok = link.url.split('/s/')[1];
+  const shell = await fetch(link.url);
+  const html = await shell.text();
+  check(
+    shell.status === 200 && shell.headers.get('content-security-policy') === SHELL_CSP && /no-store/.test(shell.headers.get('cache-control')) && shell.headers.get('referrer-policy') === 'no-referrer' && /noindex/.test(shell.headers.get('x-robots-tag')) && !html.includes('SPECOLA_SHELL_BOOT'),
+    '/s/<token> serves the shell, with its CSP and headers',
+    Object.fromEntries(shell.headers),
+  );
+  const { version } = await api('GET', `/api/pages/${id}`);
+  const before = (await x(id, '/api/counter')).json.count;
+
+  const ctx = await browser.newContext();
+  const errors = [];
+  ctx.on('weberror', (e) => errors.push(String(e.error())));
+  try {
+    const page = await ctx.newPage();
+    await page.goto(link.url);
+    const f = await waitFor(() => page.frames().find((fr) => fr.url().includes(`/s/${tok}/~page`)), 'the shell to frame the page');
+    await f.waitForFunction(() => window.specola?.backend?.available, null, { timeout: 20000 });
+    const hello = await call(f, '/api/public/hello');
+    check(hello.status === 200 && hello.json?.role === 'public' && hello.json.user === null && hello.json.userDb === true && hello.json.link?.id === link.id && hello.json.link.label === LINK_LABEL, 'a public route answers, with role public and ctx.link', hello);
+    const closed = await call(f, '/api/counter', { method: 'POST' });
+    check(closed.status === 403 && closed.headers['x-specola-error'] === 'not-public', 'a route that is not public answers 403 not-public', closed);
+    check((await x(id, '/api/counter')).json.count === before, 'without reaching the backend');
+
+    await f.evaluate(() => {
+      window.__got = [];
+      window.specola.subscribe('news', (data, topic) => window.__got.push({ topic, data }));
+    });
+    let n = 0;
+    const heard = await waitFor(async () => {
+      await x(id, '/api/publish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic: 'news', data: { n: ++n } }) });
+      await sleep(300);
+      return (await f.evaluate(() => window.__got.length)) > 0;
+    }, 'the public topic', 20000).catch(() => false);
+    check(heard, 'a push on a public topic reaches the public page');
+    check(errors.length === 0, 'no uncaught errors in the shell or the page', errors);
+  } finally {
+    await ctx.close();
+  }
+  const topic = await fetch(`${app}/p/${tok}/events?v=${version}&topic=chat`);
+  check(topic.status === 403 && topic.headers.get('x-specola-error') === 'not-public', 'a topic that is not public: 403 not-public', topic.status);
+
+  // The rate limit per link and client IP (60 a minute).
+  let res;
+  for (let i = 0; i < 70; i++) {
+    res = await fetch(`${app}/p/${tok}/x/api/public/hello`, { headers: { 'X-Specola-Version': String(version) } });
+    if (res.status === 429) break;
+    await res.arrayBuffer();
+  }
+  check(res.status === 429 && res.headers.get('x-specola-error') === 'too-many-requests' && Number(res.headers.get('retry-after')) > 0, 'public calls are rate limited: 429 with Retry-After', { status: res.status, retryAfter: res.headers.get('retry-after') });
+
+  await api('DELETE', `/api/pages/${id}/links/${link.id}`);
+  const revoked = await fetch(`${app}/p/${tok}/x/api/public/hello`, { headers: { 'X-Specola-Version': String(version) } });
+  check(revoked.status === 404, 'a revoked link stops calls at once', revoked.status);
+}
+
 // ---- helpers
+
+// mcpRequest sends one JSON-RPC request to the MCP endpoint (stateless,
+// JSON answers) as the dev user, and returns its result.
+async function mcpRequest(method, params) {
+  const res = await fetch(`${app}/mcp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: randomBytes(4).readUInt32BE(), method, params }),
+  });
+  const body = await res.json();
+  if (body.error) throw new Error(`MCP ${method}: ${JSON.stringify(body.error)}`);
+  return body.result;
+}
+
+// mcpTool calls a tool and returns its structured result (or its text).
+async function mcpTool(name, args) {
+  const r = await mcpRequest('tools/call', { name, arguments: args });
+  const text = r.content?.map((c) => c.text).join('') ?? '';
+  let data = r.structuredContent;
+  if (data === undefined) {
+    try {
+      data = JSON.parse(text);
+    } catch {}
+  }
+  return { isError: !!r.isError, data, text };
+}
+
+function same(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 // x calls the page's backend as the dev user, on the current version.
 async function x(id, path, init = {}) {

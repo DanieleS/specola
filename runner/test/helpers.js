@@ -27,13 +27,43 @@ export function backend(source, extra = {}) {
   return makeCode({ 'backend.json': JSON.stringify({ version: 1, entry: 'server/index.mjs' }), 'server/index.mjs': source, ...extra });
 }
 
-/** A fake specola: GET /internal/runner/code/{versionId}. */
+/** A backend whose backend.json has `manifest`'s fields too (secrets, egress, …). */
+export function backendWith(manifest, source) {
+  return makeCode({ 'backend.json': JSON.stringify({ version: 1, entry: 'server/index.mjs', ...manifest }), 'server/index.mjs': source });
+}
+
+/**
+ * A fake specola: GET /internal/runner/code/{versionId}, and POST
+ * /internal/runner/publish, which records each push (pushes) and answers
+ * the statuses queued in publishStatus first, 204 after.
+ */
 export async function fakeSpecola() {
   const versions = new Map();
   const hits = [];
+  const pushes = [];
+  const publishStatus = [];
   const state = { delayMs: 30 };
   const server = http.createServer((req, res) => {
     hits.push({ url: req.url, auth: req.headers.authorization });
+    if (req.url === '/internal/runner/publish' && req.method === 'POST') {
+      const parts = [];
+      req.on('data', (c) => parts.push(c));
+      req.on('end', () => {
+        if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+          res.writeHead(404).end();
+          return;
+        }
+        const status = publishStatus.length ? publishStatus.shift() : 204;
+        const raw = Buffer.concat(parts).toString('utf8');
+        pushes.push({ status, type: req.headers['content-type'], raw, body: JSON.parse(raw) });
+        if (status === 204) {
+          res.writeHead(204).end();
+        } else {
+          res.writeHead(status, { 'content-type': 'application/json', 'x-specola-error': 'body-too-large' }).end(JSON.stringify({ error: 'body-too-large', message: 'refused by the test' }));
+        }
+      });
+      return;
+    }
     const m = /^\/internal\/runner\/code\/([^/]+)$/.exec(req.url);
     if (req.headers.authorization !== `Bearer ${TOKEN}` || !m) {
       res.writeHead(404).end();
@@ -54,6 +84,8 @@ export async function fakeSpecola() {
     url: `http://127.0.0.1:${server.address().port}`,
     versions,
     hits,
+    pushes,
+    publishStatus,
     /** How long code downloads take. */
     set delayMs(ms) {
       state.delayMs = ms;
@@ -64,7 +96,8 @@ export async function fakeSpecola() {
 
 /**
  * A runner on a random port. opts.now is its snapshot clock (a function),
- * for tests that move time.
+ * for tests that move time; opts.egress and opts.publish go to
+ * createRunner (the egress proxy's test seams, the publisher's timings).
  */
 export async function startRunner(limits = {}, opts = {}) {
   const specola = await fakeSpecola();
@@ -76,7 +109,7 @@ export async function startRunner(limits = {}, opts = {}) {
     dataDir,
     limits: { ...DEFAULT_LIMITS, ...limits },
   };
-  const runner = createRunner(config, { now: opts.now });
+  const runner = createRunner(config, { now: opts.now, egress: opts.egress, publish: opts.publish });
   const addr = await runner.listen(0, '127.0.0.1');
   const url = `http://127.0.0.1:${addr.port}`;
   let nextVersion = 1;
@@ -94,6 +127,9 @@ export async function startRunner(limits = {}, opts = {}) {
     invoke(o) {
       return invoke(url, o);
     },
+    scheduled(o) {
+      return scheduled(url, o);
+    },
     logs: (page, since = 0) => getJSON(`${url}/logs?page=${page}&since=${since}`),
     /** Calls a /pages/… route: {status, headers, body (parsed JSON, or the bytes)}. */
     api(method, p, o = {}) {
@@ -109,7 +145,7 @@ export async function startRunner(limits = {}, opts = {}) {
 
 /**
  * POSTs an /invoke. o: {page, version, versionId, codeHash, method, path,
- * headers, body, user, role, signal}.
+ * headers, body, user, role, secrets, egress, signal}.
  */
 export function invoke(url, o) {
   const head = {
@@ -119,8 +155,8 @@ export function invoke(url, o) {
     user: o.user === undefined ? { sub: 'user-1', email: 'u1@example.com', name: 'User One' } : o.user,
     role: o.role ?? 'owner',
     link: null,
-    secrets: {},
-    egress: [],
+    secrets: o.secrets ?? {},
+    egress: o.egress ?? [],
     request: { method: o.method ?? 'GET', path: o.path ?? '/', headers: o.headers ?? [] },
   };
   return fetch(`${url}/invoke`, {
@@ -132,6 +168,32 @@ export function invoke(url, o) {
     body: o.body,
     duplex: 'half',
     signal: o.signal,
+  });
+}
+
+/**
+ * POSTs a /scheduled. o: {page, version, versionId, codeHash, name,
+ * scheduledTime, secrets, egress, head (fields to override)}.
+ */
+export function scheduled(url, o) {
+  const head = {
+    page: { id: o.page ?? 'page-1', version: o.version ?? 1, title: o.title ?? 'Test page' },
+    versionId: o.versionId,
+    codeHash: o.codeHash,
+    user: null,
+    role: 'cron',
+    link: null,
+    secrets: o.secrets ?? {},
+    egress: o.egress ?? [],
+    event: { name: o.name ?? 'nightly', scheduledTime: o.scheduledTime ?? 1_700_000_000_000 },
+    ...(o.head ?? {}),
+  };
+  return fetch(`${url}/scheduled`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      'x-specola-invoke': Buffer.from(JSON.stringify(head)).toString('base64url'),
+    },
   });
 }
 

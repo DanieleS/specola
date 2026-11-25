@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -11,12 +12,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/danieles/specola/internal/auth"
 	"github.com/danieles/specola/internal/backend"
 	"github.com/danieles/specola/internal/store"
 
@@ -29,9 +32,9 @@ import (
 // runner, which runs the page's code, and streams the answer back. The
 // runner fetches the code from /internal/runner/code/{versionId}.
 //
-// Not in this step: secrets (always {}), the egress proxy (a backend's
-// outbound fetch is unrestricted until the runner gets it), push, cron and
-// the public-link shell.
+// Every /invoke and /scheduled head carries the page's declared secrets
+// that are set and its egress allowlist (backendSecretsAndEgress). Push is
+// in push.go, the public-link shell and its calls in publicshell.go.
 
 const (
 	// maxBackendBody bounds a call's request body.
@@ -104,15 +107,19 @@ func backendAccessError(w http.ResponseWriter, err error) {
 	}
 }
 
-// isBackendCall reports whether a request path is a backend call, which is
-// streamed through as it comes and so never compressed.
+// isBackendCall reports whether a request path is a backend call or a push
+// stream, which are streamed through as they come and so never compressed:
+// /api/pages/{id}/x…, /api/pages/{id}/events, and their public-link
+// counterparts /p/{token}/x… and /p/{token}/events.
 func isBackendCall(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/api/pages/")
 	if !ok {
-		return false
+		if rest, ok = strings.CutPrefix(p, "/p/"); !ok {
+			return false
+		}
 	}
 	_, rest, ok = strings.Cut(rest, "/")
-	return ok && (rest == "x" || strings.HasPrefix(rest, "x/"))
+	return ok && (rest == "x" || strings.HasPrefix(rest, "x/") || rest == "events")
 }
 
 // callLimiter counts the calls running per key.
@@ -254,9 +261,8 @@ func (b *limitedBody) Read(p []byte) (int, error) {
 // can't call a backend with the user's cookie.
 func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 	ctx, sub, id := r.Context(), subOf(r.Context()), chi.URLParam(r, "id")
-	version, err := strconv.Atoi(r.Header.Get("X-Specola-Version"))
-	if err != nil || version < 1 {
-		backendError(w, http.StatusBadRequest, "bad-request", "X-Specola-Version must name the version the page shows")
+	version, ok := callVersion(w, r)
+	if !ok {
 		return
 	}
 	t, err := s.st.BackendTarget(ctx, sub, id)
@@ -264,12 +270,95 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 		backendAccessError(w, err)
 		return
 	}
-	if version != t.Version {
-		backendError(w, http.StatusConflict, "superseded", fmt.Sprintf("a new version of this page is available (version %d): reload it", t.Version))
+	user := t.User
+	s.callBackend(w, r, backendCall{
+		page:      backend.Page{ID: t.ID, Version: t.Version, Title: t.Title},
+		versionID: t.VersionID,
+		codeHash:  t.CodeHash,
+		manifest:  t.Manifest,
+		shown:     version,
+		user:      &user,
+		role:      t.Role.String(),
+		// t.ID, not id: one page, whatever spelling of its uuid the URL used.
+		limitKey: sub + "\x00" + t.ID,
+		path:     strings.TrimPrefix(r.URL.EscapedPath(), "/api/pages/"+id+"/x"),
+	})
+}
+
+// callVersion reads X-Specola-Version, the version the frame shows, which a
+// call must carry; it answers 400 and returns false when it doesn't.
+func callVersion(w http.ResponseWriter, r *http.Request) (int, bool) {
+	version, err := strconv.Atoi(r.Header.Get("X-Specola-Version"))
+	if err != nil || version < 1 {
+		backendError(w, http.StatusBadRequest, "bad-request", "X-Specola-Version must name the version the page shows")
+		return 0, false
+	}
+	return version, true
+}
+
+// backendCall is one call to a page's backend, its caller already
+// authorised: by the session (handleBackendCall) or a public link
+// (handlePublicCall).
+type backendCall struct {
+	page      backend.Page // the current version
+	versionID string
+	codeHash  string
+	manifest  *backend.Manifest // nil: the current version has no backend
+	// shown is the version the frame shows (X-Specola-Version).
+	shown int
+	user  *backend.User
+	role  string
+	link  *backend.Link
+	// limitKey counts the calls running for one caller on one page.
+	limitKey string
+	// path is the escaped path below …/x the page asked for, without the
+	// query.
+	path string
+	// allowed, when set, is asked once the version is known to be current
+	// and to have a backend, before anything is sent to the runner; it
+	// answers and returns false to stop the call there.
+	allowed func(w http.ResponseWriter) bool
+}
+
+// backendSecretsAndEgress are what an /invoke or /scheduled head carries
+// for a page's current version, whose manifest is given: its declared
+// secrets that are set, decrypted, and its egress allowlist. Both are never
+// nil, so the head always has them.
+func (s *Server) backendSecretsAndEgress(ctx context.Context, pageID string, manifest backend.Manifest) (map[string]string, []string, error) {
+	egress := manifest.Egress
+	if egress == nil {
+		egress = []string{}
+	}
+	secrets := map[string]string{}
+	if len(manifest.Secrets) == 0 {
+		// Nothing declared: nothing to read.
+		return secrets, egress, nil
+	}
+	values, err := s.st.PageSecretValues(ctx, pageID, manifest.Secrets, s.cfg.SecretsKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, name := range manifest.Secrets {
+		if v, ok := values[name]; ok {
+			secrets[name] = v
+		}
+	}
+	return secrets, egress, nil
+}
+
+// callBackend checks a call against the current version, the runner and
+// the limits, then forwards it to the runner and streams the answer back.
+func (s *Server) callBackend(w http.ResponseWriter, r *http.Request, c backendCall) {
+	ctx := r.Context()
+	if c.shown != c.page.Version {
+		backendError(w, http.StatusConflict, "superseded", fmt.Sprintf("a new version of this page is available (version %d): reload it", c.page.Version))
 		return
 	}
-	if t.Manifest == nil {
+	if c.manifest == nil {
 		backendError(w, http.StatusNotFound, "no-backend", "this version of the page has no backend")
+		return
+	}
+	if c.allowed != nil && !c.allowed(w) {
 		return
 	}
 	if s.runner == nil {
@@ -289,32 +378,35 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 		backendError(w, http.StatusBadRequest, "bad-request", err.Error())
 		return
 	}
-	// t.ID, not id: one page, whatever spelling of its uuid the URL used.
-	key := sub + "\x00" + t.ID
-	if !s.calls.acquire(key, maxCallsPerUserPage) {
+	if !s.calls.acquire(c.limitKey, maxCallsPerUserPage) {
 		backendError(w, http.StatusTooManyRequests, "too-many-requests",
 			fmt.Sprintf("at most %d requests to this page's backend can run at once", maxCallsPerUserPage))
 		return
 	}
-	defer s.calls.release(key)
+	defer s.calls.release(c.limitKey)
 
-	path := strings.TrimPrefix(r.URL.EscapedPath(), "/api/pages/"+id+"/x")
+	path := c.path
 	if path == "" {
 		path = "/"
 	}
 	if r.URL.RawQuery != "" {
 		path += "?" + r.URL.RawQuery
 	}
+	secrets, egress, err := s.backendSecretsAndEgress(ctx, c.page.ID, *c.manifest)
+	if err != nil {
+		backendAccessError(w, err)
+		return
+	}
 	head, err := backend.EncodeInvoke(&backend.Invoke{
-		Page:      backend.Page{ID: t.ID, Version: t.Version, Title: t.Title},
-		VersionID: t.VersionID,
-		CodeHash:  t.CodeHash,
-		User:      &t.User,
-		Role:      t.Role.String(),
-		// Secrets come in a later step; until then a backend gets none.
-		Secrets: map[string]string{},
-		Egress:  t.Manifest.Egress,
-		Request: backend.Request{Method: r.Method, Path: path, Headers: headers},
+		Page:      c.page,
+		VersionID: c.versionID,
+		CodeHash:  c.codeHash,
+		User:      c.user,
+		Role:      c.role,
+		Link:      c.link,
+		Secrets:   secrets,
+		Egress:    egress,
+		Request:   backend.Request{Method: r.Method, Path: path, Headers: headers},
 	})
 	if err != nil {
 		backendAccessError(w, err)
@@ -350,7 +442,7 @@ func (s *Server) handleBackendCall(w http.ResponseWriter, r *http.Request) {
 	// runner, or may have from now on. specola's and the runner's own
 	// errors don't count.
 	if res.Header.Get("X-Specola-Error") == "" {
-		s.markBackendUsed(ctx, t.ID)
+		s.markBackendUsed(ctx, c.page.ID)
 	}
 	relayResponse(w, res)
 }
@@ -503,4 +595,132 @@ func writeSuperseded(w http.ResponseWriter, ancestors, pageURL string) {
 	_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><title>Version not available</title>`+
 		`<style>body{font:15px/1.5 system-ui,sans-serif;margin:2rem;color:#333}</style>`+
 		`<p>This page has a backend: only its current version can be opened.`+link+`</p>`)
+}
+
+// CallBackendAs calls the current version of a page's backend as sub,
+// exactly as the viewer's /api/pages/{id}/x{path} would for that user
+// (access, version, limits, the page's header rules) and returns the
+// answer, the handler's or specola's own error (X-Specola-Error, JSON). It
+// is for MCP's call_backend. path starts with / and may carry a query;
+// headers are the page's own. The body streams; the caller closes it. A
+// page sub can't see is the store's error (store.ErrNotFound,
+// store.ErrForbidden), as BackendTarget returns it; everything after that
+// is a response.
+func (s *Server) CallBackendAs(ctx context.Context, sub, pageID, method, path string, headers [][2]string, body []byte) (*http.Response, error) {
+	if !strings.HasPrefix(path, "/") {
+		return nil, errors.New("path must start with /")
+	}
+	t, err := s.st.BackendTarget(ctx, sub, pageID)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse("/api/pages/" + url.PathEscape(pageID) + "/x" + path)
+	if err != nil {
+		return nil, fmt.Errorf("bad path: %w", err)
+	}
+	if headers == nil {
+		headers = [][2]string{}
+	}
+	listed, _ := json.Marshal(headers)
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", pageID)
+	ctx = context.WithValue(context.WithValue(ctx, identityKey, auth.Identity{Sub: sub}), chi.RouteCtxKey, rctx)
+	// The call ends with ctx, or when the caller closes the body.
+	ctx, cancel := context.WithCancel(ctx)
+	req := (&http.Request{
+		Method: strings.ToUpper(method), URL: u, RequestURI: u.RequestURI(),
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header: http.Header{}, Body: http.NoBody, Host: "specola.invalid",
+		RemoteAddr: "127.0.0.1:0",
+	}).WithContext(ctx)
+	if len(body) > 0 {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+	}
+	for _, kv := range headers {
+		req.Header.Add(kv[0], kv[1])
+	}
+	req.Header.Set(pageHeadersHeader, base64.RawURLEncoding.EncodeToString(listed))
+	req.Header.Set("X-Specola-Version", strconv.Itoa(t.Version))
+
+	pw := newPipeWriter(cancel)
+	go func() {
+		defer func() {
+			// relayResponse aborts with http.ErrAbortHandler when the runner
+			// stops mid-answer: the caller sees a truncated body as an
+			// error, as the viewer's fetch would.
+			if p := recover(); p != nil {
+				pw.finish(fmt.Errorf("backend answer cut short: %v", p))
+				return
+			}
+			pw.finish(nil)
+		}()
+		s.handleBackendCall(pw, req)
+	}()
+	select {
+	case <-pw.ready:
+		return pw.res, nil
+	case <-ctx.Done():
+		// Nobody will read the answer: let the handler's writes fail.
+		_ = pw.pr.CloseWithError(ctx.Err())
+		return nil, ctx.Err()
+	}
+}
+
+// pipeWriter is an http.ResponseWriter whose answer is read as an
+// *http.Response while the handler writes it, for CallBackendAs.
+type pipeWriter struct {
+	header http.Header
+	res    *http.Response
+	pr     *io.PipeReader
+	pw     *io.PipeWriter
+	once   sync.Once
+	ready  chan struct{}
+}
+
+func newPipeWriter(cancel context.CancelFunc) *pipeWriter {
+	pr, pw := io.Pipe()
+	return &pipeWriter{header: http.Header{}, pr: pr, pw: pw, ready: make(chan struct{}),
+		res: &http.Response{Body: &cancelOnClose{ReadCloser: pr, cancel: cancel}, ContentLength: -1,
+			Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1}}
+}
+
+func (p *pipeWriter) Header() http.Header { return p.header }
+
+func (p *pipeWriter) WriteHeader(status int) {
+	p.once.Do(func() {
+		p.res.StatusCode = status
+		p.res.Status = fmt.Sprintf("%d %s", status, http.StatusText(status))
+		p.res.Header = p.header.Clone()
+		if n, err := strconv.ParseInt(p.header.Get("Content-Length"), 10, 64); err == nil {
+			p.res.ContentLength = n
+		}
+		close(p.ready)
+	})
+}
+
+func (p *pipeWriter) Write(b []byte) (int, error) {
+	p.WriteHeader(http.StatusOK)
+	return p.pw.Write(b)
+}
+
+// Flush is a no-op: every Write already reaches the reader.
+func (p *pipeWriter) Flush() {}
+
+// finish ends the answer: with err, the reader gets it instead of EOF.
+func (p *pipeWriter) finish(err error) {
+	p.WriteHeader(http.StatusOK)
+	_ = p.pw.CloseWithError(err)
+}
+
+// cancelOnClose ends the call when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	c.cancel()
+	return c.ReadCloser.Close()
 }

@@ -1,13 +1,18 @@
 // The runner's HTTP API, called by specola only (docs/page-backends.md,
 // "specola ↔ runner (internal)" and "Wire formats (exact)"):
 //
-//   POST /invoke   run a page's fetch handler (head in X-Specola-Invoke)
-//   GET  /logs     a page's backend log
-//   GET  /health   liveness, for specola's "available"
-//   /pages/{id}/…  the page's data: snapshots, restore, export, import,
-//                  wipe, my data, purge ("Wire formats for data (exact)")
+//   POST /invoke     run a page's fetch handler (head in X-Specola-Invoke)
+//   POST /scheduled  run a page's scheduled handler (the same head, with
+//                    the cron event instead of the request)
+//   GET  /logs       a page's backend log
+//   GET  /health     liveness, for specola's "available"
+//   /pages/{id}/…    the page's data: snapshots, restore, export, import,
+//                    wipe, my data, purge ("Wire formats for data (exact)"),
+//                    and read-only SQL (query, "MCP (step 7)")
 //
-// Every endpoint requires the shared bearer token.
+// Every endpoint requires the shared bearer token. Besides serving, the
+// runner runs the egress proxy its workers' fetch goes through (egress.js)
+// and posts their pushes to specola (push.js).
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -15,7 +20,9 @@ import http from 'node:http';
 import { CodeCache } from './code.js';
 import { RunnerError, sendError, sendJSON } from './errors.js';
 import { Logs } from './log.js';
+import { startEgressProxy } from './egress.js';
 import { Pages } from './pages.js';
+import { Publisher } from './push.js';
 import { SNAPSHOT_ID, sweepSnapshots } from './snapshot.js';
 
 export const RUNNER_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -29,18 +36,34 @@ const ROLES = new Set(['owner', 'editor', 'viewer', 'public', 'cron']);
 const MAX_INVOKE_HEADER = 48 * 1024;
 const MAX_HEADER_SIZE = 64 * 1024;
 const MAX_JSON_BODY = 64 * 1024;
+// A query's body: up to 100 KiB of SQL (query.js) and its params.
+const MAX_QUERY_BODY = 1024 * 1024;
+const JOB_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 // How long specola lets an export, an import or "my data" take (its
 // transferCall); a request body may take as long.
 const TRANSFER_MS = 2 * 60 * 60 * 1000;
-const PAGE_ROUTE = /^\/pages\/([^/]+)(?:\/(data|snapshots|export|import|wipe|my-data)(?:\/([^/]+)(\/restore)?)?)?$/;
+const PAGE_ROUTE = /^\/pages\/([^/]+)(?:\/(data|snapshots|export|import|wipe|my-data|query)(?:\/([^/]+)(\/restore)?)?)?$/;
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u001f\u007f]/;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isString = (v) => typeof v === 'string';
 
-/** Decodes and validates the X-Specola-Invoke header. Throws a 400 RunnerError. */
+/** Decodes and validates the X-Specola-Invoke header of an /invoke. Throws a 400 RunnerError. */
 export function parseInvoke(header) {
+  return parseHead(header, false);
+}
+
+/**
+ * Decodes and validates the X-Specola-Invoke header of a /scheduled: the
+ * head of an /invoke with `event` ({name, scheduledTime}) instead of
+ * `request`, no user and the cron role. Throws a 400 RunnerError.
+ */
+export function parseScheduled(header) {
+  return parseHead(header, true);
+}
+
+function parseHead(header, scheduled) {
   const bad = (why) => new RunnerError(400, 'bad-request', `X-Specola-Invoke: ${why}`);
   if (!header) throw bad('missing');
   if (header.length > MAX_INVOKE_HEADER) throw bad('too large');
@@ -67,12 +90,7 @@ export function parseInvoke(header) {
   if (!isObject(secrets) || !Object.values(secrets).every(isString)) throw bad('secrets is invalid');
   const egress = inv.egress ?? [];
   if (!Array.isArray(egress) || !egress.every(isString)) throw bad('egress is invalid');
-  if (!isObject(request) || !isString(request.method) || !TOKEN.test(request.method)) throw bad('request.method is invalid');
-  if (!isString(request.path) || !request.path.startsWith('/')) throw bad('request.path is invalid');
-  if (!Array.isArray(request.headers) || !request.headers.every((h) => Array.isArray(h) && h.length === 2 && isString(h[0]) && isString(h[1]))) {
-    throw bad('request.headers is invalid');
-  }
-  return {
+  const head = {
     page: { id: page.id, version: page.version, title: page.title },
     versionId: inv.versionId,
     codeHash: inv.codeHash,
@@ -81,19 +99,31 @@ export function parseInvoke(header) {
     link: link ? { id: link.id, label: link.label } : null,
     secrets,
     egress,
-    request: { method: request.method.toUpperCase(), path: request.path, headers: request.headers },
   };
+  if (scheduled) {
+    const { event } = inv;
+    if (inv.role !== 'cron') throw bad('role must be "cron"');
+    if (!isObject(event) || !isString(event.name) || !JOB_NAME.test(event.name)) throw bad('event.name is invalid');
+    if (!Number.isSafeInteger(event.scheduledTime) || event.scheduledTime < 0) throw bad('event.scheduledTime is invalid');
+    return { ...head, event: { name: event.name, scheduledTime: event.scheduledTime } };
+  }
+  if (!isObject(request) || !isString(request.method) || !TOKEN.test(request.method)) throw bad('request.method is invalid');
+  if (!isString(request.path) || !request.path.startsWith('/')) throw bad('request.path is invalid');
+  if (!Array.isArray(request.headers) || !request.headers.every((h) => Array.isArray(h) && h.length === 2 && isString(h[0]) && isString(h[1]))) {
+    throw bad('request.headers is invalid');
+  }
+  return { ...head, request: { method: request.method.toUpperCase(), path: request.path, headers: request.headers } };
 }
 
 const badRequest = (message) => new RunnerError(400, 'bad-request', message);
 
 /** Reads a small JSON object body. Throws 400 bad-request. */
-async function readJSON(req) {
+async function readJSON(req, max = MAX_JSON_BODY) {
   const parts = [];
   let n = 0;
   for await (const c of req) {
     n += c.length;
-    if (n > MAX_JSON_BODY) throw badRequest('The body is too large.');
+    if (n > max) throw badRequest('The body is too large.');
     parts.push(c);
   }
   let v;
@@ -190,6 +220,12 @@ async function pageRoute(pages, m, req, res, allow) {
       sendJSON(res, 200, await pages.wipe(id, scope));
       return;
     }
+    case 'query': {
+      if (!allow('POST')) return;
+      const { sql, params } = await readJSON(req, MAX_QUERY_BODY);
+      sendJSON(res, 200, await pages.query(id, sql, params));
+      return;
+    }
     case 'my-data': {
       if (req.method === 'GET') {
         req.resume();
@@ -215,13 +251,25 @@ function notFound(req, res) {
 }
 
 /**
- * Builds the runner. `fetch` is what fetches code from specola (tests pass
- * their own); `now` is the clock of snapshots (tests move it).
+ * Builds the runner. `fetch` is what reaches specola, for code and pushes
+ * (tests pass their own); `now` is the clock of snapshots (tests move it);
+ * `egress` options go to the egress proxy (its test seams) and `publish`
+ * options to the publisher (push.js).
  */
-export function createRunner(config, { fetch: f, now } = {}) {
+export function createRunner(config, { fetch: f, now, egress: egressOptions = {}, publish: publishOptions = {} } = {}) {
   const logs = new Logs();
   const code = new CodeCache({ dataDir: config.dataDir, specolaUrl: config.specolaUrl, token: config.token, fetch: f ?? fetch });
-  const pages = new Pages({ config, code, logs, now });
+  // Started now, awaited where needed: listen() (so a runner that can't
+  // run it fails at start) and the first worker.
+  const egress = startEgressProxy({
+    // Refusals and failures, in the page's backend log.
+    log: (pageId, level, text) => logs.append(pageId, level, text),
+    allowLoopbackForTests: !!config.egressAllowLoopbackForTests,
+    ...egressOptions,
+  });
+  egress.catch(() => {}); // reported by listen() and by the calls that need it
+  const publisher = new Publisher({ specolaUrl: config.specolaUrl, token: config.token, fetch: f ?? fetch, logs, options: publishOptions });
+  const pages = new Pages({ config, code, logs, now, egress, publisher });
   // Compared as digests: equal lengths for timingSafeEqual, whatever was sent.
   const expected = createHash('sha256').update(`Bearer ${config.token}`).digest();
   const authorized = (req) => {
@@ -261,6 +309,13 @@ export function createRunner(config, { fetch: f, now } = {}) {
         await pages.invoke(inv, req, res);
         return;
       }
+      case '/scheduled': {
+        if (!allow('POST')) return;
+        const inv = parseScheduled(req.headers['x-specola-invoke']);
+        req.resume(); // no body
+        sendJSON(res, 200, await pages.scheduled(inv));
+        return;
+      }
       default: {
         const m = PAGE_ROUTE.exec(url.pathname);
         if (m) return pageRoute(pages, m, req, res, allow);
@@ -295,13 +350,17 @@ export function createRunner(config, { fetch: f, now } = {}) {
     pages,
     logs,
     code,
+    publisher,
+    /** The egress proxy, once started. */
+    egress: () => egress,
     /** Removes what a previous process left half written. */
     async sweep() {
       await code.sweep();
       await pages.sweep();
       await sweepSnapshots(config.dataDir);
     },
-    listen(port = config.listen.port, host = config.listen.host) {
+    async listen(port = config.listen.port, host = config.listen.host) {
+      await egress;
       return new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(port, host, () => {
@@ -315,7 +374,9 @@ export function createRunner(config, { fetch: f, now } = {}) {
         server.close(() => resolve());
         server.closeAllConnections();
       });
+      publisher.close();
       await pages.stopAll();
+      await (await egress.catch(() => null))?.close();
     },
   };
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/danieles/specola/internal/auth"
+	"github.com/danieles/specola/internal/backend"
 	"github.com/danieles/specola/internal/store"
 	"github.com/danieles/specola/plugin"
 
@@ -40,6 +41,12 @@ type Options struct {
 	// Whether they are enabled is fixed at start, so tool descriptions
 	// follow it; whether the runner is available is read when needed.
 	Backends func() BackendState
+	// Runner is the backend runner's client, nil when backends are
+	// disabled: backend_logs and backend_query ask it.
+	Runner *backend.Runner
+	// CallBackend is how call_backend calls a page's backend as the user
+	// (backendtools.go); nil when backends are disabled.
+	CallBackend CallBackendFunc
 	// LocalhostProtection keeps the SDK's DNS-rebinding check. Only needed
 	// without bearer auth; behind a reverse proxy on loopback it rejects
 	// every request, since the Host header is the public name.
@@ -81,6 +88,9 @@ func Handler(st *store.Store, opts Options) http.Handler {
 	mcp.AddTool(srv, &mcp.Tool{Name: "create_public_link", Description: createLinkDesc, Annotations: additive}, t.createPublicLink)
 	mcp.AddTool(srv, &mcp.Tool{Name: "list_public_links", Description: listLinksDesc, Annotations: readOnly}, t.listPublicLinks)
 	mcp.AddTool(srv, &mcp.Tool{Name: "revoke_public_link", Description: revokeLinkDesc, Annotations: &mcp.ToolAnnotations{IdempotentHint: true}}, t.revokePublicLink)
+	if backends.Enabled {
+		t.registerBackendTools(srv)
+	}
 
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
 		Stateless:                  true,
@@ -165,7 +175,7 @@ const (
 func getPageDesc(b BackendState) string {
 	d := `Get a page's metadata and the HTML of its current version, or of an earlier one with version. When that version is a bundle (an app built with the Specola Vite plugin), html is only its index.html and bundle lists its other files; a bundle can't be edited through these tools: change its source project and publish it again with create_bundle_upload (kind "version").`
 	if b.Enabled {
-		d += ` A bundle's backend code (.specola/) is not listed. On a page whose current version has a backend only that version can be opened: an earlier one is still returned, to read, with a note saying so.`
+		d += ` A bundle's backend code (.specola/) is not listed; backend describes the current version's backend (its manifest, and secrets_missing). On a page whose current version has a backend only that version can be opened: an earlier one is still returned, to read, with a note saying so.`
 	}
 	return d
 }
@@ -333,6 +343,9 @@ type getPageOut struct {
 	// it describes the version html belongs to.
 	Bundle *bundleInfo `json:"bundle" jsonschema:"set when the version html belongs to is a bundle: html is its index.html, and these are its other files"`
 	Note   string      `json:"note,omitempty" jsonschema:"what to know before changing this version"`
+	// Backend replaces PageMeta's flag too: the current version's backend,
+	// null when it has none.
+	Backend *pageBackend `json:"backend" jsonschema:"set when the page's current version has a backend: its manifest, and the declared secrets without a value"`
 }
 
 func (t *tools) getPage(ctx context.Context, req *mcp.CallToolRequest, in getPageIn) (*mcp.CallToolResult, getPageOut, error) {
@@ -358,6 +371,11 @@ func (t *tools) getPage(ctx context.Context, req *mcp.CallToolRequest, in getPag
 	}
 	if out.Bundle != nil {
 		out.Note = bundleNote
+	}
+	if meta.Backend {
+		if out.Backend, err = t.pageBackend(ctx, who.Sub, in.ID); err != nil {
+			return nil, getPageOut{}, toolError(err, "page")
+		}
 	}
 	// Reading a closed version is fine; the note says it can't be opened.
 	if _, err := t.st.ServeVersion(ctx, who.Sub, in.ID, v); errors.Is(err, store.ErrSuperseded) {

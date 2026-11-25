@@ -99,6 +99,12 @@ test('config', () => {
   assert.equal(c.listen.port, 8081);
   assert.ok(path.isAbsolute(c.dataDir));
   assert.throws(() => loadConfig({ SPECOLA_RUNNER_TOKEN: TOKEN, SPECOLA_URL: 'http://s', RUNNER_WORKER_MEMORY_MB: 'lots' }), /RUNNER_WORKER_MEMORY_MB/);
+  // The egress proxy's loopback allowance: tests only, never in production.
+  const base = { SPECOLA_RUNNER_TOKEN: TOKEN, SPECOLA_URL: 'http://s' };
+  assert.equal(loadConfig(base).egressAllowLoopbackForTests, false);
+  assert.equal(loadConfig({ ...base, RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS: '1' }).egressAllowLoopbackForTests, true);
+  assert.throws(() => loadConfig({ ...base, RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS: '1', NODE_ENV: 'production' }), /tests only/);
+  assert.throws(() => loadConfig({ ...base, RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS: 'yes' }), /must be 1/);
   assert.deepEqual(parseListen('127.0.0.1:9000'), { host: '127.0.0.1', port: 9000 });
   assert.deepEqual(parseListen('[::1]:9000'), { host: '::1', port: 9000 });
 });
@@ -408,7 +414,7 @@ describe('handlers', () => {
     const v2 = r.publish(backend(`export default {}`));
     const res2 = await r.invoke({ ...v2, page: 'h-7' });
     assert.equal(res2.status, 500);
-    assert.match(await logText(r, 'h-7'), /no fetch handler/);
+    assert.match(await logText(r, 'h-7'), /has no handler: its default export must be an object with a fetch\(request, ctx\) or a scheduled\(event, ctx\) method/);
   });
 
   test('console output, publish and waitUntil', async () => {
@@ -418,7 +424,6 @@ describe('handlers', () => {
           console.log('hello', { a: 1 });
           console.warn('careful');
           ctx.log.error('bad', 42);
-          ctx.publish('topic', {});
           ctx.waitUntil(new Promise((r) => setTimeout(r, 300)).then(() => console.info('later')));
           return new Response('ok');
         },
@@ -432,7 +437,6 @@ describe('handlers', () => {
       ['log', 'hello { a: 1 }'],
       ['warn', 'careful'],
       ['error', 'bad 42'],
-      ['warn', 'ctx.publish: push is not available yet; the event was dropped'],
     ]);
     const all = await r.logs('h-8');
     for (const l of all.body.lines) assert.ok(!Number.isNaN(Date.parse(l.time)));

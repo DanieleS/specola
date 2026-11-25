@@ -1,7 +1,15 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { api, backendErrorMessage, Unauthorized, type PageMeta, type Snapshot, type VersionInfo } from "./api";
-  import BackendPanel from "./BackendPanel.svelte";
+  import {
+    api,
+    backendErrorMessage,
+    secretsMissing,
+    Unauthorized,
+    type PageMeta,
+    type Snapshot,
+    type VersionInfo,
+  } from "./api";
+  import BackendPanel, { type BackendTab } from "./BackendPanel.svelte";
   import ConfirmDialog from "./ConfirmDialog.svelte";
   import { backends, refreshBackends } from "./backends.svelte";
   import * as offline from "./offline.svelte";
@@ -16,6 +24,9 @@
   let sharing = $state(false);
   // The side panel open, if any.
   let panel = $state<"history" | "backend" | null>(null);
+  // The Backend panel's tab, kept while it is closed and set by the
+  // missing-secrets notice.
+  let backendTab = $state<BackendTab>("log");
   let historyOpen = $derived(panel === "history");
   let versions = $state<VersionInfo[]>([]);
   let viewing = $state<number | null>(null); // an older version, or null for current
@@ -65,6 +76,17 @@
   let hasPanel = $derived(
     !!meta && (!!meta.backend || !!meta.backendData) && !readOffline && (backends.enabled || !backends.known),
   );
+  // Secrets the backend declares and nobody has set (docs/page-backends.md,
+  // "Secrets"): told to owners and editors, who can set them or ask.
+  let missingSecrets = $derived(hasBackend && canEdit && !readOffline ? secretsMissing(meta) : []);
+  function openSecrets() {
+    backendTab = "secrets";
+    panel = "backend";
+  }
+  // The Secrets tab loaded them: the notice follows without asking again.
+  function setMissing(names: string[]) {
+    if (meta) (meta as PageMeta & { backendSecretsMissing?: string[] }).backendSecretsMissing = names;
+  }
   function isClosed(n: number) {
     if (!meta || n === meta.version) return false;
     const v = versions.find((x) => x.version === n);
@@ -355,6 +377,20 @@
           title="Has a backend: server code that runs on Specola">backend</span
         >
       {/if}
+      {#if missingSecrets.length && hasPanel}
+        <button
+          data-secrets-missing
+          class="shrink-0 text-[10px] uppercase tracking-wide text-amber-400 border border-amber-400/40 rounded px-1.5 py-0.5 hover:bg-amber-500/10"
+          title="The backend declares {missingSecrets.join(', ')}, with no value set: what needs {missingSecrets.length === 1
+            ? 'it'
+            : 'them'} fails. {meta?.role === 'owner' ? 'Set them' : 'An owner sets them'} in the Backend panel's Secrets tab."
+          aria-label={missingSecrets.length === 1 ? "1 secret missing" : `${missingSecrets.length} secrets missing`}
+          onclick={openSecrets}
+          ><!-- Short at phone width, where the row has no room for more. --><span class="sm:hidden">! secrets</span><span
+            class="hidden sm:inline">{missingSecrets.length === 1 ? "1 secret missing" : `${missingSecrets.length} secrets missing`}</span
+          ></button
+        >
+      {/if}
       {#if readOffline}
         <span
           class="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
@@ -524,7 +560,13 @@
         </aside>
       {/if}
       {#if panel === "backend" && hasPanel && meta}
-        <BackendPanel page={meta} onclose={() => (panel = null)} ondatachange={() => reloads++} />
+        <BackendPanel
+          page={meta}
+          bind:tab={backendTab}
+          onclose={() => (panel = null)}
+          ondatachange={() => reloads++}
+          onsecretsmissing={setMissing}
+        />
       {/if}
     </div>
   {/if}

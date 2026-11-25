@@ -29,7 +29,9 @@
 // server passes both as boot, in place of SPECOLA_BOOT at the end, with
 // backend: whether the page has a backend it can call.
 //
-// - specola.fetch(input, init) calls the page's backend: see "Backend" below.
+// - specola.fetch(input, init) calls the page's backend, and
+//   specola.subscribe(topic, onMessage) hears what it pushes: see "Backend"
+//   and "Push" below.
 ((boot) => {
   if (window.specola) return;
   const MAX_BYTES = 1 << 20;
@@ -221,6 +223,7 @@
         const d = m.data;
         if (d && d.op === "files") loadOffline(d.files);
         else if (d && BACKEND_OPS.has(d.op)) backendMessage(d);
+        else if (d && d.op === "event") pushMessage(d);
         else reply(d);
       };
       bridgeReady(e.data);
@@ -506,7 +509,6 @@ importScripts(${JSON.stringify(href)});`;
   // with a BackendUnavailable error carrying a reason; so do calls the
   // viewer refuses because backends are off, or because a newer version of
   // the page has replaced this one ("superseded").
-  // TODO(page-backends step 4): specola.subscribe, over the same port.
   function bridgeReady(hello) {
     clearTimeout(bridgeTimer);
     const b = hello.backend;
@@ -645,6 +647,74 @@ importScripts(${JSON.stringify(href)});`;
     }
   }
 
+  // Push (docs/page-backends.md, "Realtime push"). specola.subscribe(topic,
+  // onMessage) hears what the page's backend publishes on topic with
+  // ctx.publish, as onMessage(data, topic), until the unsubscribe function it
+  // returns is called. Subscriptions to one topic share it: the viewer is
+  // told {op:"sub", topic} for the first and {op:"unsub", topic} after the
+  // last, and keeps one event stream for the frame's current topics.
+  // Delivery is best effort: there is no replay, so a message published while
+  // the stream is down or reopening (the topic set changed, the network
+  // dropped) is not seen; an app that must not miss anything reloads its
+  // state with specola.fetch, say on each message or when it becomes visible
+  // again. Without a viewer relaying (opened raw, offline, no backend)
+  // subscribing works but nothing arrives. A callback that throws is
+  // reported, and the others still run.
+  const TOPIC = /^[A-Za-z0-9_.:/-]{1,128}$/;
+  const MAX_TOPICS = 20; // the most an event stream takes
+  const topics = new Map(); // topic -> Set of {onMessage}, one per subscription
+  let warnedPush = false;
+
+  function subscribe(topic, onMessage) {
+    if (typeof topic !== "string" || !TOPIC.test(topic)) {
+      throw new TypeError(`specola.subscribe: a topic is 1 to 128 letters, digits, _, ., :, / or - (got ${String(topic)})`);
+    }
+    if (typeof onMessage !== "function") throw new TypeError("specola.subscribe: onMessage must be a function");
+    let subs = topics.get(topic);
+    if (!subs) {
+      if (topics.size >= MAX_TOPICS) throw new TypeError(`specola.subscribe: at most ${MAX_TOPICS} topics at once`);
+      subs = new Set();
+      topics.set(topic, subs);
+      const why = unavailable();
+      if (!why) relay({ op: "sub", topic });
+      else if (!warnedPush) {
+        warnedPush = true;
+        console.warn("specola.subscribe: no pushes will arrive:", why.message);
+      }
+    }
+    // An object per call, so the same function subscribed twice is two
+    // subscriptions, each with its own unsubscribe.
+    const entry = { onMessage };
+    subs.add(entry);
+    let done = false;
+    return function unsubscribe() {
+      if (done) return;
+      done = true;
+      subs.delete(entry);
+      if (subs.size || topics.get(topic) !== subs) return;
+      topics.delete(topic);
+      relay({ op: "unsub", topic });
+    };
+  }
+
+  function pushMessage(d) {
+    const subs = typeof d.topic === "string" && topics.get(d.topic);
+    if (!subs) return;
+    // A copy: a callback may unsubscribe, itself or others, as it runs. One
+    // removed meanwhile is not called.
+    for (const entry of [...subs]) {
+      if (!subs.has(entry)) continue;
+      try {
+        entry.onMessage(d.data, d.topic);
+      } catch (err) {
+        // Reported as uncaught (the console, window.onerror), without
+        // keeping the next subscriber from its message.
+        if (typeof reportError === "function") reportError(err);
+        else setTimeout(() => { throw err; });
+      }
+    }
+  }
+
   define(
     window,
     "specola",
@@ -658,6 +728,7 @@ importScripts(${JSON.stringify(href)});`;
         return backendState;
       },
       fetch: backendFetch,
+      subscribe,
       flush() {
         if (!persistent) return Promise.resolve();
         return new Promise((resolve, reject) => {
