@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,13 +151,20 @@ func New(cfg *config.Config, st *store.Store, a *auth.Auth, tokens mcpauth.Token
 		vr.Get("/view/{id}", s.handleTokenView)
 		vr.Get("/view/{id}/*", s.handleTokenView)
 		s.routesPublic(vr)
+		routesAppIcons(vr)
 		vr.Get("/b/{key}/*", s.handleBundleFile)
 		vr.Head("/b/{key}/*", s.handleBundleFile)
 		s.viewMux = vr
 	}
 
+	// Page apps' icons need no session (apps.go); any other path under
+	// /app/ than an app's own answers 404 rather than the SPA shell.
+	routesAppIcons(r)
+	r.Handle("/app/*", http.NotFoundHandler())
+
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAuth)
+		s.routesApps(r)
 		if cfg.ViewOrigin == "" {
 			r.Get("/view/{id}", s.handleView)
 			r.Get("/view/{id}/*", s.handleView)
@@ -276,8 +284,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 		if id.Sub == "" {
 			// Only our own OIDC flow can recover an anonymous browser request.
+			// It comes back where it was going (a page app, say).
 			if s.auth != nil && !strings.HasPrefix(r.URL.Path, "/api") {
-				http.Redirect(w, r, "/auth/login", http.StatusFound)
+				http.Redirect(w, r, "/auth/login?next="+url.QueryEscape(auth.SafeNext(r.URL.RequestURI())), http.StatusFound)
 				return
 			}
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -472,7 +481,9 @@ func (s *Server) handleAddVersion(w http.ResponseWriter, r *http.Request) {
 // has backend data, and when it will be purged if that is within a week.
 type pageMetaResp struct {
 	*store.PageMeta
-	ViewURL        string     `json:"viewUrl"`
+	ViewURL string `json:"viewUrl"`
+	// AppURL is where the page is installed as an app (apps.go).
+	AppURL         string     `json:"appUrl"`
 	BackendData    bool       `json:"backendData"`
 	BackendPurgeAt *time.Time `json:"backendPurgeAt,omitempty"`
 	// BackendSecretsMissing: for owners and editors of a backend page
@@ -492,7 +503,7 @@ func (s *Server) handlePageMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, pageMetaResp{
-		PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID),
+		PageMeta: meta, ViewURL: s.viewURL(subOf(r.Context()), meta.ID), AppURL: "/app/" + meta.ID + "/",
 		BackendData: meta.BackendData, BackendPurgeAt: s.backendPurgeAt(meta.BackendDormantSince),
 		BackendSecretsMissing: missing,
 	})

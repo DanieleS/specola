@@ -15,6 +15,8 @@
 /* global VERSION, PRECACHE */
 const SHELL = `specola-shell-${VERSION}`;
 const API = "specola-api";
+// Page apps (docs/page-apps.md): each app's shell, by URL, and their icons.
+const APPS = "specola-apps";
 const OFFLINE_HEADER = "X-Specola-Offline";
 
 // Reads that make no sense from a stale copy.
@@ -60,8 +62,16 @@ self.addEventListener("fetch", (e) => {
     e.respondWith(caches.match(req).then((hit) => hit || fetchAndKeep(req, SHELL)));
     return;
   }
+  if (p.startsWith("/app-icons/")) {
+    e.respondWith(caches.match(req, { cacheName: APPS }).then((hit) => hit || fetchAndKeep(req, APPS)));
+    return;
+  }
   if (req.mode === "navigate") {
-    if (/^\/(view|s|b|tools|auth|mcp|upload|healthz|\.well-known)(\/|$)/.test(p)) return;
+    if (/^\/app\/[^/]+\/$/.test(p)) {
+      e.respondWith(appShell(req));
+      return;
+    }
+    if (/^\/(app|view|s|b|tools|auth|mcp|upload|healthz|\.well-known)(\/|$)/.test(p)) return;
     e.respondWith(shell(req));
     return;
   }
@@ -80,6 +90,26 @@ async function shell(req) {
     return res;
   } catch (err) {
     const hit = await caches.match("/");
+    if (hit) return hit;
+    throw err;
+  }
+}
+
+// A page app's shell carries its own head (manifest, name, icon): kept by
+// URL, apart from Specola's. Offline, that copy, else Specola's shell, which
+// shows the app too (the SPA reads the page from the path), only without its
+// head.
+async function appShell(req) {
+  const key = new URL(req.url).pathname;
+  try {
+    const res = await fetch(req);
+    if (res.ok && (res.headers.get("Content-Type") ?? "").startsWith("text/html")) {
+      const c = await caches.open(APPS);
+      await c.put(key, res.clone());
+    }
+    return res;
+  } catch (err) {
+    const hit = (await caches.match(key, { cacheName: APPS })) || (await caches.match("/"));
     if (hit) return hit;
     throw err;
   }

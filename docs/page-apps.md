@@ -1,6 +1,9 @@
 # Page apps — design and contract
 
-Status: design. Nothing here is implemented yet.
+Status: step 1 of "Order of work" is implemented (signed-in apps: login
+with `next`, `/app/{id}/`, manifests with defaults, generated icons,
+`PageFrame` and `AppShell`, the app-origin service worker), checked in
+Chromium by `e2e/page-apps.mjs`. The rest is design.
 
 A **page app** is one page installed on its own as a Progressive Web App: its
 own icon on the home screen or in the dock, its own window and name, and none
@@ -70,7 +73,8 @@ On the **app origin** only (session and service worker live there).
 
 | URL | Auth | What |
 | --- | --- | --- |
-| `GET /app/{id}/` | session | The shell. No session: `302` to `/auth/login?next=/app/{id}/`. |
+| `GET /app/{id}` | session | `301` to `/app/{id}/`. |
+| `GET /app/{id}/` | session | The shell. No session: `302` to `/auth/login?next=/app/{id}/`. Without access: `404` with Specola's plain shell, so the SPA says so. |
 | `GET /app/{id}/manifest.webmanifest` | session | Its manifest; `404` without access. |
 
 Any other path under `/app/` answers `404`. Both are `Cache-Control:
@@ -91,9 +95,11 @@ manifest link and title replaced by
 Nothing else is injected: the SPA reads the id from `location.pathname`, so a
 cached shell works offline for any app.
 
-`/auth/login` takes `next`: a local path (starts with `/`, not `//` or `/\`,
-no scheme), kept in the state cookie; the callback redirects there instead of
-`/`, anything else is ignored.
+`/auth/login` takes `next`: a local path (starts with `/`, not `//`, no
+backslash or line break, no scheme or host), kept for the flow in a cookie
+(`specola_login_next`, path `/auth/`, 10 minutes); the callback redirects
+there instead of `/`, anything else is ignored. A signed-out request for any
+non-API path is sent to the login with `next` set to itself.
 
 ## Public apps
 
@@ -136,8 +142,9 @@ Served on the same origin as today (the view origin when there is one), so
   "theme_color": "{theme_color}",
   "background_color": "{background_color}",
   "icons": [
-    { "src": "{icon}", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "{icon}", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    { "src": "{icon 192}", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "{icon 512}", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "{icon 512}", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
 ```
@@ -330,8 +337,11 @@ link, how many visitors keep data and how much; never the data.
 - **Install banner** (both shells): `beforeinstallprompt` → "Install"; iOS
   Safari → "Share → Add to Home Screen"; hidden in standalone and once
   dismissed.
-- Viewer ⋯: "Install as app" (opens `/app/{id}/`), and "App…" for editors:
-  the settings with an icon preview, plain and masked.
+- Viewer header: "Install as app ↗" (opens `/app/{id}/` in a new tab), and
+  "App…" for editors: the settings with an icon preview, plain and masked.
+- `startSession()` (`session.ts`) starts the session the same way in
+  Specola and in a page app: who is signed in, backends, offline data bound
+  to the user, unsaved page data writes folded back in.
 - Links dialog: "Install" hint next to each new URL, visitor counts per link.
 
 ## MCP

@@ -12,13 +12,33 @@ import (
 //go:embed all:dist
 var dist embed.FS
 
-func Handler() http.Handler {
-	sub, err := fs.Sub(dist, "dist")
+var (
+	sub   = mustSub()
+	index = mustRead(sub, "index.html")
+)
+
+func mustSub() fs.FS {
+	s, err := fs.Sub(dist, "dist")
 	if err != nil {
 		panic(err)
 	}
+	return s
+}
+
+func mustRead(f fs.FS, name string) []byte {
+	b, err := fs.ReadFile(f, name)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// Index is the SPA's shell, index.html, which page apps serve with their
+// own head (internal/server/apps.go).
+func Index() []byte { return index }
+
+func Handler() http.Handler {
 	files := http.FileServer(http.FS(sub))
-	index, _ := fs.ReadFile(sub, "index.html")
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/")

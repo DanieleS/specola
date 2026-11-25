@@ -27,6 +27,7 @@ e2e:
 	node e2e/bundles.mjs
 	node e2e/sdk-bridge.mjs
 	node e2e/backends.mjs
+	node e2e/page-apps.mjs
 
 tidy:
 	go mod tidy

@@ -21,6 +21,17 @@ form's commands are dropped when the title changes, and that files of a
 version nobody keeps are pruned when the app starts, unless another tab is
 storing it.
 
+`page-apps.mjs` checks page apps ([docs/page-apps.md](../docs/page-apps.md))
+in Chromium, on the app origin alone and with a separate view origin. It
+publishes a page that counts its loads in `localStorage`, and checks that
+Specola's own manifest is unchanged, that the viewer links to the page's app,
+and that `/app/{id}/` gets its own manifest (`Page.getAppManifest`: its `id`,
+scope, name and theme color), its title and icon, and shows the page alone
+with the same data as in the viewer, kept across reloads. Then, once the
+service worker controls the app, it goes offline, reloads, and checks the app
+opens from the kept copy with its own shell; last, that an app for a page
+that isn't there says so.
+
 `backends.mjs` checks page backends
 ([docs/page-backends.md](../docs/page-backends.md)) end to end. It starts the
 real runner (`runner/`, its data in a temporary directory) and Specola in

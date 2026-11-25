@@ -35,6 +35,8 @@ export type PageMeta = {
   public: boolean;
   /** Where to load the rendered page from; may be on a separate origin. */
   viewUrl: string;
+  /** Where the page is installed as an app (docs/page-apps.md). */
+  appUrl?: string;
   /** The current version is an SPA bundle (docs/spa-bundles.md). */
   bundle?: boolean;
   /** The current version has a backend (docs/page-backends.md): only it can be opened. */

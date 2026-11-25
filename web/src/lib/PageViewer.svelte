@@ -13,7 +13,7 @@
   import ConfirmDialog from "./ConfirmDialog.svelte";
   import { backends, refreshBackends } from "./backends.svelte";
   import * as offline from "./offline.svelte";
-  import { serveStorage, storageName, type Backend } from "./pagedata";
+  import PageFrame, { viewSrc } from "./PageFrame.svelte";
   import ShareDialog from "./ShareDialog.svelte";
   import { versionSnapshot } from "./snapshots";
 
@@ -56,20 +56,9 @@
   let closed = $derived(!!shown && isClosed(shown));
   // Only the current version can have a backend that runs.
   let hasBackend = $derived(!!meta?.backend && shown === meta.version);
-  let src = $derived(meta && shown && !readOffline && !closed ? withVersion(meta.viewUrl, shown) : "");
-  let offlineSrc = $state("");
-  // The kept bundle's files for the page in offlineSrc, if it is one.
-  let offlineFiles: offline.BundleFile[] | undefined;
-  let missing = $state(false);
+  // For "Open raw": the frame (PageFrame) loads the same.
+  let src = $derived(meta && shown && !readOffline && !closed ? viewSrc(meta.viewUrl, shown) : "");
   let saving = $state(false);
-  let host = $state<HTMLDivElement>();
-
-  // viewUrl may already carry a query (a view token), so add v properly.
-  function withVersion(viewUrl: string, v: number) {
-    const u = new URL(viewUrl, location.href);
-    u.searchParams.set("v", String(v));
-    return u.toString();
-  }
   let canEdit = $derived(meta?.role === "owner" || meta?.role === "editor");
   // The Backend panel (docs/page-backends.md, "Data lifecycle"): for a page
   // with a backend, or with data a backend left, while backends may be on.
@@ -105,29 +94,10 @@
       .catch((e) => {
         // Never read online, but kept: enough to show it.
         const k = offline.index.pages[id];
-        if (k && !(e instanceof Unauthorized)) meta = keptMeta(k);
+        if (k && !(e instanceof Unauthorized)) meta = offline.keptMeta(k);
         else error = String(e);
       });
     if (historyOpen) loadVersions();
-  }
-
-  function keptMeta(k: offline.OfflinePage): PageMeta {
-    return {
-      id: k.id,
-      name: k.name,
-      slug: "",
-      folderId: null,
-      version: k.versions.at(-1)!,
-      updatedAt: k.updatedAt,
-      role: k.role,
-      bundle: offline.isBundle(k.id, k.versions.at(-1)!),
-      backend: !!k.backend,
-      shared: false,
-      favorite: false,
-      public: false,
-      viewUrl: "",
-      offline: true,
-    };
   }
 
   function loadVersions() {
@@ -161,76 +131,6 @@
     const v = shown;
     if (!m || !v || readOffline || isClosed(v)) return;
     untrack(() => offline.keep(m, v)).catch((e) => console.warn("keep offline:", e));
-  });
-
-  // Offline, show the kept copy from a blob URL in the same sandbox. A
-  // bundle runs from its kept files, which the frame's SDK gets over the
-  // port; one not kept whole is reported missing rather than shown broken.
-  $effect(() => {
-    const v = shown;
-    offlineSrc = "";
-    missing = false;
-    if (!readOffline || !v || closed) return;
-    let url = "";
-    let live = true;
-    const bundle = offline.isBundle(id, v) ? offline.bundle(id, v) : Promise.resolve(null);
-    Promise.all([offline.html(id, v), bundle]).then(([h, b]) => {
-      if (!live) return;
-      if (h === null || (offline.isBundle(id, v) && !b)) {
-        missing = true;
-        return;
-      }
-      offlineFiles = b?.files;
-      if (b) h = offline.offlineBundleHTML(h, b.base);
-      offlineSrc = url = URL.createObjectURL(new Blob([h], { type: "text/html" }));
-    });
-    return () => {
-      live = false;
-      if (url) URL.revokeObjectURL(url);
-    };
-  });
-
-  // A frame per load, made here: the page's localStorage data must be in the
-  // frame's name before the frame is in the document (browsers ignore a later
-  // change), and only the page first loaded in it gets to save its writes.
-  $effect(() => {
-    const h = host;
-    const url = src || offlineSrc;
-    void reloads;
-    if (!h || !url) return;
-    const title = untrack(() => meta?.name ?? "page");
-    const files = src ? undefined : offlineFiles;
-    // Where the page's specola.fetch calls go, if it has a backend.
-    const backend: Backend | undefined = untrack(() =>
-      hasBackend && shown
-        ? {
-            status: () => ({ enabled: backends.enabled, available: backends.available && offline.net.online }),
-            version: shown,
-            offline: !src,
-            onSuperseded: () => (superseded = true),
-          }
-        : undefined,
-    );
-    let live = true;
-    let stop = () => {};
-    storageName(id).then((name) => {
-      if (!live) return;
-      // No allow-same-origin: the page runs on an opaque origin, matching the
-      // server's CSP sandbox, so it cannot touch Specola's session or API.
-      const f = document.createElement("iframe");
-      f.title = title;
-      f.referrerPolicy = "no-referrer";
-      f.setAttribute("sandbox", "allow-scripts allow-popups allow-forms allow-modals");
-      f.className = "flex-1 w-full bg-white border-0";
-      if (name) f.name = name;
-      f.src = url;
-      h.replaceChildren(f);
-      if (name || files || backend) stop = serveStorage(f, id, !!name, files, backend);
-    });
-    return () => {
-      live = false;
-      stop();
-    };
   });
 
   async function togglePinned() {
@@ -425,6 +325,15 @@
       {#if meta?.role === "owner" && !readOffline}
         <button class={action} onclick={() => (sharing = true)}>{meta.shared || meta.public ? "Shared" : "Share"}</button>
       {/if}
+      {#if meta?.appUrl && !readOffline}
+        <a
+          href={meta.appUrl}
+          target="_blank"
+          rel="noopener"
+          class={action}
+          title="Open this page on its own, to install it as an app on this device">Install as app ↗</a
+        >
+      {/if}
       {#if src}
         <a href={src} target="_blank" rel="noopener noreferrer" class={action}>Open raw ↗</a>
       {/if}
@@ -504,14 +413,16 @@
             >Open the current version (v{meta.version})</button
           >
         </div>
-      {:else if missing}
-        <p class="flex-1 p-5 text-white/50">
-          Version {shown} isn't {shownBundle ? "available offline" : "kept on this device"}. It can be opened when you're back
-          online.
-        </p>
-      {:else if src || offlineSrc}
-        <!-- The sandboxed frame showing the page goes here; see above. -->
-        <div bind:this={host} class="flex flex-1 min-w-0"></div>
+      {:else if meta && shown}
+        <PageFrame
+          {id}
+          {meta}
+          version={shown}
+          {readOffline}
+          bundle={shownBundle}
+          {reloads}
+          onsuperseded={() => (superseded = true)}
+        />
       {/if}
 
       {#if historyOpen}

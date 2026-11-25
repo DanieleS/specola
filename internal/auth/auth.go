@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -18,7 +19,9 @@ import (
 const (
 	sessionCookie = "specola_session"
 	stateCookie   = "specola_oidc_state"
-	sessionTTL    = 7 * 24 * time.Hour
+	// nextCookie holds where to go once signed in (Login's next).
+	nextCookie = "specola_login_next"
+	sessionTTL = 7 * 24 * time.Hour
 )
 
 type Auth struct {
@@ -81,7 +84,29 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		Name: stateCookie, Value: state, Path: "/", HttpOnly: true,
 		Secure: a.cfg.Secure(), SameSite: http.SameSiteLaxMode, MaxAge: 600,
 	})
+	// Where to come back to; none clears one an abandoned login left.
+	next := &http.Cookie{Name: nextCookie, Path: "/auth/", MaxAge: -1}
+	if n := SafeNext(r.URL.Query().Get("next")); n != "/" {
+		next = &http.Cookie{
+			Name: nextCookie, Value: url.QueryEscape(n), Path: "/auth/", HttpOnly: true,
+			Secure: a.cfg.Secure(), SameSite: http.SameSiteLaxMode, MaxAge: 600,
+		}
+	}
+	http.SetCookie(w, next)
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state), http.StatusFound)
+}
+
+// SafeNext returns next when it is a path on this origin, else "/": a login
+// may only come back here, never to another site (no open redirect).
+func SafeNext(next string) string {
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.ContainsAny(next, "\\\x00\r\n") {
+		return "/"
+	}
+	u, err := url.Parse(next)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.User != nil {
+		return "/"
+	}
+	return next
 }
 
 // Callback completes the flow: verify state, exchange the code, verify the ID
@@ -129,7 +154,14 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 			MaxAge: int(sessionTTL.Seconds()),
 		})
 	}
-	http.Redirect(w, r, "/", http.StatusFound)
+	next := "/"
+	if c, err := r.Cookie(nextCookie); err == nil {
+		if v, err := url.QueryUnescape(c.Value); err == nil {
+			next = SafeNext(v)
+		}
+		http.SetCookie(w, &http.Cookie{Name: nextCookie, Path: "/auth/", MaxAge: -1})
+	}
+	http.Redirect(w, r, next, http.StatusFound)
 }
 
 // Logout clears the session cookie and, when the provider supports it, ends the
