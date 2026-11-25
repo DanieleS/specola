@@ -32,7 +32,8 @@ plugin/CLI, the page SDK and the SPA. Keep it in sync with the code.
 ## Goals and non-goals
 
 - Arbitrary server-side logic per page, versioned with the app it belongs
-  to: one bundle version = one frontend + one backend, restored together.
+  to: one bundle version = one frontend + one backend. Only the current
+  version of a page with a backend is live (see Versions).
 - Standard web APIs (`fetch(request, ctx)` handlers, `Request`, `Response`,
   streams), so routers like Hono work unchanged.
 - Batteries included: SQLite (shared and per user), a file store, outbound
@@ -169,6 +170,41 @@ and limits; the entry's presence at commit). It is stored parsed on the
 version (`asset_version.backend jsonb`), so specola reads routes, secrets and
 cron without touching blobs.
 
+## Versions: only the current one is live
+
+A page whose **current** version has a backend is a **backend page**. Its
+data is one live state, so an older frontend+backend pair has nothing
+coherent to show, and running it would write today's data with yesterday's
+code. So:
+
+- **A version can be opened only if it is the current one, or if neither
+  it nor the current version has a backend.** On a backend page every older
+  version is closed, with or without a backend of its own; on a page that
+  went static, its old backend versions are closed (there is nothing to
+  run them).
+- A closed version answers **410 `superseded`** on `/view/{id}?v=N`, the
+  token view and pinned public links; the viewer shows "This page has a
+  backend: only its current version can be opened" with a link to it,
+  instead of the frame.
+- **History is kept.** Versions stay in the list with their notes, marked
+  "not viewable", and **Restore** still works: it makes a new current
+  version from the old one, which is the undo for a bad deploy. Restore
+  brings back code, not data; the viewer offers to restore, too, the data
+  snapshot taken when that version stopped being current (see Data
+  lifecycle). Deleting versions would break Specola's "nothing is ever
+  overwritten" rule for no gain: they cost only storage.
+- MCP `get_page` with a `version` still returns that version's source (it
+  reads it, it doesn't run it), with a note that it can't be opened.
+- **Public links** on a backend page can't be pinned (400 `backend-pinned`);
+  a link pinned earlier to a version that is now closed answers 410.
+- **Offline** keeps only the current version of a backend page.
+- **Version skew.** When a new version becomes current, frames still
+  showing the old one get **409 `superseded`** from `/x/…` and from the
+  events stream (specola compares `X-Specola-Version` with the current
+  version). The SDK rejects with `BackendUnavailable`
+  (`reason: "superseded"`) and the viewer shows "A new version is
+  available — Reload". Requests already running finish on the old worker.
+
 ## Handler contract
 
 The entry's default export is an object with any of:
@@ -206,7 +242,8 @@ interface Ctx {
   (`userDb`), or both (shared catalogue, private drafts). Schema is the
   code's job (migrate on first access; `PRAGMA user_version` is the usual
   way). Data belongs to the **page**, not the version: restoring a version
-  restores code, never data, so migrations must be forward-compatible.
+  restores code, never data, unless the owner also restores a snapshot
+  (see Data lifecycle).
 - **Files.** `files.put(key, body, {contentType})`, `get(key)` →
   `{body: ReadableStream, size, contentType} | null`, `delete(key)`,
   `list(prefix?)`. Keys like bundle paths. For uploads: the page sends a
@@ -260,16 +297,16 @@ changes.
 Specola:
 
 1. authenticates, checks the user can **view** the page (404/403 as
-   everywhere), and that the version has a backend (404 `no-backend`);
+   everywhere), that `X-Specola-Version` is the current version (409
+   `superseded`) and that it has a backend (404 `no-backend`);
 2. resolves the role (owner/editor/viewer);
 3. checks limits (body size, concurrent requests per user and page);
 4. forwards to the runner with the request, the `ctx` identity, the
    version's code reference and the page's declared secrets (decrypted);
 5. streams the runner's response through, flushing each chunk.
 
-**The version runs the backend it was published with**, so a frontend is
-always paired with its own backend, including when someone opens an old
-version from the history. Cron runs only for the current version.
+Only the current version runs: calls, cron and pushes alike (see
+Versions).
 
 ### specola ↔ runner (internal)
 
@@ -298,9 +335,11 @@ A small Node service (`runner/` in this repo, its own image on
 /data/pages/{pageId}/files/…
 ```
 
-- **One worker process per (page, version)**, started on first request,
-  kept warm, stopped after 5 minutes idle (and on a new code hash for that
-  version, which doesn't happen: versions are immutable). Each worker runs
+- **One worker process per page**, running its current version, started
+  on first request, kept warm, stopped after 5 minutes idle. When a new
+  version becomes current, the runner snapshots the data (see Data
+  lifecycle), then starts a new worker for it and lets the old one drain
+  its in-flight requests. Each worker runs
   with `node --permission --allow-fs-read=<its code dir>,<its page dir>
   --allow-fs-write=<its page dir>` and no child processes, workers or
   addons, `--max-old-space-size` from the limits, and its own environment
@@ -314,9 +353,13 @@ A small Node service (`runner/` in this repo, its own image on
 - **Limits** per request (wall time, response bytes), per worker (memory,
   concurrent requests) and per page (disk), see Limits. A worker that
   exceeds memory is killed and the request answers 502 `backend-crashed`.
-- SQLite files are opened by the worker only; WAL mode; one worker per page
-  version, and versions of the same page share the files (SQLite's locking
-  serialises writers across them).
+- SQLite files are opened by the page's worker only (and read-only by the
+  runner for snapshots, exports and `backend_query`); WAL mode. During a
+  version switch the draining worker and the new one overlap briefly;
+  SQLite's locking serialises their writes.
+- **Single replica, by design**: the data lives on the runner's volume.
+  Sharding pages across runners is possible later without changing this
+  contract.
 
 ## Secrets
 
@@ -364,7 +407,8 @@ needs no CORS:
 - only routes matching `public` reach the runner; others answer 403
   `not-public` without invoking anything;
 - `ctx.user = null`, `ctx.role = "public"`, `ctx.link` set, `userDb = null`;
-- a pinned link runs its pinned version's backend;
+- links on a backend page always follow the current version (see
+  Versions);
 - rate limits per link and per client IP (below);
 - revoking the link stops calls at once, as it stops serving.
 
@@ -379,9 +423,72 @@ Pages without a backend keep today's `/s/{token}` behaviour.
 - **Errors to the page** are sanitised: an uncaught exception answers 500
   with `{"error":"backend-error","ref":"<id>"}`; the stack is in the log
   under that `ref`.
-- MCP `call_backend(id, method, path, body?, version?)` lets an agent
-  exercise the backend as its user, to test what it published (returns
-  status, headers and up to 64 KiB of body).
+- MCP `call_backend(id, method, path, body?)` lets an agent exercise the
+  backend as its user, to test what it published (returns status, headers
+  and up to 64 KiB of body).
+- MCP `backend_query(id, sql)` (owners and editors) runs read-only SQL on
+  the shared database, up to 1000 rows, so an agent can check what its code
+  wrote. Editors can already read everything through the code they publish,
+  so this exposes nothing new. Per-user databases are not reachable this
+  way.
+
+## Data lifecycle
+
+A page's backend data is `shared.sqlite`, one `users/*.sqlite` per user,
+and the file store. The file store is content-addressed (an index in
+`files.sqlite`, blobs under `files/blobs/{sha256}`), so a snapshot of it is
+a copy of the index, and blobs are deleted only when neither the live
+index nor a snapshot names them.
+
+### Snapshots
+
+A **snapshot** is every database of the page, copied with `VACUUM INTO`
+(consistent while the worker runs), plus the file index.
+
+- **Taken automatically** when a new version becomes current, before its
+  worker handles anything (labelled with the version that is leaving: it is
+  the state that version left, which its restore can bring back), every
+  day the page was called, and before any restore, import or wipe (so each
+  of those can be undone).
+- **Taken by hand** by an owner from the "Backend" panel, with a label.
+- **Kept**: the last 5 version snapshots, the last 7 daily ones, up to 10
+  manual ones, and the last 5 taken before a restore/import/wipe. They have
+  their own quota per page (Limits); past it the oldest automatic ones go
+  first.
+- **Restored** by an owner only: it replaces all of the page's data
+  (shared, every user's, files) with the snapshot. When restoring a version
+  from the history, the viewer offers to restore that version's snapshot
+  in the same step.
+
+Snapshots live on the runner's volume, so they protect from bad code and
+bad migrations, **not** from losing the volume. Back up the volume.
+
+### Export, import, wipe
+
+- **Export** (owner): a zip of `shared.sqlite`, the files and a
+  `manifest.json` (page, version, date). Users' private databases are not
+  in it: each user exports their own (**My data**, any viewer, their
+  `userDb` only). `GET /api/pages/{id}/backend/export`,
+  `GET /api/pages/{id}/backend/my-data`.
+- **Import** (owner): uploads a zip in the export format and replaces the
+  shared database and the files (snapshot first). It moves a page's data
+  between instances, or seeds it. `PUT /api/pages/{id}/backend/import`.
+- **Wipe** (owner): "Reset shared data and files" or "Reset every user's
+  data", each after a snapshot. Any user: "Delete my data" (their `userDb`,
+  no snapshot: it is theirs to delete).
+
+### When the page changes state
+
+| Event | Data |
+| --- | --- |
+| Archived (itself or a folder above) | Kept untouched; calls answer 404 like the page; cron paused; snapshots kept |
+| Unarchived | Everything resumes |
+| New version without a backend | Kept dormant; the panel still offers export, snapshots and wipe; a later backend version finds it |
+| A user loses access | Their `userDb` stays, unreachable; it comes back with the access (as `localStorage` does today) |
+| Purge | Specola never deletes a page, so backend data of a page archived or without a backend for more than `RUNNER_PURGE_AFTER_DAYS` days (default: never) is deleted with its snapshots. The panel and the Archived list show the date 7 days ahead |
+
+MCP gets none of the destructive operations (restore, import, wipe): they
+are UI-only, for owners.
 
 ## Plugin and CLI
 
@@ -428,6 +535,8 @@ The CLI and upload protocol are unchanged: `.specola/` files are bundle files.
 | idle worker lifetime | 5 min |
 | push payload | 7 KiB |
 | cron jobs per page | 10, at most once a minute |
+| snapshots per page | 2 GiB, beyond the page's own 1 GiB |
+| import zip | 1 GiB |
 
 Runner env (`RUNNER_*`) overrides the runner-side ones; specola env
 (`SPECOLA_BACKEND_*`) the specola-side ones.
@@ -441,6 +550,7 @@ Runner env (`RUNNER_*`) overrides the runner-side ones; specola env
 | `SPECOLA_SECRETS_KEY` | specola | 32 bytes, base64; encrypts page secrets |
 | `SPECOLA_URL` | runner | specola's internal base URL |
 | `RUNNER_DATA_DIR` | runner | the volume (default `/data`) |
+| `RUNNER_PURGE_AFTER_DAYS` | runner | purge data of dormant pages after this many days (default: never) |
 
 `docker-compose.yaml` gains a `runner` service and volume, commented out by
 default.
@@ -455,22 +565,21 @@ false and `specola.fetch` rejects with `BackendUnavailable`
 
 1. Runner skeleton, internal API, `specola.fetch` over the port with
    streaming, `db`/`userDb`/`files`, plugin server build and dev server,
-   backend log, the disabled/unavailable states everywhere (MCP included).
-2. Secrets and egress proxy.
-3. Realtime push.
-4. Scheduled jobs.
-5. Public links shell.
-6. MCP `call_backend`, `backend_logs`, `list_secrets`, instructions.
+   backend log, the disabled/unavailable states everywhere (MCP included),
+   only-current-version rules (410/409) and the version-switch snapshot.
+2. Data lifecycle: snapshots panel and restore, export, my data, import,
+   wipe, purge.
+3. Secrets and egress proxy.
+4. Realtime push.
+5. Scheduled jobs.
+6. Public links shell.
+7. MCP `call_backend`, `backend_logs`, `backend_query`, `list_secrets`,
+   instructions.
 
 ## Open questions
 
-- **Old versions writing to new data.** Opening an old version runs its
-  backend against today's data. Alternative: old versions get a read-only
-  `db`, or no backend at all. Current choice: same rights, author's job.
-- **Data lifecycle**: export (zip of SQLite + files for the owner), wipe,
-  and what happens to data when a page is archived for good (today nothing
-  is ever hard-deleted).
+- **Editors and data**: export, import and snapshots are owner-only, while
+  editors can read everything through code anyway. Should editors at least
+  export?
 - **Bun-compatible handlers**: the contract is web-standard, so it may run
   on another runtime later; nothing depends on it now.
-- **Single runner replica** because SQLite lives on its volume; sharding by
-  page is possible later without changing the contract.
