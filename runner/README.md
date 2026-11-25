@@ -101,7 +101,7 @@ contract, "Wire formats (exact)"):
 | `GET /pages/{id}/export?title=…&version=…` | The zip (`manifest.json`, `shared.sqlite`, `files/index.json`, `files/data/<key>`), streamed; the manifest names the page with the title and version given |
 | `PUT /pages/{id}/import` | The zip (≤ 1 GiB) → `{before}`; 400 `bad-import` naming what is wrong, nothing changed |
 | `POST /pages/{id}/wipe` | `{scope:"shared"\|"users"}` → `{before}` |
-| `GET` / `DELETE /pages/{id}/my-data` | The `X-Specola-Sub` user's database (404 `no-data`) / delete it → 204 |
+| `GET` / `DELETE /pages/{id}/my-data` | The `X-Specola-Sub` user's database (404 `no-data`) / delete it, live and in every snapshot → 204 |
 | `DELETE /pages/{id}` | Purge: data, snapshots, state and log → 204, also when there was nothing |
 
 A missing or wrong token answers `401 unauthorized` everywhere. Page ids

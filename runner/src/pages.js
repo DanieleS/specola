@@ -35,10 +35,11 @@ import { SLOTS, commitSwap, exportZip, finishSwap, prepareExport, removeDb, stag
 import { RunnerError } from './errors.js';
 import { PageWorker } from './process.js';
 import { QUERY_TIMEOUT_MS, runQuery } from './query.js';
-import { blobNames, collectBlobs, findSnapshot, keep, listSnapshots, publicSnapshot, snapshotBytes, takeSnapshot, vacuumCopy } from './snapshot.js';
+import { blobNames, collectBlobs, eraseUserFromSnapshots, findSnapshot, keep, listSnapshots, publicSnapshot, snapshotBytes, snapshotsHolding, takeSnapshot, vacuumCopy } from './snapshot.js';
 import { pageUsage } from './worker/usage.mjs';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HASH = /^[0-9a-f]{64}$/;
 
 export class Pages {
   #pages = new Map(); // pageId → Promise<page state>
@@ -121,6 +122,10 @@ export class Pages {
       // A committed swap that could not be finished (finishSwap): finished
       // before the page runs again.
       swapPending: false,
+      // "Delete my data", per user who asked (see deleteMyData):
+      // {user: sha256 of the sub, snapshots: ids of the snapshots that held
+      // the user's database then, stage: 'live' | 'snapshots' | 'done'}.
+      erased: [],
       transfers: 0,
       newestDaily: undefined, // ms of the newest daily snapshot; undefined: not looked yet
       background: Promise.resolve(),
@@ -131,6 +136,7 @@ export class Pages {
       if (typeof saved.codeHash === 'string') page.codeHash = saved.codeHash;
       if (typeof saved.title === 'string') page.title = saved.title;
       if (Number.isSafeInteger(saved.restoredFor)) page.restoredFor = saved.restoredFor;
+      if (Array.isArray(saved.erased)) page.erased = saved.erased.filter(validErasure);
     } catch (err) {
       if (err.code !== 'ENOENT') this.logs.append(id, 'warn', `runner state for this page is unreadable (${err.message}); starting afresh`);
     }
@@ -144,6 +150,16 @@ export class Pages {
       page.swapPending = true;
       this.logs.append(id, 'error', `replacing the data, which the runner stopped in the middle of, failed again: ${err.message}`);
     }
+    // A "delete my data" the previous process died in (or that failed):
+    // finished before anything can read the data, or restore it.
+    if (page.erased.some((e) => e.stage !== 'done')) {
+      try {
+        await this.#finishErasures(page);
+        this.logs.append(id, 'warn', 'finished deleting a user\'s data, which the runner stopped in the middle of');
+      } catch (err) {
+        this.logs.append(id, 'error', `deleting a user's data, which the runner stopped in the middle of, failed again: ${err.message}`);
+      }
+    }
     return page;
   }
 
@@ -151,7 +167,10 @@ export class Pages {
     const file = this.#statePath(page.id);
     await fs.mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${randomBytes(6).toString('hex')}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify({ version: page.version, codeHash: page.codeHash, title: page.title, restoredFor: page.restoredFor }));
+    await fs.writeFile(
+      tmp,
+      JSON.stringify({ version: page.version, codeHash: page.codeHash, title: page.title, restoredFor: page.restoredFor, ...(page.erased.length ? { erased: page.erased } : {}) }),
+    );
     await fs.rename(tmp, file);
   }
 
@@ -327,6 +346,9 @@ export class Pages {
 
   // Takes a snapshot (the caller holds dataLock) and logs what it left out.
   async #snapshot(page, { kind, version, label, protect }) {
+    // A snapshot id the erasures name and that is gone could be taken again
+    // now, by a snapshot that holds data a user made after deleting theirs.
+    await this.#pruneErased(page);
     const { snapshot, skipped } = await takeSnapshot({
       pageDir: this.pageDir(page.id),
       snapshotsDir: this.snapshotsDir(page.id),
@@ -450,6 +472,7 @@ export class Pages {
 
   /** GET /pages/{id}/data. */
   async data(id) {
+    await this.#page(id); // finishes a "delete my data" a restart cut first
     const snapshots = await listSnapshots(this.snapshotsDir(id));
     return {
       usage: {
@@ -528,7 +551,13 @@ export class Pages {
         throw new RunnerError(500, 'internal', `The snapshot cannot be restored: the contents of ${missing.length} of its files are missing.`, ref);
       }
       const before = await this.#snapshot(page, { kind: 'before-restore', protect: sid });
-      await this.#replace(id, SLOTS, (dir) => stageSwapRestore(s.dir, dir));
+      // The users who deleted their data after this snapshot was taken:
+      // their databases were removed from it then, and any copy that
+      // survived stays out. Only this snapshot's own erasures count: data a
+      // user made after deleting theirs is in later snapshots, which come
+      // back whole.
+      const skip = new Set(page.erased.filter((e) => e.snapshots.includes(sid)).map((e) => `${e.user}.sqlite`));
+      await this.#replace(id, SLOTS, (dir) => stageSwapRestore(s.dir, dir, skip));
       const restoredFor = current !== null && page.version !== null && current > page.version ? current : null;
       if (restoredFor !== page.restoredFor) {
         page.restoredFor = restoredFor;
@@ -665,25 +694,152 @@ export class Pages {
   }
 
   /**
-   * DELETE /pages/{id}/my-data. The worker may have the database open: it
-   * is told to close and delete it itself (one synchronous step there, so
-   * no call reopens it in between), rather than taking the whole page
-   * offline, which would hold every other user's calls for as long as the
-   * slowest call in flight. With the page's lock held no worker starts
-   * meanwhile; the runner then deletes what is left (no worker had it).
+   * DELETE /pages/{id}/my-data: the user's database, live and in every
+   * snapshot of the page (docs/page-backends.md, "Details settled in
+   * implementation").
+   *
+   * The worker may have the database open: it is told to close and delete
+   * it itself (one synchronous step there, so no call reopens it in
+   * between), rather than taking the whole page offline, which would hold
+   * every other user's calls for as long as the slowest call in flight.
+   * With the page's lock held no worker starts meanwhile; the runner then
+   * deletes what is left (no worker had it).
+   *
+   * Concurrency: maintLock keeps it apart from restores, imports, wipes,
+   * purges and other deletions; the snapshot work runs under dataLock,
+   * which every snapshot is taken under, so a snapshot in progress (its
+   * .tmp- directory) is finished first and is then one of the snapshots the
+   * deletion rewrites, and none starts before the live database is gone.
+   *
+   * Crash safety: before anything is deleted, the page's state
+   * (state/{pageId}.json) records the erasure: the user's hash, the
+   * snapshots that hold their database, and the stage reached ('live',
+   * then 'snapshots' once the live database is gone, then 'done'). Each
+   * step is idempotent, so a runner that dies midway finishes the work when
+   * it loads the page again (at start-up, Pages.resumeErasures, or at the
+   * page's first use), before anything can read or restore its data. The
+   * record names the snapshots that held the data at deletion time, not
+   * the user: data the user makes afterwards (a new database, in later
+   * snapshots) is never touched by a resumed erasure, nor skipped by a
+   * restore. The record stays, done, for as long as one of those snapshots
+   * does: a restore of one of them leaves that user's database out even if
+   * a copy survived (defence in depth).
    */
   async deleteMyData(id, sub) {
-    const page = await this.#page(id);
-    const file = this.#userDb(id, sub);
-    await this.#chain(page, 'maintLock', () =>
-      this.#locked(page, async () => {
-        for (const w of [page.worker, ...page.draining]) {
-          if (w && !w.gone) await w.forgetUser(userHash(sub));
-        }
-        // Not while a snapshot or a copy reads it.
-        await this.#dataLocked(page, () => removeDb(file));
-      }),
-    );
+    const name = userHash(sub);
+    for (;;) {
+      const page = await this.#page(id);
+      const done = await this.#chain(page, 'maintLock', () =>
+        this.#locked(page, async () => {
+          // A purge ran first: this page state is gone, look again.
+          if (page.purged) return false;
+          for (const w of [page.worker, ...page.draining]) {
+            if (w && !w.gone) await w.forgetUser(name);
+          }
+          await this.#dataLocked(page, async () => {
+            await this.#beginErasure(page, name);
+            await this.#finishErasures(page);
+          });
+          return true;
+        }),
+      );
+      if (done) return;
+    }
+  }
+
+  // Records the erasure of the user `name` (the caller holds dataLock): what
+  // it will delete, before deleting anything.
+  async #beginErasure(page, name) {
+    const live = await dbExists(this.#userDbOf(page.id, name));
+    const holding = (await snapshotsHolding(this.snapshotsDir(page.id), name)).map((s) => s.id);
+    if (!live && holding.length === 0) return; // nothing of theirs
+    const prior = page.erased.find((e) => e.user === name);
+    if (prior) {
+      prior.snapshots = [...new Set([...prior.snapshots, ...holding])];
+      prior.stage = 'live';
+    } else {
+      page.erased.push({ user: name, snapshots: holding, stage: 'live' });
+    }
+    await this.#save(page);
+  }
+
+  // Carries every erasure not done yet to its end (the caller holds
+  // dataLock, or the page is loading: nothing else touches its data).
+  async #finishErasures(page) {
+    const id = page.id;
+    let any = false;
+    for (const e of page.erased) {
+      if (e.stage === 'done') continue;
+      any = true;
+      if (e.stage === 'live') {
+        await removeDb(this.#userDbOf(id, e.user));
+        e.stage = 'snapshots';
+        await this.#save(page);
+      }
+      const snaps = (await listSnapshots(this.snapshotsDir(id))).filter((s) => e.snapshots.includes(s.id));
+      const { rewritten, deleted } = await eraseUserFromSnapshots(snaps, e.user);
+      e.stage = 'done';
+      await this.#save(page);
+      if (rewritten.length || deleted.length) {
+        this.logs.append(id, 'info', `a user's data deleted from ${rewritten.length + deleted.length} snapshot(s)${deleted.length ? `; left empty and deleted: ${deleted.join(', ')}` : ''}`);
+      }
+    }
+    if (!any) return;
+    await this.#pruneErased(page);
+    // Deleted snapshots may have been the newest daily one, or the last to
+    // name some blobs.
+    page.newestDaily = undefined;
+    await collectBlobs(this.pageDir(id), this.snapshotsDir(id)).catch(() => {});
+  }
+
+  // Forgets, in the erasures, the snapshots that are gone, and the erasures
+  // done whose snapshots are all gone.
+  async #pruneErased(page) {
+    if (page.erased.length === 0) return;
+    const ids = new Set((await listSnapshots(this.snapshotsDir(page.id))).map((s) => s.id));
+    let changed = false;
+    const kept = [];
+    for (const e of page.erased) {
+      const snapshots = e.snapshots.filter((s) => ids.has(s));
+      if (snapshots.length !== e.snapshots.length) changed = true;
+      if (snapshots.length === 0 && e.stage === 'done') {
+        changed = true;
+        continue;
+      }
+      kept.push({ ...e, snapshots });
+    }
+    if (!changed) return;
+    page.erased = kept;
+    await this.#save(page);
+  }
+
+  #userDbOf(id, name) {
+    return path.join(this.pageDir(id), 'users', `${name}.sqlite`);
+  }
+
+  /**
+   * Run at start, after the sweeps: finishes the "delete my data" a
+   * previous process died in, for every page that has one.
+   */
+  async resumeErasures() {
+    let names = [];
+    try {
+      names = await fs.readdir(path.join(this.config.dataDir, 'state'));
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    for (const n of names) {
+      if (!n.endsWith('.json')) continue;
+      let saved;
+      try {
+        saved = JSON.parse(await fs.readFile(path.join(this.config.dataDir, 'state', n), 'utf8'));
+      } catch {
+        continue; // a .tmp, or unreadable: #load says so when the page is used
+      }
+      if (Array.isArray(saved?.erased) && saved.erased.some((e) => validErasure(e) && e.stage !== 'done')) {
+        await this.#page(n.slice(0, -'.json'.length));
+      }
+    }
   }
 
   /** DELETE /pages/{id}: everything of the page, idempotent. */
@@ -773,6 +929,21 @@ async function exists(p) {
   } catch {
     return false;
   }
+}
+
+// A database, or what is left of one (its WAL, shared memory or journal).
+async function dbExists(file) {
+  for (const s of ['', '-wal', '-shm', '-journal']) if (await exists(file + s)) return true;
+  return false;
+}
+
+// An erasure as the page's state file has it.
+function validErasure(e) {
+  return (
+    e && typeof e === 'object' && typeof e.user === 'string' && HASH.test(e.user) &&
+    Array.isArray(e.snapshots) && e.snapshots.every((s) => typeof s === 'string') &&
+    ['live', 'snapshots', 'done'].includes(e.stage)
+  );
 }
 
 // Refuses a call for a version older than the one the page runs, or than

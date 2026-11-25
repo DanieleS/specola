@@ -13,6 +13,7 @@
 // the copies (and anything else that reads SQLite in bulk) run on a worker
 // thread: the runner keeps serving other pages meanwhile.
 
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
@@ -89,6 +90,7 @@ const OPS = {
   names: ({ file }) => indexNames(file),
   check: ({ file }) => quickCheck(file),
   index: ({ file, rows, updatedAt }) => buildIndex(file, rows, updatedAt),
+  count: ({ file }) => indexCount(file),
 };
 
 if (!isMainThread && workerData?.snapshotOp) {
@@ -181,6 +183,18 @@ function indexNames(file) {
     return db.prepare('SELECT DISTINCT sha256 FROM files').all().map((r) => r.sha256);
   } catch (err) {
     if (/no such table/.test(err.message)) return [];
+    throw err;
+  } finally {
+    db.close();
+  }
+}
+
+function indexCount(file) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    return db.prepare('SELECT count(*) AS n FROM files').get().n;
+  } catch (err) {
+    if (/no such table/.test(err.message)) return 0;
     throw err;
   } finally {
     db.close();
@@ -468,6 +482,99 @@ export async function deleteSnapshot(pageDir, snapshotsDir, s) {
  */
 export async function snapshotBytes(pageDir, snapshotsDir, snaps) {
   return snapshotsCost(snaps ?? (await listSnapshots(snapshotsDir)), heldOrNone(pageDir, snapshotsDir));
+}
+
+// --- a user's "delete my data" ------------------------------------------------
+
+const DB_SIDECARS = ['', '-wal', '-shm', '-journal'];
+
+/** Whether a snapshot directory holds the user `name`'s database. */
+async function holdsUser(dir, name) {
+  const file = path.join(dir, 'users', `${name}.sqlite`);
+  for (const s of DB_SIDECARS) if (await exists(file + s)) return true;
+  return false;
+}
+
+/** The snapshots (listSnapshots' entries) that hold the user `name`'s database. */
+export async function snapshotsHolding(snapshotsDir, name) {
+  const out = [];
+  for (const s of await listSnapshots(snapshotsDir)) if (await holdsUser(s.dir, name)) out.push(s);
+  return out;
+}
+
+// Whether a snapshot holds nothing once the user `name`'s database is out of
+// it: no shared database, no file index with entries, no other user's
+// database.
+async function emptyWithout(dir, name) {
+  if (await exists(path.join(dir, 'shared.sqlite'))) return false;
+  let users = [];
+  try {
+    users = await fs.readdir(path.join(dir, 'users'));
+  } catch (err) {
+    if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
+  }
+  if (users.some((n) => USER_DB.test(n) && n !== `${name}.sqlite`)) return false;
+  const index = path.join(dir, 'files.sqlite');
+  if (await exists(index)) {
+    try {
+      if ((await thread({ op: 'count', file: index })) > 0) return false;
+    } catch {
+      return false; // can't tell: keep it
+    }
+  }
+  return true;
+}
+
+// Bytes of a snapshot's copies, as its meta.json counts them (everything
+// but meta.json itself, which is written after the size is measured).
+async function copiesBytes(dir) {
+  let total = await dirBytes(dir);
+  for (const n of ['meta.json', 'meta.json.tmp']) {
+    const st = await fs.lstat(path.join(dir, n)).catch(() => null);
+    if (st?.isFile()) total -= st.size;
+  }
+  return total;
+}
+
+/**
+ * Removes the user `name`'s database (with its sidecars) from each of
+ * `snapshots` (listSnapshots' entries): its meta.json gets the new size,
+ * written aside and renamed; a snapshot left with nothing is deleted (renamed
+ * to a .tmp- name first, so a snapshot id is there whole or not at all, and
+ * the start-up sweep removes what a crash leaves). Idempotent: run again on
+ * the same snapshots, it finishes what a previous run left (a database
+ * removed but the size not updated yet, a snapshot emptied but not deleted).
+ * Resolves to {rewritten, deleted}: snapshot ids.
+ */
+export async function eraseUserFromSnapshots(snapshots, name) {
+  const rewritten = [];
+  const deleted = [];
+  for (const s of snapshots) {
+    if (!(await exists(s.dir))) continue;
+    if (await emptyWithout(s.dir, name)) {
+      const gone = path.join(path.dirname(s.dir), `.tmp-erased-${randomBytes(6).toString('hex')}`);
+      await fs.rename(s.dir, gone);
+      await fs.rm(gone, { recursive: true, force: true });
+      deleted.push(s.id);
+      continue;
+    }
+    const file = path.join(s.dir, 'users', `${name}.sqlite`);
+    for (const x of DB_SIDECARS) await fs.rm(file + x, { force: true });
+    const metaFile = path.join(s.dir, 'meta.json');
+    let meta;
+    try {
+      meta = JSON.parse(await fs.readFile(metaFile, 'utf8'));
+    } catch {
+      // No meta.json (a step 1 snapshot not migrated yet): its size is
+      // measured whenever it is listed.
+      rewritten.push(s.id);
+      continue;
+    }
+    const sizeBytes = await copiesBytes(s.dir);
+    if (meta.sizeBytes !== sizeBytes) await writeAtomic(metaFile, JSON.stringify({ ...meta, sizeBytes }));
+    rewritten.push(s.id);
+  }
+  return { rewritten, deleted };
 }
 
 function fmt(n) {

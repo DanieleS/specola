@@ -17,9 +17,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-// Snapshot directory → the sha256s its index names. A snapshot never
-// changes once its directory has its id (it is written aside and renamed
-// into place), so each index is read once.
+// Snapshot directory → {stamp, set}: the sha256s its index names. A
+// snapshot's index never changes once its directory has its id (it is
+// written aside and renamed into place; "delete my data" rewrites only a
+// user database and meta.json in it), so each index is read once. The
+// stamp (the index's inode, size and mtime) catches a directory deleted
+// and then taken again under the same id between two looks.
 const named = new Map();
 
 function indexNames(file) {
@@ -43,12 +46,18 @@ function indexNames(file) {
 }
 
 function snapshotNames(dir) {
-  let set = named.get(dir);
-  if (!set) {
-    const file = path.join(dir, 'files.sqlite');
-    set = new Set(fs.existsSync(file) ? indexNames(file) : []);
-    named.set(dir, set);
+  const file = path.join(dir, 'files.sqlite');
+  let stamp = 'none';
+  try {
+    const st = fs.statSync(file);
+    stamp = `${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    // no index: names nothing
   }
+  const hit = named.get(dir);
+  if (hit && hit.stamp === stamp) return hit.set;
+  const set = new Set(stamp === 'none' ? [] : indexNames(file));
+  named.set(dir, { stamp, set });
   return set;
 }
 

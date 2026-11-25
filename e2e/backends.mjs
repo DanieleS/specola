@@ -573,11 +573,18 @@ async function dataLifecycle(id) {
 }
 
 // viewerData: a viewer downloads their own data from the panel, deletes it,
-// and has none left; the shared data's routes stay closed to them.
+// and has none left, not even through a restore of a snapshot taken while
+// they had it; the shared data's routes stay closed to them.
 async function viewerData(id) {
   const { version } = await api('GET', `/api/pages/${id}`);
   const put = await as(VIEWER, `/api/pages/${id}/x/api/note`, { method: 'PUT', headers: { 'X-Specola-Version': String(version) }, body: 'note of the viewer' });
   check(put.status === 204, 'the viewer writes a note to their own database', put.status);
+  // A manual snapshot holding the viewer's note and the owner's, then the
+  // owner's note changes: restored after the deletion, it brings back the
+  // owner's note and not the viewer's.
+  const held = await api('POST', `/api/pages/${id}/backend/snapshots`, { label: 'e2e with the viewer' });
+  check(held?.kind === 'manual' && held.sizeBytes > 0, 'a manual snapshot with the viewer\'s data', held);
+  await x(id, '/api/note', { method: 'PUT', body: 'owner note after the snapshot' });
   for (const path of ['/backend/data', '/backend/export']) {
     const res = await as(VIEWER, `/api/pages/${id}${path}`);
     check(res.status === 403 && res.headers.get('x-specola-error') === 'forbidden', `a viewer gets 403 on ${path}`, res.status);
@@ -618,7 +625,18 @@ async function viewerData(id) {
     check(gone.status === 404 && gone.headers.get('x-specola-error') === 'no-data' && body?.error === 'no-data', 'then GET …/my-data answers 404 no-data', gone.status);
     const twice = await as(VIEWER, `/api/pages/${id}/backend/my-data`, { method: 'DELETE' });
     check(twice.status === 204, 'deleting it again answers 204', twice.status);
-    check((await x(id, '/api/note')).json?.note === 'note of the dev user', 'other users\' data is untouched');
+    check((await x(id, '/api/note')).json?.note === 'owner note after the snapshot', 'other users\' data is untouched');
+    const shrunk = (await api('GET', `/api/pages/${id}/backend/data`)).snapshots.find((s) => s.id === held.id);
+    check(shrunk && shrunk.sizeBytes < held.sizeBytes, 'the snapshot is still there, smaller: the viewer\'s database left it', { before: held.sizeBytes, after: shrunk?.sizeBytes });
+
+    // The owner restores that snapshot: the viewer's data stays deleted.
+    const restored = await raw('POST', `/api/pages/${id}/backend/snapshots/${held.id}/restore`);
+    check(restored.status === 200, 'the owner restores the snapshot taken before the deletion', restored.status);
+    await restored.arrayBuffer();
+    const still = await as(VIEWER, `/api/pages/${id}/backend/my-data`);
+    const stillBody = await still.json().catch(() => null);
+    check(still.status === 404 && still.headers.get('x-specola-error') === 'no-data' && stillBody?.error === 'no-data', 'after the restore, the viewer\'s my-data is still 404 no-data', still.status);
+    check((await x(id, '/api/note')).json?.note === 'note of the dev user', 'the restore brought back the owner\'s note');
   } finally {
     await ctx.close();
   }

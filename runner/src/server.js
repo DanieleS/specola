@@ -353,11 +353,15 @@ export function createRunner(config, { fetch: f, now, egress: egressOptions = {}
     publisher,
     /** The egress proxy, once started. */
     egress: () => egress,
-    /** Removes what a previous process left half written. */
+    /**
+     * Removes what a previous process left half written, and finishes the
+     * "delete my data" it died in.
+     */
     async sweep() {
       await code.sweep();
       await pages.sweep();
       await sweepSnapshots(config.dataDir);
+      await pages.resumeErasures();
     },
     async listen(port = config.listen.port, host = config.listen.host) {
       await egress;

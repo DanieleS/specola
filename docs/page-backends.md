@@ -719,7 +719,12 @@ background, when the newest `daily` one is older than 24 h.
   of the page** (each snapshot's `meta.json` and size are updated; a
   snapshot left with nothing is deleted). Data a user deleted never comes
   back through a restore. Snapshots are therefore exact copies of the page
-  except for the data users chose to delete.
+  except for the data users chose to delete. The runner records the deletion in
+  the page's state before deleting anything (the user's hash and the
+  snapshots that held their database), finishes it after a restart if it
+  was cut short, and, for as long as one of those snapshots remains, leaves
+  that user's database out of any restore of it; data the user makes after
+  deleting theirs is kept in later snapshots and restored like any other.
 
 **Purge** runs in specola every hour: pages with `backend_used_at` set and
 dormant for longer than the setting get `DELETE /pages/{id}` on the runner,

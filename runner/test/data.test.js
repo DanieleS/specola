@@ -13,6 +13,7 @@ import { after, before, describe, test } from 'node:test';
 import { DEFAULT_LIMITS } from '../src/config.js';
 import { keep, listSnapshots, sweepSnapshots } from '../src/snapshot.js';
 import { pageUsage } from '../src/worker/files.mjs';
+import { createRunner } from '../src/server.js';
 import { TOKEN, backend, logText, startRunner, until } from './helpers.js';
 import { craftZip, exportEntries, sha256 } from './zipcraft.js';
 
@@ -871,6 +872,204 @@ describe('my data', () => {
       assert.deepEqual(await p.mine(u2), ['theirs']);
       assert.doesNotMatch(await logText(r, 'me-1'), /crashed|stopped/);
       assert.equal((await r.api('DELETE', '/pages/me-1/my-data', { sub: 'never-here' })).status, 204);
+    }));
+});
+
+// Only the user's database for /mine: a snapshot of a page where one user
+// has data and nothing else holds nothing once that user deletes theirs.
+const USERS_BACKEND = backend(`export default {
+  async fetch(request, ctx) {
+    const url = new URL(request.url);
+    const v = url.searchParams.get('v');
+    if (url.pathname === '/mine') {
+      ctx.userDb.exec('CREATE TABLE IF NOT EXISTS m (v TEXT)');
+      if (v) ctx.userDb.prepare('INSERT INTO m VALUES (?)').run(v);
+      return Response.json(ctx.userDb.prepare('SELECT v FROM m').all().map((r) => r.v));
+    }
+    ctx.db.exec('CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT, b BLOB)');
+    if (url.pathname === '/add') ctx.db.prepare('INSERT INTO t (v) VALUES (?)').run(v);
+    if (url.pathname === '/big') ctx.db.prepare('INSERT INTO t (v, b) VALUES (?, randomblob(?))').run('big', Number(url.searchParams.get('n')));
+    return Response.json(ctx.db.prepare('SELECT v FROM t ORDER BY id').all().map((r) => r.v));
+  },
+}`);
+
+describe('delete my data, in snapshots', () => {
+  const usersPage = (r, id) => {
+    const v = r.publish(USERS_BACKEND, 'users-1');
+    const call = async (p, user) => {
+      const res = await r.invoke({ ...v, page: id, version: 1, path: p, ...(user ? { user, role: 'viewer' } : {}) });
+      assert.equal(res.status, 200, p);
+      return res.json();
+    };
+    return {
+      call,
+      snap: async (label) => {
+        const res = await r.api('POST', `/pages/${id}/snapshots`, { json: { kind: 'manual', label } });
+        assert.equal(res.status, 201, JSON.stringify(res.body));
+        return res.body;
+      },
+      restore: async (sid) => assert.equal((await r.api('POST', `/pages/${id}/snapshots/${sid}/restore`)).status, 200),
+      data: async () => (await r.api('GET', `/pages/${id}/data`)).body,
+      idle: () => r.runner.pages.idle(id),
+    };
+  };
+  const snapDir = (r, id, sid) => path.join(r.dataDir, 'snapshots', id, sid);
+  const holds = async (r, id, sid, sub) => fs.access(path.join(snapDir(r, id, sid), 'users', `${hash(sub)}.sqlite`)).then(() => true, () => false);
+  const meta = async (r, id, sid) => JSON.parse(await fs.readFile(path.join(snapDir(r, id, sid), 'meta.json'), 'utf8'));
+  // What a snapshot's copies take, as meta.json counts them.
+  const copies = async (dir) => {
+    let n = 0;
+    for (const e of await fs.readdir(dir, { recursive: true, withFileTypes: true })) {
+      if (e.isFile() && !(e.name === 'meta.json' && (e.parentPath ?? e.path) === dir)) n += (await fs.stat(path.join(e.parentPath ?? e.path, e.name))).size;
+    }
+    return n;
+  };
+  const state = async (r, id) => JSON.parse(await fs.readFile(path.join(r.dataDir, 'state', `${id}.json`), 'utf8'));
+
+  test('removes the user\'s database from every snapshot, updates sizes, deletes the ones left empty, keeps the rest', () =>
+    withRunner({}, async (r) => {
+      const p = usersPage(r, 'es');
+      await p.call('/mine?v=one'); // user-1; the daily snapshot holds only this
+      await p.idle();
+      const onlyMine = await p.snap('only user-1');
+      await p.call('/mine?v=theirs', u2);
+      await p.call('/add?v=shared');
+      const all = await p.snap('everyone');
+      const allBefore = await meta(r, 'es', all.id);
+      const daily = (await p.data()).snapshots.find((s) => s.kind === 'daily');
+      assert.ok(daily && (await holds(r, 'es', daily.id, 'user-1')));
+
+      assert.equal((await r.api('DELETE', '/pages/es/my-data', { sub: 'user-1' })).status, 204);
+
+      const { snapshots, usage } = await p.data();
+      const ids = snapshots.map((s) => s.id);
+      assert.ok(!ids.includes(onlyMine.id), 'a snapshot left with nothing is deleted');
+      assert.ok(!ids.includes(daily.id), 'automatic ones too');
+      assert.ok(ids.includes(all.id));
+      for (const s of snapshots) assert.equal(await holds(r, 'es', s.id, 'user-1'), false, s.id);
+      assert.equal(await holds(r, 'es', all.id, 'user-2'), true, 'other users\' databases stay');
+      await fs.access(path.join(snapDir(r, 'es', all.id), 'shared.sqlite'));
+      const allAfter = await meta(r, 'es', all.id);
+      assert.ok(allAfter.sizeBytes < allBefore.sizeBytes, 'the size went down');
+      assert.equal(allAfter.sizeBytes, await copies(snapDir(r, 'es', all.id)));
+      assert.deepEqual({ ...allAfter, sizeBytes: 0 }, { ...allBefore, sizeBytes: 0 }, 'nothing else changes in meta.json');
+      assert.equal(snapshots.find((s) => s.id === all.id).sizeBytes, allAfter.sizeBytes);
+      assert.equal(usage.snapshotBytes, snapshots.reduce((n, s) => n + s.sizeBytes, 0));
+      assert.deepEqual((await fs.readdir(path.join(r.dataDir, 'snapshots', 'es'))).filter((n) => n.startsWith('.tmp-')), []);
+      assert.deepEqual((await state(r, 'es')).erased, [{ user: hash('user-1'), snapshots: [all.id], stage: 'done' }]);
+
+      // A restore of the older snapshot: user-1's data does not come back,
+      // the rest does.
+      await p.call('/add?v=later');
+      await p.restore(all.id);
+      assert.deepEqual(await p.call('/mine'), []);
+      assert.deepEqual(await p.call('/mine', u2), ['theirs']);
+      assert.deepEqual(await p.call('/rows'), ['shared']);
+      // Not even a copy that survived somehow.
+      const stray = path.join(snapDir(r, 'es', all.id), 'users', `${hash('user-1')}.sqlite`);
+      await fs.copyFile(path.join(snapDir(r, 'es', all.id), 'users', `${hash('user-2')}.sqlite`), stray);
+      await p.restore(all.id);
+      assert.deepEqual(await p.call('/mine'), []);
+      assert.deepEqual(await p.call('/mine', u2), ['theirs']);
+      await fs.rm(stray);
+
+      // Using the page again makes new data, which snapshots keep and
+      // restores bring back.
+      assert.deepEqual(await p.call('/mine?v=again'), ['again']);
+      const later = await p.snap('after deleting');
+      await p.call('/mine?v=more');
+      await p.restore(all.id);
+      assert.deepEqual(await p.call('/mine'), []);
+      await p.restore(later.id);
+      assert.deepEqual(await p.call('/mine'), ['again']);
+      assert.deepEqual(await p.call('/mine', u2), ['theirs']);
+
+      // The record goes with the last snapshot it names.
+      assert.equal((await r.api('DELETE', `/pages/es/snapshots/${all.id}`)).status, 204);
+      await p.snap('after the old one went');
+      assert.equal((await state(r, 'es')).erased, undefined);
+    }));
+
+  test('a user without data anywhere: nothing recorded', () =>
+    withRunner({}, async (r) => {
+      const p = usersPage(r, 'es-none');
+      await p.call('/add?v=x');
+      await p.snap('x');
+      assert.equal((await r.api('DELETE', '/pages/es-none/my-data', { sub: 'never-here' })).status, 204);
+      assert.equal((await state(r, 'es-none')).erased, undefined);
+      assert.equal((await p.data()).snapshots.length, 2);
+    }));
+
+  test('a snapshot in progress during the deletion finishes, and is rewritten too', () =>
+    withRunner({}, async (r) => {
+      const p = usersPage(r, 'es-race');
+      await p.call('/mine?v=mine');
+      await p.call('/mine?v=theirs', u2);
+      for (let i = 0; i < 4; i++) await p.call('/big?n=10000000'); // a slow VACUUM INTO
+      await p.idle();
+      const dir = path.join(r.dataDir, 'snapshots', 'es-race');
+      const snapping = r.api('POST', '/pages/es-race/snapshots', { json: { kind: 'manual', label: 'racing' } });
+      await until(async () => (await fs.readdir(dir)).some((n) => n.startsWith('.tmp-')), { every: 2 });
+      const deleting = r.api('DELETE', '/pages/es-race/my-data', { sub: 'user-1' });
+      const snap = await snapping;
+      assert.equal(snap.status, 201);
+      assert.equal((await deleting).status, 204);
+      for (const s of (await p.data()).snapshots) assert.equal(await holds(r, 'es-race', s.id, 'user-1'), false, s.id);
+      assert.equal(await holds(r, 'es-race', snap.body.id, 'user-2'), true);
+      assert.equal((await meta(r, 'es-race', snap.body.id)).sizeBytes, await copies(snapDir(r, 'es-race', snap.body.id)));
+      await p.restore(snap.body.id);
+      assert.deepEqual(await p.call('/mine'), []);
+      assert.deepEqual(await p.call('/mine', u2), ['theirs']);
+    }));
+
+  test('a deletion the runner died in is finished at the next start', () =>
+    withRunner({}, async (r) => {
+      for (const stage of ['live', 'snapshots']) {
+        const id = `es-crash-${stage}`;
+        const p = usersPage(r, id);
+        await p.call('/mine?v=mine');
+        await p.call('/mine?v=theirs', u2);
+        await p.call('/add?v=shared');
+        const snap = await p.snap('before');
+        const onlyMine = path.join(r.dataDir, 'snapshots', id, '20200101T000000Z-manual');
+        await fs.mkdir(path.join(onlyMine, 'users'), { recursive: true });
+        await fs.copyFile(path.join(snapDir(r, id, snap.id), 'users', `${hash('user-1')}.sqlite`), path.join(onlyMine, 'users', `${hash('user-1')}.sqlite`));
+        await fs.writeFile(path.join(onlyMine, 'meta.json'), JSON.stringify({ kind: 'manual', label: 'old', createdAt: '2020-01-01T00:00:00.000Z', sizeBytes: 1 }));
+        await p.idle();
+        // What the runner had done when it died: recorded the erasure and,
+        // at the "snapshots" stage, deleted the live database.
+        const live = path.join(pageDir(r, id), 'users', `${hash('user-1')}.sqlite`);
+        if (stage === 'snapshots') for (const x of ['', '-wal', '-shm']) await fs.rm(live + x, { force: true });
+        const st = await state(r, id);
+        const holding = [];
+        for (const n of await fs.readdir(path.join(r.dataDir, 'snapshots', id))) if (await holds(r, id, n, 'user-1')) holding.push(n);
+        assert.ok(holding.includes(snap.id) && holding.length >= 3, 'the daily one holds it too');
+        st.erased = [{ user: hash('user-1'), snapshots: holding, stage }];
+        await fs.writeFile(path.join(r.dataDir, 'state', `${id}.json`), JSON.stringify(st));
+      }
+      // A new runner process on the same data.
+      const r2 = createRunner({ ...r.config });
+      try {
+        await r2.sweep();
+        for (const stage of ['live', 'snapshots']) {
+          assert.match(r2.logs.since(`es-crash-${stage}`).map((l) => l.text).join('\n'), /finished deleting a user's data/);
+        }
+      } finally {
+        await r2.close();
+      }
+      for (const stage of ['live', 'snapshots']) {
+        const id = `es-crash-${stage}`;
+        const names = await fs.readdir(path.join(r.dataDir, 'snapshots', id));
+        assert.ok(!names.includes('20200101T000000Z-manual'), `${stage}: left empty, deleted`);
+        for (const n of names) assert.equal(await holds(r, id, n, 'user-1'), false, `${stage}: ${n}`);
+        const [snap] = names.filter((n) => n.endsWith('-manual'));
+        assert.equal(await holds(r, id, snap, 'user-2'), true);
+        assert.equal((await meta(r, id, snap)).sizeBytes, await copies(snapDir(r, id, snap)));
+        assert.deepEqual((await fs.readdir(path.join(pageDir(r, id), 'users'))).filter((n) => n.startsWith(hash('user-1'))), [], `${stage}: the live database is gone`);
+        const { erased } = await state(r, id);
+        assert.equal(erased[0].stage, 'done');
+        assert.ok(erased[0].snapshots.includes(snap) && !erased[0].snapshots.includes('20200101T000000Z-manual'));
+      }
     }));
 });
 

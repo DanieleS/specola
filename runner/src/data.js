@@ -367,14 +367,15 @@ export async function stageSwapImport(pageDir, work, swapDir) {
 /**
  * Builds a snapshot's data into a swap: every slot as the snapshot has it
  * (the blobs it names are in the page's store: kept for as long as a
- * snapshot names them). Commit with all the SLOTS.
+ * snapshot names them), except the user databases named in `skip` (file
+ * names: the data of users who deleted theirs). Commit with all the SLOTS.
  */
-export async function stageSwapRestore(snapDir, swapDir) {
+export async function stageSwapRestore(snapDir, swapDir, skip = new Set()) {
   const to = swapNew(swapDir);
   for (const db of ['shared.sqlite', 'files.sqlite']) {
     if (await exists(path.join(snapDir, db))) await fs.copyFile(path.join(snapDir, db), path.join(to, db));
   }
-  const users = await userDbs(path.join(snapDir, 'users'));
+  const users = (await userDbs(path.join(snapDir, 'users'))).filter((n) => !skip.has(n));
   if (users.length) await fs.mkdir(path.join(to, 'users'));
   for (const n of users) await fs.copyFile(path.join(snapDir, 'users', n), path.join(to, 'users', n));
 }
