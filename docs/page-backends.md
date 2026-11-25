@@ -717,8 +717,11 @@ background, when the newest `daily` one is older than 24 h.
   `backendPurgeAt` (the earliest among the pages inside, which aren't
   listed). The purge notice in the viewer is for owners and editors.
 - *Delete my data* closes that database in the worker without taking the
-  page offline. ⚠️ It does not remove the user's database from existing
-  snapshots, and an owner's restore brings it back (see Open questions).
+  page offline, and **also removes the user's database from every snapshot
+  of the page** (each snapshot's `meta.json` and size are updated; a
+  snapshot left with nothing is deleted). Data a user deleted never comes
+  back through a restore. Snapshots are therefore exact copies of the page
+  except for the data users chose to delete.
 
 **Purge** runs in specola every hour: pages with `backend_used_at` set and
 dormant for longer than the setting get `DELETE /pages/{id}` on the runner,
@@ -981,9 +984,6 @@ false and `specola.fetch` rejects with `BackendUnavailable`
 
 ## Open questions
 
-- **"Delete my data" and snapshots**: the user's database survives in
-  snapshots and comes back on restore. Options: tombstones that restore
-  honours, or rewriting the snapshots' copies. Needs a decision.
 
 - **Bun-compatible handlers**: the contract is web-standard, so it may run
   on another runtime later; nothing depends on it now.
