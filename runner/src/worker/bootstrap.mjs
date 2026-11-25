@@ -145,7 +145,7 @@ async function init(msg) {
   snapshotsDir = msg.snapshotsDir;
   diskQuota = msg.diskQuota;
   fs.mkdirSync(pageDir, { recursive: true });
-  quota = new PageQuota(pageDir, diskQuota, (text) => log('warn', [text]));
+  quota = new PageQuota(pageDir, diskQuota, (text) => log('warn', [text]), snapshotsDir);
   await quota.refresh();
   const guardURL = installSqliteGuard(pageDir);
   const guard = await import(guardURL);

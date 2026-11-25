@@ -12,6 +12,7 @@ import (
 func TestRunnerDataRoutes(t *testing.T) {
 	type got struct{ method, path, sub, ctype, body string }
 	var last got
+	var lastVersion string
 	purgeStatus := http.StatusNoContent
 	rs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
@@ -19,7 +20,12 @@ func TestRunnerDataRoutes(t *testing.T) {
 			return
 		}
 		b, _ := io.ReadAll(r.Body)
-		last = got{r.Method, r.URL.EscapedPath(), r.Header.Get("X-Specola-Sub"), r.Header.Get("Content-Type"), string(b)}
+		path := r.URL.EscapedPath()
+		if r.URL.RawQuery != "" {
+			path += "?" + r.URL.RawQuery
+		}
+		last = got{r.Method, path, r.Header.Get("X-Specola-Sub"), r.Header.Get("Content-Type"), string(b)}
+		lastVersion = r.Header.Get("X-Specola-Version")
 		if r.Method == "DELETE" && r.URL.Path == "/pages/p1" {
 			w.WriteHeader(purgeStatus)
 			return
@@ -39,9 +45,10 @@ func TestRunnerDataRoutes(t *testing.T) {
 			got{"POST", "/pages/p1/snapshots", "", "application/json", `{"kind":"manual","label":"a \"b\""}`}},
 		{func() (*http.Response, error) { return r.DeleteSnapshot(ctx, "p1", "20260101T000000Z-manual") },
 			got{"DELETE", "/pages/p1/snapshots/20260101T000000Z-manual", "", "", ""}},
-		{func() (*http.Response, error) { return r.RestoreSnapshot(ctx, "p1", "20260101T000000Z-version-v3") },
+		{func() (*http.Response, error) { return r.RestoreSnapshot(ctx, "p1", "20260101T000000Z-version-v3", 4) },
 			got{"POST", "/pages/p1/snapshots/20260101T000000Z-version-v3/restore", "", "", ""}},
-		{func() (*http.Response, error) { return r.Export(ctx, "p1") }, got{"GET", "/pages/p1/export", "", "", ""}},
+		{func() (*http.Response, error) { return r.Export(ctx, "p1", "Shop & co ✓", 4) },
+			got{"GET", "/pages/p1/export?title=Shop+%26+co+%E2%9C%93&version=4", "", "", ""}},
 		{func() (*http.Response, error) { return r.Import(ctx, "p1", strings.NewReader("PK zip"), 6) },
 			got{"PUT", "/pages/p1/import", "", "application/zip", "PK zip"}},
 		{func() (*http.Response, error) { return r.Import(ctx, "p1", strings.NewReader("PK chunked"), -1) },
@@ -63,6 +70,10 @@ func TestRunnerDataRoutes(t *testing.T) {
 		res.Body.Close()
 		if string(b) != "answer" || last != tc.want {
 			t.Errorf("got %+v (%q), want %+v", last, b, tc.want)
+		}
+		// The current version goes with a restore, and only there.
+		if want := map[bool]string{true: "4"}[strings.HasSuffix(tc.want.path, "/restore")]; lastVersion != want {
+			t.Errorf("%s: X-Specola-Version %q", tc.want.path, lastVersion)
 		}
 	}
 
@@ -89,7 +100,7 @@ func TestRunnerDataStreams(t *testing.T) {
 		io.WriteString(w, "two")
 	}))
 	defer rs.Close()
-	res, err := NewRunner(rs.URL, "tok").Export(context.Background(), "p1")
+	res, err := NewRunner(rs.URL, "tok").Export(context.Background(), "p1", "T", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

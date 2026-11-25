@@ -113,6 +113,29 @@ function subOf(req) {
   return sub;
 }
 
+// The page's current version as specola has it (X-Specola-Version), or
+// null when not said. Throws 400 bad-request.
+function versionOf(req) {
+  const v = req.headers['x-specola-version'];
+  if (v === undefined) return null;
+  if (typeof v !== 'string' || !/^[0-9]{1,15}$/.test(v)) throw badRequest('X-Specola-Version is invalid.');
+  return Number(v);
+}
+
+// The page as specola has it, for an export's manifest: ?title= and
+// ?version= (empty: its current version has none), each when given.
+function aboutOf(req) {
+  const q = new URL(req.url, 'http://runner.invalid').searchParams;
+  const about = {};
+  if (q.has('title')) about.title = q.get('title');
+  if (q.has('version')) {
+    const v = q.get('version');
+    if (v !== '' && !/^[0-9]{1,15}$/.test(v)) throw badRequest('version is invalid.');
+    about.version = v === '' ? null : Number(v);
+  }
+  return about;
+}
+
 // The /pages/{id}/… routes. The page id and the snapshot id are checked
 // against their exact forms before anything becomes a path.
 async function pageRoute(pages, m, req, res, allow) {
@@ -145,7 +168,7 @@ async function pageRoute(pages, m, req, res, allow) {
       if (restore) {
         if (!allow('POST')) return;
         req.resume();
-        sendJSON(res, 200, await pages.restore(id, sid));
+        sendJSON(res, 200, await pages.restore(id, sid, versionOf(req)));
         return;
       }
       if (!allow('DELETE')) return;
@@ -155,7 +178,7 @@ async function pageRoute(pages, m, req, res, allow) {
     case 'export':
       if (!allow('GET')) return;
       req.resume();
-      await pages.exportTo(id, res);
+      await pages.exportTo(id, res, aboutOf(req));
       return;
     case 'import':
       if (allow('PUT')) sendJSON(res, 200, await pages.importFrom(id, req));

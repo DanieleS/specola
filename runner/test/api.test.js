@@ -362,6 +362,9 @@ describe('handlers', () => {
     assert.equal((await (await call({ path: '/list' })).json()).length, 3);
     // content-addressed: two keys, one blob
     assert.equal((await fs.readdir(path.join(pageDir, 'files', 'blobs'))).length, 2);
+    // A daily snapshot being written keeps every blob (it may name them):
+    // let the one the calls above started finish.
+    await r.runner.pages.idle('h-3');
     assert.equal(await (await call({ path: '/delete?key=notes/a.txt' })).json(), true);
     assert.equal((await fs.readdir(path.join(pageDir, 'files', 'blobs'))).length, 2, 'still named by notes/b.txt');
     assert.equal(await (await call({ path: '/delete?key=notes/b.txt' })).json(), true);

@@ -19,6 +19,7 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { DatabaseSync } from 'node:sqlite';
 import { RunnerError } from './errors.js';
 import { INDEX_SCHEMA } from './worker/files.mjs';
+import { heldBlobs } from './worker/usage.mjs';
 
 /** A snapshot id, exactly as the contract has it. */
 export const SNAPSHOT_ID = /^[0-9]{8}T[0-9]{6}Z-[a-z-]+(-v[0-9]+)?$/;
@@ -175,6 +176,8 @@ async function copyDatabases(pageDir, dest) {
 function indexNames(file) {
   const db = new DatabaseSync(file, { readOnly: true });
   try {
+    // The live index may be mid-write in the worker: wait, don't fail.
+    db.exec('PRAGMA busy_timeout = 5000');
     return db.prepare('SELECT DISTINCT sha256 FROM files').all().map((r) => r.sha256);
   } catch (err) {
     if (/no such table/.test(err.message)) return [];
@@ -389,8 +392,10 @@ export async function takeSnapshot({ pageDir, snapshotsDir, kind, label, version
     await fs.rm(tmp, { recursive: true, force: true });
     throw err;
   }
-  await keep(snapshotsDir, limits, [id, protect]);
-  await collectBlobs(pageDir, snapshotsDir);
+  await keep(snapshotsDir, limits, [id, protect], pageDir);
+  // Housekeeping: the snapshot is taken whatever happens here, and the next
+  // collection deletes what this one leaves.
+  await collectBlobs(pageDir, snapshotsDir).catch(() => {});
   return { snapshot: { id, ...meta }, skipped };
 }
 
@@ -399,9 +404,11 @@ export async function takeSnapshot({ pageDir, snapshotsDir, kind, label, version
  * dailySnapshotsKept daily ones and beforeSnapshotsKept of the before-*
  * ones (together); manual ones are never removed here. Then, past
  * snapshotDiskBytes, the oldest automatic ones go first. `spare` lists ids
- * kept whatever (the snapshot just taken; the one being restored).
+ * kept whatever (the snapshot just taken; the one being restored). With
+ * pageDir, the budget counts the blobs only snapshots keep (usage.mjs) as
+ * the snapshots' own, so removing the snapshots that name them frees them.
  */
-export async function keep(snapshotsDir, limits, spare = []) {
+export async function keep(snapshotsDir, limits, spare = [], pageDir = null) {
   const counts = { version: limits.versionSnapshotsKept, daily: limits.dailySnapshotsKept, before: limits.beforeSnapshotsKept };
   const all = await listSnapshots(snapshotsDir);
   const seen = { version: 0, daily: 0, before: 0 };
@@ -411,13 +418,42 @@ export async function keep(snapshotsDir, limits, spare = []) {
     if (f !== 'manual' && ++seen[f] > counts[f] && !spare.includes(s.id)) await fs.rm(s.dir, { recursive: true, force: true });
     else left.push(s);
   }
-  let total = left.reduce((n, s) => n + s.sizeBytes, 0);
+  const held = pageDir ? heldOrNone(pageDir, snapshotsDir) : new Map();
+  const cost = (set) => snapshotsCost(set, held);
+  let kept = [...left];
   for (const s of [...left].reverse()) {
-    if (total <= limits.snapshotDiskBytes) break;
+    if (cost(kept) <= limits.snapshotDiskBytes) break;
     if (s.kind === 'manual' || spare.includes(s.id)) continue;
     await fs.rm(s.dir, { recursive: true, force: true });
-    total -= s.sizeBytes;
+    kept = kept.filter((k) => k !== s);
   }
+}
+
+// heldBlobs, or none when an index can't be read: the budget then counts
+// the copies only, as the snapshots' sizes say.
+function heldOrNone(pageDir, snapshotsDir) {
+  try {
+    return heldBlobs(pageDir, snapshotsDir);
+  } catch {
+    return new Map();
+  }
+}
+
+// Bytes a set of snapshots costs: their copies, and the blobs only they
+// keep, each once.
+function snapshotsCost(snaps, held) {
+  let total = snaps.reduce((n, s) => n + s.sizeBytes, 0);
+  if (held.size === 0) return total;
+  const dirs = new Set(snaps.map((s) => path.basename(s.dir)));
+  for (const h of held.values()) {
+    for (const d of h.by) {
+      if (dirs.has(d)) {
+        total += h.size;
+        break;
+      }
+    }
+  }
+  return total;
 }
 
 /** Deletes one snapshot and the blobs only it named. */
@@ -426,9 +462,12 @@ export async function deleteSnapshot(pageDir, snapshotsDir, s) {
   await collectBlobs(pageDir, snapshotsDir);
 }
 
-/** Bytes of every snapshot of the page. */
-export async function snapshotBytes(snapshotsDir) {
-  return (await listSnapshots(snapshotsDir)).reduce((n, s) => n + s.sizeBytes, 0);
+/**
+ * Bytes the page's snapshots take: their copies and the blobs only they
+ * keep. `snaps` is their listing, when the caller has it.
+ */
+export async function snapshotBytes(pageDir, snapshotsDir, snaps) {
+  return snapshotsCost(snaps ?? (await listSnapshots(snapshotsDir)), heldOrNone(pageDir, snapshotsDir));
 }
 
 function fmt(n) {

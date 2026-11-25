@@ -225,4 +225,32 @@ describe('an import is checked before anything is built', () => {
     await assert.rejects(result, /takes 200000 bytes, more than the page has room for \(100000 bytes\)/);
     await assert.rejects(fs.access(path.join(work, 'blobs')), 'nothing was written');
   });
+
+  test('refuses one sha256 listed with two sizes, before inflating it', async () => {
+    // The big entry first: counted once at the small size, it would be
+    // inflated in full before the small one fails its check.
+    const big = Buffer.alloc(2_000_000);
+    const sha = sha256(big);
+    const index = [
+      { key: 'a', contentType: 'text/plain', size: big.length, sha256: sha },
+      { key: 'b', contentType: 'text/plain', size: 1, sha256: sha },
+    ];
+    const entries = [...exportEntries({ index }), { name: 'files/data/a', data: big }, { name: 'files/data/b', data: 'x' }];
+    const { work, result } = await stage(entries, 1000);
+    await assert.rejects(result, /lists the sha256 [0-9a-f]{64} with two different sizes/);
+    await assert.rejects(fs.access(path.join(work, 'blobs')), 'nothing was written');
+  });
+
+  test('stages the same content once', async () => {
+    const files = [{ key: 'a', data: 'same' }, { key: 'b', data: 'same' }, { key: 'c', data: 'same' }];
+    const { work, result } = await stage(exportEntries({ files }), 4);
+    assert.deepEqual(await result, { shared: false, files: 3, bytes: 4 });
+    assert.deepEqual(await fs.readdir(path.join(work, 'blobs')), [sha256('same')]);
+  });
+
+  test('checks every copy of the same content', async () => {
+    const index = ['a', 'b'].map((key) => ({ key, contentType: 'text/plain', size: 4, sha256: sha256('same') }));
+    const { result } = await stage([...exportEntries({ index }), { name: 'files/data/a', data: 'same' }, { name: 'files/data/b', data: 'diff' }]);
+    await assert.rejects(result, /files\/data\/b does not match its sha256/);
+  });
 });

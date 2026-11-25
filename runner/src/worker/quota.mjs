@@ -12,14 +12,14 @@
 // counted.
 // This file runs inside page workers: it must only import node: modules.
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { formatBytes, pageUsage } from './files.mjs';
+import { formatBytes } from './files.mjs';
+import { pageUsage, pageUsageSync } from './usage.mjs';
 
 const MIN_INTERVAL_MS = 1000;
 
 export class PageQuota {
   #pageDir;
+  #snapshotsDir;
   #limit;
   #warn;
   #free = 0;
@@ -33,9 +33,12 @@ export class PageQuota {
    * @param {string} pageDir
    * @param {number} limit bytes
    * @param {(text: string) => void} warn writes to the backend log
+   * @param {string} [snapshotsDir] the page's snapshots: the blobs only they
+   *   keep count against their quota, not this one (usage.mjs)
    */
-  constructor(pageDir, limit, warn) {
+  constructor(pageDir, limit, warn, snapshotsDir) {
     this.#pageDir = pageDir;
+    this.#snapshotsDir = snapshotsDir;
     this.#limit = limit;
     this.#warn = warn;
   }
@@ -44,7 +47,7 @@ export class PageQuota {
   track(db) {
     // Measured now (once per database and worker): the last measurement may
     // predate what another database wrote since.
-    this.#free = Math.max(0, this.#limit - usageSync(this.#pageDir));
+    this.#free = Math.max(0, this.#limit - pageUsageSync(this.#pageDir, this.#snapshotsDir));
     this.#dbs.add(db);
     this.#cap(db);
   }
@@ -78,7 +81,7 @@ export class PageQuota {
           const wait = this.#last + MIN_INTERVAL_MS - Date.now();
           if (wait > 0 && this.#last) await new Promise((r) => setTimeout(r, wait).unref());
           this.#last = Date.now();
-          const used = await pageUsage(this.#pageDir);
+          const used = await pageUsage(this.#pageDir, this.#snapshotsDir);
           this.#free = Math.max(0, this.#limit - used);
           for (const db of this.#dbs) this.#cap(db);
           // SQLite stops a little short of the limit: "full" is 99% used.
@@ -94,24 +97,4 @@ export class PageQuota {
     })();
     return this.#running;
   }
-}
-
-// pageUsage, for a database opening in a synchronous getter (ctx.db).
-function usageSync(dir) {
-  let total = 0;
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { recursive: true, withFileTypes: true });
-  } catch {
-    return 0;
-  }
-  for (const e of entries) {
-    if (!e.isFile()) continue;
-    try {
-      total += fs.lstatSync(path.join(e.parentPath ?? e.path, e.name)).size;
-    } catch {
-      // deleted meanwhile
-    }
-  }
-  return total;
 }

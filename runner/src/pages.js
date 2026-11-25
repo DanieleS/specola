@@ -16,7 +16,14 @@
 //              the work of a maintenance
 // A maintenance takes the page offline first: new calls wait for it (up to
 // the first-byte timeout, then 503 backend-unavailable), the worker drains
-// and stops, the work runs, and the next call starts a fresh worker.
+// and stops, the work runs, and the next call starts a fresh worker. What
+// it replaces is built aside and swapped in all at once (data.js, "replacing
+// data"), so a failure leaves the page's data as it was or as it should be,
+// never a mix.
+//
+// Exports, imports and "my data" downloads each hold a copy of up to a
+// page's worth of data on the volume for as long as the browser takes, so
+// only a few run at once, per page and in all (429 too-many-requests).
 
 import { randomBytes } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
@@ -24,16 +31,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { entryOf } from './code.js';
-import { exportZip, prepareExport, removeDb, restoreFrom, stageImport, swapImport, usersBytes, userHash, wipe } from './data.js';
+import { SLOTS, commitSwap, exportZip, finishSwap, prepareExport, removeDb, stageImport, stageSwapImport, stageSwapRestore, swapNew, usersBytes, userHash, wipeSlots } from './data.js';
 import { RunnerError } from './errors.js';
 import { PageWorker } from './process.js';
-import { blobNames, collectBlobs, findSnapshot, keep, listSnapshots, publicSnapshot, takeSnapshot, vacuumCopy } from './snapshot.js';
-import { pageUsage } from './worker/files.mjs';
+import { blobNames, collectBlobs, findSnapshot, keep, listSnapshots, publicSnapshot, snapshotBytes, takeSnapshot, vacuumCopy } from './snapshot.js';
+import { pageUsage } from './worker/usage.mjs';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Pages {
   #pages = new Map(); // pageId → Promise<page state>
+  #transfers = 0; // running in all (see #transfer)
 
   /**
    * @param {{config: object, code: import('./code.js').CodeCache, logs: import('./log.js').Logs, now?: () => number}} o
@@ -56,6 +64,11 @@ export class Pages {
 
   snapshotsDir(id) {
     return path.join(this.config.dataDir, 'snapshots', id);
+  }
+
+  /** Where a restore, import or wipe builds the data it swaps in (data.js). */
+  swapDir(id) {
+    return path.join(this.config.dataDir, 'swap', id);
   }
 
   /** Scratch space on the same volume (renames into place), swept at start. */
@@ -89,9 +102,16 @@ export class Pages {
       maintLock: Promise.resolve(),
       offline: null, // {what, done} while a maintenance runs
       purged: false,
-      // The data was replaced by a restore and no call has run on it since:
-      // it is not the state the running version left (see #switch).
-      restored: false,
+      // The data was restored for a version specola had made current and the
+      // runner had not run yet (restoring a version with its data): that
+      // version, until it runs. The data is not the state the running
+      // version left (see #switch), and the versions before it no longer
+      // run.
+      restoredFor: null,
+      // A committed swap that could not be finished (finishSwap): finished
+      // before the page runs again.
+      swapPending: false,
+      transfers: 0,
       newestDaily: undefined, // ms of the newest daily snapshot; undefined: not looked yet
       background: Promise.resolve(),
     };
@@ -100,9 +120,19 @@ export class Pages {
       if (Number.isSafeInteger(saved.version)) page.version = saved.version;
       if (typeof saved.codeHash === 'string') page.codeHash = saved.codeHash;
       if (typeof saved.title === 'string') page.title = saved.title;
-      page.restored = saved.restored === true;
+      if (Number.isSafeInteger(saved.restoredFor)) page.restoredFor = saved.restoredFor;
     } catch (err) {
       if (err.code !== 'ENOENT') this.logs.append(id, 'warn', `runner state for this page is unreadable (${err.message}); starting afresh`);
+    }
+    // A restore, import or wipe the previous process died in: finished if
+    // it had committed, dropped if not. Before anything uses the data.
+    try {
+      if (await finishSwap(this.pageDir(id), this.swapDir(id))) {
+        this.logs.append(id, 'warn', 'finished replacing the data, which the runner stopped in the middle of');
+      }
+    } catch (err) {
+      page.swapPending = true;
+      this.logs.append(id, 'error', `replacing the data, which the runner stopped in the middle of, failed again: ${err.message}`);
     }
     return page;
   }
@@ -111,7 +141,7 @@ export class Pages {
     const file = this.#statePath(page.id);
     await fs.mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${randomBytes(6).toString('hex')}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify({ version: page.version, codeHash: page.codeHash, title: page.title, restored: page.restored }));
+    await fs.writeFile(tmp, JSON.stringify({ version: page.version, codeHash: page.codeHash, title: page.title, restoredFor: page.restoredFor }));
     await fs.rename(tmp, file);
   }
 
@@ -162,7 +192,7 @@ export class Pages {
           continue; // a purge replaced the page's state: look again
         }
         // Cheap refusal first: no need to fetch code that will not run.
-        if (page.version !== null && inv.page.version < page.version) throw superseded(page.version);
+        refuseOld(page, inv.page.version);
         const codeDir = await this.code.ensure(inv.versionId, inv.codeHash);
         // Inside the lock, a maintenance that started meanwhile wins.
         const worker = await this.#locked(page, () => (page.offline || page.purged ? null : this.#workerFor(page, inv, codeDir)));
@@ -180,17 +210,22 @@ export class Pages {
 
   async #workerFor(page, inv, codeDir) {
     const v = inv.page.version;
-    if (page.version !== null && v < page.version) throw superseded(page.version);
+    refuseOld(page, v);
+    if (page.swapPending) {
+      try {
+        await finishSwap(this.pageDir(page.id), this.swapDir(page.id));
+        page.swapPending = false;
+      } catch (err) {
+        this.logs.append(page.id, 'error', `replacing the data failed midway and can't be finished: ${err.message}`);
+        throw new RunnerError(503, 'backend-unavailable', 'The page\'s data is being repaired; retry in a moment.');
+      }
+    }
     if (page.version === null || v > page.version) {
       if (page.version !== null) await this.#switch(page, v);
       page.version = v;
       page.codeHash = inv.codeHash;
       page.title = inv.page.title;
-      page.restored = false;
-      await this.#save(page);
-    } else if (page.restored) {
-      // A call runs on the restored data: from now on it is this version's.
-      page.restored = false;
+      page.restoredFor = null;
       await this.#save(page);
     }
     if (page.worker && !page.worker.gone) return page.worker;
@@ -218,7 +253,7 @@ export class Pages {
   async #switch(page, newVersion) {
     const old = page.version;
     this.logs.append(page.id, 'info', `version switch: ${old} → ${newVersion}`);
-    if (page.restored) {
+    if (page.restoredFor !== null) {
       // Restoring a version with its data restores the data before the new
       // version's first call: that data is not what version `old` left (its
       // own is in the before-restore snapshot), so a snapshot labelled with
@@ -310,6 +345,9 @@ export class Pages {
         await this.#locked(page, () => this.#stopWorkers(page, what));
         return await this.#dataLocked(page, () => fn(page));
       } finally {
+        // A swap that committed and failed to finish: the next call tries
+        // again before it runs.
+        if (await exists(path.join(this.swapDir(id), 'journal.json'))) page.swapPending = true;
         page.offline = null;
         page.newestDaily = undefined;
         release();
@@ -328,6 +366,46 @@ export class Pages {
     await Promise.all(workers.map((w) => w.exited()));
   }
 
+  // Replaces `slots` of the page's data (the page is offline) with what
+  // stage(swapDir) builds in swapNew(swapDir): all of them or, when
+  // anything fails before the commit, none.
+  async #replace(id, slots, stage) {
+    const dir = this.swapDir(id);
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.mkdir(swapNew(dir), { recursive: true });
+    try {
+      await stage(dir);
+    } catch (err) {
+      await fs.rm(dir, { recursive: true, force: true });
+      throw err;
+    }
+    await commitSwap(this.pageDir(id), dir, slots);
+  }
+
+  // Retention again after a restore, import or wipe, sparing the snapshot
+  // taken before it (which is how it is undone): the blobs the operation
+  // left to snapshots alone now count against their budget.
+  async #afterReplace(id, before) {
+    await keep(this.snapshotsDir(id), this.limits, [before.id], this.pageDir(id));
+    await collectBlobs(this.pageDir(id), this.snapshotsDir(id));
+  }
+
+  // Runs a transfer (an export, an import, a "my data" download), if one
+  // more fits: each holds a copy of up to a page's data while it streams.
+  async #transfer(page, fn) {
+    if (page.transfers >= this.limits.transfersPerPage || this.#transfers >= this.limits.transfersMax) {
+      throw new RunnerError(429, 'too-many-requests', 'Too many exports, imports and downloads of data are running; retry in a moment.');
+    }
+    page.transfers++;
+    this.#transfers++;
+    try {
+      return await fn();
+    } finally {
+      page.transfers--;
+      this.#transfers--;
+    }
+  }
+
   // --- the data routes --------------------------------------------------------
 
   /** GET /pages/{id}/data. */
@@ -335,11 +413,12 @@ export class Pages {
     const snapshots = await listSnapshots(this.snapshotsDir(id));
     return {
       usage: {
-        // The quota's own measure (worker/quota.mjs): everything under the
-        // page's directory.
-        pageBytes: await pageUsage(this.pageDir(id)),
+        // The quotas' own measures (worker/usage.mjs): everything under the
+        // page's directory but the blobs only snapshots keep, which count
+        // with the snapshots.
+        pageBytes: await pageUsage(this.pageDir(id), this.snapshotsDir(id)),
         pageLimit: this.limits.pageDiskBytes,
-        snapshotBytes: snapshots.reduce((n, s) => n + s.sizeBytes, 0),
+        snapshotBytes: await snapshotBytes(this.pageDir(id), this.snapshotsDir(id), snapshots),
         snapshotLimit: this.limits.snapshotDiskBytes,
       },
       snapshots: snapshots.map(publicSnapshot),
@@ -373,8 +452,13 @@ export class Pages {
     });
   }
 
-  /** POST /pages/{id}/snapshots/{sid}/restore → {before}. */
-  async restore(id, sid) {
+  /**
+   * POST /pages/{id}/snapshots/{sid}/restore → {before}. current is the
+   * version specola has current (X-Specola-Version), if it said: when the
+   * runner has not run it yet, the data is restored for it (a version
+   * restored with its data), see #switch.
+   */
+  async restore(id, sid, current = null) {
     if (!(await findSnapshot(this.snapshotsDir(id), sid))) throw noSnapshot();
     return this.#maintain(id, 'a restore', async (page) => {
       const s = await findSnapshot(this.snapshotsDir(id), sid);
@@ -404,13 +488,15 @@ export class Pages {
         throw new RunnerError(500, 'internal', `The snapshot cannot be restored: the contents of ${missing.length} of its files are missing.`, ref);
       }
       const before = await this.#snapshot(page, { kind: 'before-restore', protect: sid });
-      await restoreFrom(this.pageDir(id), s.dir);
-      page.restored = true;
-      await this.#save(page);
-      // Kept while the before-restore one was taken; now retention applies
-      // to it like to any other.
-      await keep(this.snapshotsDir(id), this.limits);
-      await collectBlobs(this.pageDir(id), this.snapshotsDir(id));
+      await this.#replace(id, SLOTS, (dir) => stageSwapRestore(s.dir, dir));
+      const restoredFor = current !== null && page.version !== null && current > page.version ? current : null;
+      if (restoredFor !== page.restoredFor) {
+        page.restoredFor = restoredFor;
+        await this.#save(page);
+      }
+      // The restored snapshot was spared while the before-restore one was
+      // taken; now retention applies to it like to any other.
+      await this.#afterReplace(id, before);
       this.logs.append(id, 'info', `data restored from snapshot ${sid} (the data before it is in ${before.id})`);
       return { before: publicSnapshot(before) };
     });
@@ -420,16 +506,26 @@ export class Pages {
   async wipe(id, scope) {
     return this.#maintain(id, 'a wipe', async (page) => {
       const before = await this.#snapshot(page, { kind: 'before-wipe' });
-      await wipe(this.pageDir(id), scope);
-      await collectBlobs(this.pageDir(id), this.snapshotsDir(id));
+      await this.#replace(id, wipeSlots(scope), async () => {});
+      if (scope === 'shared') await fs.rm(path.join(this.pageDir(id), 'files', 'tmp'), { recursive: true, force: true });
+      await this.#afterReplace(id, before);
       this.logs.append(id, 'info', `${scope === 'shared' ? 'shared data and files' : 'every user\'s data'} wiped (the data before it is in ${before.id})`);
       return { before: publicSnapshot(before) };
     });
   }
 
-  /** GET /pages/{id}/export: streams the zip to res. */
-  async exportTo(id, res) {
+  /**
+   * GET /pages/{id}/export: streams the zip to res. about is the page as
+   * specola knows it ({title, version}), for the manifest; what the runner
+   * last saw otherwise.
+   */
+  async exportTo(id, res, about = {}) {
     const page = await this.#page(id);
+    return this.#transfer(page, () => this.#exportTo(page, res, about));
+  }
+
+  async #exportTo(page, res, about) {
+    const id = page.id;
     const pageDir = this.pageDir(id);
     // The copies sit under the page's snapshots as a .tmp- directory: the
     // blob collection (the runner's and the worker's) leaves every blob
@@ -439,7 +535,8 @@ export class Pages {
     try {
       const { shared, rows } = await this.#dataLocked(page, () => prepareExport(pageDir, pin));
       res.writeHead(200, { 'Content-Type': 'application/zip', 'Cache-Control': 'no-store' });
-      const zip = exportZip({ pageDir, pin, shared, rows, page: { id, title: page.title, version: page.version }, now: this.now() });
+      const manifest = { id, title: about.title ?? page.title, version: about.version !== undefined ? about.version : page.version };
+      const zip = exportZip({ pageDir, pin, shared, rows, page: manifest, now: this.now() });
       try {
         await pipeline(zip, res);
       } catch (err) {
@@ -456,6 +553,11 @@ export class Pages {
   async importFrom(id, req) {
     const max = this.limits.importBytes;
     if (Number(req.headers['content-length'] ?? 0) > max) throw tooLarge(max);
+    const page = await this.#page(id);
+    return this.#transfer(page, () => this.#importFrom(id, req, max));
+  }
+
+  async #importFrom(id, req, max) {
     await fs.mkdir(this.tmpDir, { recursive: true });
     const name = `import-${randomBytes(8).toString('hex')}`;
     const zipFile = path.join(this.tmpDir, `${name}.zip`);
@@ -474,14 +576,17 @@ export class Pages {
         createWriteStream(zipFile),
       );
       // Everything is checked and built aside before the page goes offline.
+      // The old files stay only as long as the before-import snapshot names
+      // them, on the snapshots' budget: the room is the page's quota less
+      // what stays, the users' databases.
       const room = this.limits.pageDiskBytes - (await usersBytes(this.pageDir(id)));
       const staged = await stageImport(zipFile, work, { room, now: this.now() });
       await fs.rm(zipFile, { force: true });
       return await this.#maintain(id, 'an import', async (page) => {
         const before = await this.#snapshot(page, { kind: 'before-import' });
         await fs.mkdir(this.pageDir(id), { recursive: true });
-        await swapImport(this.pageDir(id), work);
-        await collectBlobs(this.pageDir(id), this.snapshotsDir(id));
+        await this.#replace(id, ['shared.sqlite', 'files.sqlite'], (dir) => stageSwapImport(this.pageDir(id), work, dir));
+        await this.#afterReplace(id, before);
         this.logs.append(id, 'info', `data imported: ${staged.shared ? 'a shared database' : 'no shared database'} and ${staged.files} file(s) (the data before it is in ${before.id})`);
         return { before: publicSnapshot(before) };
       });
@@ -500,6 +605,10 @@ export class Pages {
     const file = this.#userDb(id, sub);
     if (!(await exists(file))) throw noData();
     const page = await this.#page(id);
+    return this.#transfer(page, () => this.#myDataTo(page, file, res));
+  }
+
+  async #myDataTo(page, file, res) {
     await fs.mkdir(this.tmpDir, { recursive: true });
     const copy = path.join(this.tmpDir, `my-data-${randomBytes(8).toString('hex')}.sqlite`);
     try {
@@ -531,7 +640,8 @@ export class Pages {
         for (const w of [page.worker, ...page.draining]) {
           if (w && !w.gone) await w.forgetUser(userHash(sub));
         }
-        await removeDb(file);
+        // Not while a snapshot or a copy reads it.
+        await this.#dataLocked(page, () => removeDb(file));
       }),
     );
   }
@@ -541,6 +651,7 @@ export class Pages {
     await this.#maintain(id, 'a purge', async (page) => {
       await fs.rm(this.pageDir(id), { recursive: true, force: true });
       await fs.rm(this.snapshotsDir(id), { recursive: true, force: true });
+      await fs.rm(this.swapDir(id), { recursive: true, force: true });
       await fs.rm(this.#statePath(id), { force: true });
       page.purged = true;
       page.version = null;
@@ -594,6 +705,14 @@ async function exists(p) {
   } catch {
     return false;
   }
+}
+
+// Refuses a call for a version older than the one the page runs, or than
+// the one its data was restored for.
+function refuseOld(page, v) {
+  if (page.version === null) return;
+  const current = Math.max(page.version, page.restoredFor ?? 0);
+  if (v < current) throw superseded(current);
 }
 
 function superseded(current) {

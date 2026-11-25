@@ -186,6 +186,8 @@ describe('routes', () => {
     await bad('POST', '/pages/p/wipe', { json: { scope: 'all' } }, /scope must be/);
     await bad('GET', '/pages/p/my-data', {}, /X-Specola-Sub is required/);
     await bad('DELETE', '/pages/p/my-data', {}, /X-Specola-Sub is required/);
+    await bad('POST', '/pages/p/snapshots/20261125T101500Z-daily/restore', { headers: { 'x-specola-version': 'two' } }, /X-Specola-Version is invalid/);
+    await bad('GET', '/pages/p/export?version=-1', {}, /version is invalid/);
     // 100 characters, counted as characters, not UTF-16 units.
     assert.equal((await r.api('POST', '/pages/p-label/snapshots', { json: { kind: 'manual', label: '😀'.repeat(100) } })).status, 201);
   });
@@ -274,11 +276,16 @@ describe('snapshots', () => {
       await p2.call('/add?v=two');
       const v1 = (await p2.data()).snapshots.find((s) => s.kind === 'version');
       // The viewer restores version 1 as version 3, then v1's data, before
-      // version 3's first call.
-      const res = await r.api('POST', `/pages/v-restore/snapshots/${v1.id}/restore`);
+      // version 3's first call: specola says version 3 is current.
+      const res = await r.api('POST', `/pages/v-restore/snapshots/${v1.id}/restore`, { headers: { 'x-specola-version': '3' } });
       assert.equal(res.status, 200);
       const state = JSON.parse(await fs.readFile(path.join(r.dataDir, 'state', 'v-restore.json'), 'utf8'));
-      assert.equal(state.restored, true, 'kept on disk, so a restart does not forget it');
+      assert.equal(state.restoredFor, 3, 'kept on disk, so a restart does not forget it');
+      // A call of version 2 that was on its way meanwhile no longer runs:
+      // version 2's code on version 1's data, and taking it for its own.
+      const late = await p2.call('/rows');
+      assert.equal(late.status, 409);
+      assert.equal(late.error, 'superseded');
       assert.deepEqual(await p3.rows(), ['one']);
       const snaps = (await p3.data()).snapshots;
       assert.deepEqual(snaps.filter((s) => s.kind === 'version').map((s) => s.version), [1], 'no "version 2" snapshot of version 1\'s data');
@@ -287,6 +294,25 @@ describe('snapshots', () => {
       const before = snaps.find((s) => s.id === res.body.before.id);
       assert.equal((await r.api('POST', `/pages/v-restore/snapshots/${before.id}/restore`)).status, 200);
       assert.deepEqual(await p3.rows(), ['one', 'two']);
+    }));
+
+  test('a plain restore, then a new version: the version snapshot holds the restored data', () =>
+    withRunner({}, async (r) => {
+      const p1 = pageOf(r, 'v-restore-3', 1);
+      const p2 = pageOf(r, 'v-restore-3', 2);
+      await p1.call('/add?v=one');
+      const manual = await p1.snap('one row');
+      await p1.call('/add?v=two');
+      // From the panel: specola's current version is the one running.
+      const res = await r.api('POST', `/pages/v-restore-3/snapshots/${manual.body.id}/restore`, { headers: { 'x-specola-version': '1' } });
+      assert.equal(res.status, 200);
+      // Published before any call: the switch keeps what version 1 left.
+      assert.deepEqual(await p2.rows(), ['one']);
+      const v = (await p2.data()).snapshots.find((s) => s.kind === 'version');
+      assert.equal(v?.version, 1, 'version 1 left the restored data');
+      await p2.call('/add?v=three');
+      assert.equal((await r.api('POST', `/pages/v-restore-3/snapshots/${v.id}/restore`)).status, 200);
+      assert.deepEqual(await p2.rows(), ['one']);
     }));
 
   test('a call on restored data makes it the running version\'s again', () =>
@@ -595,7 +621,9 @@ print(json.dumps({i.filename: i.compress_type for i in z.infolist()}))
       assert.deepEqual(manifest.page, { id: 'x-src', title: 'Test page', version: 1 });
       const index = JSON.parse(execFileSync('unzip', ['-p', zipFile, 'files/index.json']));
       assert.deepEqual(index.find((f) => f.key === 'img/p.png'), { key: 'img/p.png', contentType: 'image/png', size: 30_000, sha256: sha256(files[1][1]) });
-      assert.equal((await fs.readdir(path.join(r.dataDir, 'snapshots', 'x-src'))).filter((n) => n.startsWith('.tmp-')).length, 0, 'the export pin is gone');
+      // The pin goes once the zip is written, which the client may see
+      // complete a moment before.
+      await until(async () => (await fs.readdir(path.join(r.dataDir, 'snapshots', 'x-src'))).filter((n) => n.startsWith('.tmp-')).length === 0);
 
       const dst = pageOf(r, 'x-dst');
       await dst.call('/add?v=old');
@@ -672,6 +700,145 @@ print(json.dumps({i.filename: i.compress_type for i in z.infolist()}))
       const res = await r.api('PUT', '/pages/q-imp/import', { body: zip });
       assert.equal(res.status, 400);
       assert.match(res.body.message, /more than the page has room for/);
+    }));
+});
+
+describe('quotas: blobs only snapshots keep are the snapshots\'', () => {
+  test('a shared wipe frees the page\'s room; the snapshot carries the files', () =>
+    withRunner({ pageDiskBytes: 1_000_000 }, async (r) => {
+      const p = pageOf(r, 'qw');
+      assert.equal((await p.put('a', randomBytes(600_000))).status, 200);
+      assert.equal((await r.api('POST', '/pages/qw/wipe', { json: { scope: 'shared' } })).status, 200);
+      const { usage } = await p.data();
+      assert.ok(usage.pageBytes < 100_000, `page bytes ${usage.pageBytes}`);
+      assert.ok(usage.snapshotBytes >= 600_000, `snapshot bytes ${usage.snapshotBytes}`);
+      assert.equal(usage.pageBytes, await pageUsage(pageDir(r, 'qw'), path.join(r.dataDir, 'snapshots', 'qw')));
+      // Room for new files.
+      assert.equal((await p.put('b', randomBytes(600_000))).status, 200);
+    }));
+
+  test('an import does not pile the new files on the old ones', () =>
+    withRunner({ pageDiskBytes: 1_000_000 }, async (r) => {
+      const p = pageOf(r, 'qi');
+      assert.equal((await p.put('old', randomBytes(600_000))).status, 200);
+      const zip = craftZip(exportEntries({ files: [{ key: 'new', data: randomBytes(600_000) }] }));
+      assert.equal((await r.api('PUT', '/pages/qi/import', { body: zip })).status, 200);
+      const { usage } = await p.data();
+      assert.ok(usage.pageBytes < 1_000_000, `page bytes ${usage.pageBytes}`);
+      assert.equal((await p.put('small', randomBytes(10_000))).status, 200);
+    }));
+
+  test('the snapshot budget counts those files once, and retention frees them', () =>
+    withRunner({ snapshotDiskBytes: 1_000_000 }, async (r) => {
+      const p = pageOf(r, 'qb');
+      const ids = [];
+      for (const k of ['a', 'b']) {
+        assert.equal((await p.put(k, randomBytes(600_000))).status, 200);
+        ids.push((await r.api('POST', '/pages/qb/wipe', { json: { scope: 'shared' } })).body.before.id);
+      }
+      const { usage, snapshots } = await p.data();
+      // The first wipe's snapshot (and any daily one that named a) went to
+      // make room for the second's.
+      assert.deepEqual(snapshots.filter((s) => s.kind === 'before-wipe').map((s) => s.id), [ids[1]]);
+      assert.ok(usage.snapshotBytes <= 1_000_000 && usage.snapshotBytes >= 600_000, `snapshot bytes ${usage.snapshotBytes}`);
+    }));
+});
+
+describe('restore leaves nothing half done', () => {
+  test('the before-restore snapshot survives the retention after the restore', () =>
+    withRunner({ snapshotDiskBytes: 350_000 }, async (r) => {
+      const p = pageOf(r, 'rk');
+      await p.call('/big?n=100000');
+      const manual = [];
+      for (let i = 1; i <= 3; i++) manual.push((await p.snap(`m${i}`)).body);
+      await p.call('/add?v=after');
+      const res = await r.api('POST', `/pages/rk/snapshots/${manual[0].id}/restore`);
+      assert.equal(res.status, 200);
+      const ids = (await p.data()).snapshots.map((s) => s.id);
+      assert.ok(ids.includes(res.body.before.id), 'the restore can be undone');
+      assert.equal((await r.api('POST', `/pages/rk/snapshots/${res.body.before.id}/restore`)).status, 200);
+      assert.deepEqual(await p.rows(), ['big', 'after']);
+    }));
+
+  test('a restore that fails while building the data changes nothing', () =>
+    withRunner({}, async (r) => {
+      const p = pageOf(r, 'ra');
+      await p.call('/add?v=one');
+      await p.put('k', 'one', 'text/plain');
+      await p.call('/mine?v=mine');
+      const snap = (await p.snap('one')).body;
+      await p.call('/add?v=two');
+      await p.put('k', 'two', 'text/plain');
+      // A user's database in the snapshot that can't be copied: the shared
+      // database and the file index were copied already.
+      const users = path.join(r.dataDir, 'snapshots', 'ra', snap.id, 'users');
+      const [db] = await fs.readdir(users);
+      await fs.rm(path.join(users, db));
+      await fs.mkdir(path.join(users, db));
+      const res = await r.api('POST', `/pages/ra/snapshots/${snap.id}/restore`);
+      assert.equal(res.status, 500);
+      assert.deepEqual(await p.rows(), ['one', 'two']);
+      assert.equal(String(await p.get('k')), 'two');
+      assert.deepEqual(await p.mine(), ['mine']);
+      await assert.rejects(fs.access(path.join(r.dataDir, 'swap', 'ra')), 'nothing left aside');
+    }));
+
+  test('a swap the runner died in is finished if it committed, dropped if not', () =>
+    withRunner({}, async (r) => {
+      const table = (file, v) => {
+        const db = new DatabaseSync(file);
+        db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, b BLOB)');
+        db.prepare('INSERT INTO t (v) VALUES (?)').run(v);
+        db.close();
+      };
+      for (const [id, committed] of [['died-1', true], ['died-2', false]]) {
+        await fs.mkdir(pageDir(r, id), { recursive: true });
+        table(path.join(pageDir(r, id), 'shared.sqlite'), 'old');
+        const swap = path.join(r.dataDir, 'swap', id);
+        await fs.mkdir(path.join(swap, 'new'), { recursive: true });
+        table(path.join(swap, 'new', 'shared.sqlite'), 'new');
+        if (committed) {
+          const has = { 'shared.sqlite': true, 'files.sqlite': false };
+          await fs.writeFile(path.join(swap, 'journal.json'), JSON.stringify({ slots: ['shared.sqlite', 'files.sqlite'], has }));
+        }
+        assert.deepEqual(await pageOf(r, id).rows(), [committed ? 'new' : 'old'], id);
+        await assert.rejects(fs.access(swap), `${id}: the swap is gone`);
+      }
+      assert.match(await logText(r, 'died-1'), /finished replacing the data/);
+    }));
+});
+
+describe('transfers', () => {
+  test('only a few run at once per page; the others answer 429', () =>
+    withRunner({ transfersPerPage: 1 }, async (r) => {
+      const p = pageOf(r, 'tr');
+      await p.call('/add?v=x');
+      // An import whose zip is still coming.
+      const req = http.request(`${r.url}/pages/tr/import`, {
+        method: 'PUT',
+        headers: { authorization: `Bearer ${TOKEN}`, 'content-length': '100000' },
+      });
+      req.on('error', () => {});
+      req.write(Buffer.alloc(1000));
+      await until(async () => (await fs.readdir(path.join(r.dataDir, 'tmp')).catch(() => [])).some((n) => n.endsWith('.zip')));
+      for (const [method, route] of [['GET', '/pages/tr/export'], ['PUT', '/pages/tr/import']]) {
+        const res = await r.api(method, route, method === 'PUT' ? { body: 'PK' } : {});
+        assert.equal(res.status, 429, route);
+        assert.equal(res.body.error, 'too-many-requests');
+      }
+      assert.equal((await r.api('GET', '/pages/other/export')).status, 200, 'other pages are not held');
+      req.destroy();
+      await until(async () => (await r.api('GET', '/pages/tr/export')).status === 200);
+    }));
+
+  test('an export\'s manifest says the page as specola has it', () =>
+    withRunner({}, async (r) => {
+      const p = pageOf(r, 'about');
+      await p.call('/add?v=x');
+      const res = await r.api('GET', `/pages/about/export?title=${encodeURIComponent('Renamed ✓')}&version=7`);
+      const file = path.join(r.dataDir, 'about.zip');
+      await fs.writeFile(file, res.body);
+      assert.deepEqual(JSON.parse(execFileSync('unzip', ['-p', file, 'manifest.json'])).page, { id: 'about', title: 'Renamed ✓', version: 7 });
     }));
 });
 

@@ -4,7 +4,7 @@
 // an import or a wipe. Pages (pages.js) decides when: these run with the
 // page offline (no worker) when they change anything.
 
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -204,14 +204,31 @@ async function stage(zipFile, work, room, now) {
   const s = byName.get('shared.sqlite');
   if (s?.dir) throw bad('"shared.sqlite/" is not part of the export format.');
   const blobs = new Map();
-  for (const k of keys.values()) blobs.set(k.sha256, k.size);
+  for (const k of keys.values()) {
+    // The same content is the same size: otherwise the sizes counted here
+    // are not what inflating writes.
+    if (blobs.has(k.sha256) && blobs.get(k.sha256) !== k.size) {
+      throw bad(`files/index.json lists the sha256 ${k.sha256} with two different sizes.`);
+    }
+    blobs.set(k.sha256, k.size);
+  }
   const expanded = (s?.usize ?? 0) + [...blobs.values()].reduce((a, b) => a + b, 0);
   if (expanded > room) throw bad(`Its data takes ${expanded} bytes, more than the page has room for (${room} bytes).`);
+  // And what is written is counted as it is written, whatever the entries
+  // declare: the staging space is no page's quota.
+  let written = 0;
+  const count = async function* (src) {
+    for await (const c of src) {
+      written += c.length;
+      if (written > expanded) throw bad(`Its data inflates to more than the ${expanded} bytes it declares.`);
+      yield c;
+    }
+  };
 
   await fs.mkdir(path.join(work, 'blobs'), { recursive: true });
   if (s) {
     const file = path.join(work, 'shared.sqlite');
-    await pipeline(Readable.from(entryData(zipFile, s)), createWriteStream(file));
+    await pipeline(Readable.from(entryData(zipFile, s)), count, createWriteStream(file));
     const head = Buffer.alloc(16);
     const fh = await fs.open(file);
     await fh.read(head, 0, 16, 0);
@@ -226,21 +243,27 @@ async function stage(zipFile, work, room, now) {
     if (check !== 'ok') throw bad(`shared.sqlite is damaged: ${check.slice(0, 200)}.`);
   }
   let n = 0;
+  const staged = new Set();
   for (const k of keys.values()) {
-    const part = path.join(work, 'blobs', `.part-${n++}`);
     const hash = createHash('sha256');
-    await pipeline(
-      Readable.from(entryData(zipFile, k.entry)),
-      async function* (src) {
-        for await (const c of src) {
-          hash.update(c);
-          yield c;
-        }
-      },
-      createWriteStream(part),
-    );
+    const hashing = async function* (src) {
+      for await (const c of src) {
+        hash.update(c);
+        yield c;
+      }
+    };
+    if (staged.has(k.sha256)) {
+      // Content already staged: only checked, not written again.
+      let len = 0;
+      for await (const c of hashing(Readable.from(entryData(zipFile, k.entry)))) len += c.length;
+      if (len !== k.size || hash.digest('hex') !== k.sha256) throw bad(`${DATA_PREFIX}${k.key} does not match its sha256 in files/index.json.`);
+      continue;
+    }
+    const part = path.join(work, 'blobs', `.part-${n++}`);
+    await pipeline(Readable.from(entryData(zipFile, k.entry)), count, hashing, createWriteStream(part));
     const got = hash.digest('hex');
     if (got !== k.sha256) throw bad(`${DATA_PREFIX}${k.key} does not match its sha256 in files/index.json.`);
+    staged.add(got);
     await fs.rename(part, path.join(work, 'blobs', got));
   }
   const rows = [...keys.values()].map(({ key, contentType, size, sha256 }) => ({ key, contentType, size, sha256 }));
@@ -248,68 +271,116 @@ async function stage(zipFile, work, room, now) {
   return { shared: Boolean(s), files: rows.length, bytes: expanded };
 }
 
+// --- replacing data, all or nothing ---------------------------------------
+//
+// A restore, an import or a wipe replaces some of the page's data: its
+// "slots", shared.sqlite, files.sqlite and users/. Replacing them one by one
+// in place would leave a mix (the snapshot's shared data beside the old file
+// index, users' databases half copied) when the disk fills up or the runner
+// dies midway. So the new data is built complete aside, in a swap directory
+// on the same volume (where anything can fail and the page is untouched);
+// then a journal naming the slots is written, which is the commit point;
+// then each slot is swapped by renames. finishSwap() does that last part and
+// can run again from any point, which the runner does at start-up for a
+// swap a previous process left with its journal (and drops one left
+// without: it never committed).
+
+export const SLOTS = Object.freeze(['shared.sqlite', 'files.sqlite', 'users']);
+const JOURNAL = 'journal.json';
+
+/** Where a swap builds the new data (`<swapDir>/new`). */
+export const swapNew = (swapDir) => path.join(swapDir, 'new');
+
+async function exists(p) {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Puts a staged import in place of the page's shared database and file
- * store (users' databases stay). The page is offline.
+ * Commits the swap built in swapNew(swapDir): each slot ends as it is there,
+ * or absent when it is not there. The page is offline.
  */
-export async function swapImport(pageDir, work) {
+export async function commitSwap(pageDir, swapDir, slots) {
+  const has = {};
+  for (const slot of slots) has[slot] = await exists(path.join(swapNew(swapDir), slot));
+  const journal = path.join(swapDir, JOURNAL);
+  const tmp = `${journal}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify({ slots, has }));
+  await fs.rename(tmp, journal);
+  await finishSwap(pageDir, swapDir);
+}
+
+/**
+ * Finishes a committed swap, or drops one that never committed (no
+ * journal). Idempotent. Resolves to whether one was finished.
+ */
+export async function finishSwap(pageDir, swapDir) {
+  let journal;
+  try {
+    journal = JSON.parse(await fs.readFile(path.join(swapDir, JOURNAL), 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT' && !(err instanceof SyntaxError)) throw err;
+    // Never committed (a torn journal.tmp is not one): the page's data is
+    // as it was.
+    await fs.rm(swapDir, { recursive: true, force: true });
+    return false;
+  }
+  await fs.mkdir(pageDir, { recursive: true });
+  for (const slot of journal.slots) {
+    if (!SLOTS.includes(slot)) continue;
+    const src = path.join(swapNew(swapDir), slot);
+    const dest = path.join(pageDir, slot);
+    // Already moved in by an earlier run: done.
+    if (journal.has[slot] && !(await exists(src))) continue;
+    // The old one and its sidecars go first: a WAL left beside the new
+    // file would be replayed into it.
+    if (slot === 'users') await fs.rm(dest, { recursive: true, force: true });
+    else await removeDb(dest);
+    if (journal.has[slot]) await fs.rename(src, dest);
+  }
+  await fs.rm(swapDir, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * Builds a staged import (stageImport's `work`) into a swap: its blobs go
+ * straight into the page's store (content-addressed, so adding them changes
+ * nothing until an index names them), its databases into swapNew(swapDir).
+ * Commit with the slots shared.sqlite and files.sqlite: users' databases
+ * stay.
+ */
+export async function stageSwapImport(pageDir, work, swapDir) {
   const blobs = path.join(pageDir, 'files', 'blobs');
   await fs.mkdir(blobs, { recursive: true });
-  // Content-addressed: a blob already there is the same bytes.
   for (const n of await fs.readdir(path.join(work, 'blobs'))) {
     if (SHA.test(n)) await fs.rename(path.join(work, 'blobs', n), path.join(blobs, n));
   }
-  await replaceDb(path.join(work, 'shared.sqlite'), path.join(pageDir, 'shared.sqlite'), { move: true });
-  await replaceDb(path.join(work, 'files.sqlite'), path.join(pageDir, 'files.sqlite'), { move: true });
-}
-
-// The old database and its sidecars go first: a WAL left beside the new
-// file would be replayed into it.
-async function replaceDb(src, dest, { move = false } = {}) {
-  await removeDb(dest);
-  try {
-    await fs.access(src);
-  } catch {
-    return; // none in the source: the page has none either
+  for (const db of ['shared.sqlite', 'files.sqlite']) {
+    if (await exists(path.join(work, db))) await fs.rename(path.join(work, db), path.join(swapNew(swapDir), db));
   }
-  if (move) {
-    await fs.rename(src, dest);
-    return;
-  }
-  const tmp = `${dest}.${randomBytes(6).toString('hex')}.tmp`;
-  await fs.copyFile(src, tmp);
-  await fs.rename(tmp, dest);
 }
-
-// --- restore and wipe ---------------------------------------------------------
 
 /**
- * Replaces all of the page's data (shared, every user's, the file index)
- * with a snapshot's. The page is offline; the blobs the snapshot names are
- * there (kept by the collection for as long as a snapshot names them).
+ * Builds a snapshot's data into a swap: every slot as the snapshot has it
+ * (the blobs it names are in the page's store: kept for as long as a
+ * snapshot names them). Commit with all the SLOTS.
  */
-export async function restoreFrom(pageDir, snapDir) {
-  await fs.mkdir(pageDir, { recursive: true });
-  await replaceDb(path.join(snapDir, 'shared.sqlite'), path.join(pageDir, 'shared.sqlite'));
-  await replaceDb(path.join(snapDir, 'files.sqlite'), path.join(pageDir, 'files.sqlite'));
-  const users = path.join(pageDir, 'users');
-  for (const n of await userDbs(users)) await removeDb(path.join(users, n));
-  const from = await userDbs(path.join(snapDir, 'users'));
-  if (from.length) await fs.mkdir(users, { recursive: true });
-  for (const n of from) await replaceDb(path.join(snapDir, 'users', n), path.join(users, n));
+export async function stageSwapRestore(snapDir, swapDir) {
+  const to = swapNew(swapDir);
+  for (const db of ['shared.sqlite', 'files.sqlite']) {
+    if (await exists(path.join(snapDir, db))) await fs.copyFile(path.join(snapDir, db), path.join(to, db));
+  }
+  const users = await userDbs(path.join(snapDir, 'users'));
+  if (users.length) await fs.mkdir(path.join(to, 'users'));
+  for (const n of users) await fs.copyFile(path.join(snapDir, 'users', n), path.join(to, 'users', n));
 }
 
-/** Wipes the shared database and file index ("shared") or every user's database ("users"). */
-export async function wipe(pageDir, scope) {
-  if (scope === 'shared') {
-    await removeDb(path.join(pageDir, 'shared.sqlite'));
-    await removeDb(path.join(pageDir, 'files.sqlite'));
-    await fs.rm(path.join(pageDir, 'files', 'tmp'), { recursive: true, force: true });
-    return;
-  }
-  const users = path.join(pageDir, 'users');
-  for (const n of await userDbs(users)) await removeDb(path.join(users, n));
-}
+/** The slots a wipe empties: the shared database and file index ("shared") or every user's database ("users"). */
+export const wipeSlots = (scope) => (scope === 'shared' ? ['shared.sqlite', 'files.sqlite'] : ['users']);
 
 /** Bytes the users' databases take (they stay through an import). */
 export async function usersBytes(pageDir) {

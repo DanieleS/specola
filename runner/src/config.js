@@ -23,6 +23,11 @@ export const DEFAULT_LIMITS = Object.freeze({
   manualSnapshotsMax: 10,
   snapshotDiskBytes: 2048 * MiB,
   importBytes: 1024 * MiB,
+  // Exports, imports and "my data" downloads running at once, per page and
+  // in all: each holds a copy of up to a page's data on the volume while
+  // it streams, at the pace of a browser.
+  transfersPerPage: 2,
+  transfersMax: 8,
 });
 
 // RUNNER_* variable for each limit.

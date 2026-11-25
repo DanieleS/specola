@@ -41,6 +41,11 @@ const (
 	purgeNotice = 7 * 24 * time.Hour
 	// purgeEvery is how often dormant pages are looked for.
 	purgeEvery = time.Hour
+	// maxTransfersPerUserPage bounds the exports, imports and "my data"
+	// downloads one user has running on one page: each holds a copy of up
+	// to a page's data on the runner for as long as the browser takes (the
+	// runner bounds them per page and in all too).
+	maxTransfersPerUserPage = 2
 	// purgeFirst is how long after start the first look is: long enough for
 	// the runner's first health check, short enough that an instance
 	// restarted more often than hourly still purges.
@@ -235,6 +240,22 @@ func fileTitle(t *store.BackendTarget) string {
 	return "page"
 }
 
+// acquireTransfer counts a data transfer of the caller's on the page, or
+// answers 429 too-many-requests when they have too many running already.
+// Counted apart from calls (a long download doesn't hold back the app).
+func (s *Server) acquireTransfer(w http.ResponseWriter, t *store.BackendTarget) bool {
+	if s.calls.acquire(transferKey(t), maxTransfersPerUserPage) {
+		return true
+	}
+	backendError(w, http.StatusTooManyRequests, "too-many-requests",
+		fmt.Sprintf("at most %d exports, imports or downloads of this page's data can run at once", maxTransfersPerUserPage))
+	return false
+}
+
+func (s *Server) releaseTransfer(t *store.BackendTarget) { s.calls.release(transferKey(t)) }
+
+func transferKey(t *store.BackendTarget) string { return "data\x00" + t.User.Sub + "\x00" + t.ID }
+
 // handleBackendDataInfo answers the page's data usage and its snapshots,
 // to its owners and editors.
 func (s *Server) handleBackendDataInfo(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +337,7 @@ func (s *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) {
 	if sid == "" {
 		return
 	}
-	res, err := s.runner.RestoreSnapshot(r.Context(), t.ID, sid)
+	res, err := s.runner.RestoreSnapshot(r.Context(), t.ID, sid, t.Version)
 	if err != nil {
 		s.dataFailed(w, r, err, false, "")
 		return
@@ -335,7 +356,11 @@ func (s *Server) handleBackendExport(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := s.runner.Export(r.Context(), t.ID)
+	if !s.acquireTransfer(w, t) {
+		return
+	}
+	defer s.releaseTransfer(t)
+	res, err := s.runner.Export(r.Context(), t.ID, t.Title, t.Version)
 	if err != nil {
 		s.dataFailed(w, r, err, false, "")
 		return
@@ -370,6 +395,10 @@ func (s *Server) handleBackendImport(w http.ResponseWriter, r *http.Request) {
 	// reading the body in full-duplex mode trips Go's server (a concurrent
 	// read of the body by its background reader).
 	_ = http.NewResponseController(w).EnableFullDuplex()
+	if !s.acquireTransfer(w, t) {
+		return
+	}
+	defer s.releaseTransfer(t)
 	body := &limitedBody{r: r.Body, left: maxImportBytes}
 	size := r.ContentLength
 	if r.Body == nil || r.Body == http.NoBody {
@@ -418,6 +447,10 @@ func (s *Server) handleMyData(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.acquireTransfer(w, t) {
+		return
+	}
+	defer s.releaseTransfer(t)
 	res, err := s.runner.MyData(r.Context(), t.ID, t.User.Sub)
 	if err != nil {
 		s.dataFailed(w, r, err, false, "")

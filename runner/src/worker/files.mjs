@@ -13,6 +13,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { pathProblem } from './paths.mjs';
+import { pageUsage } from './usage.mjs';
 
 const MAX_CONTENT_TYPE = 255;
 
@@ -54,32 +55,8 @@ function checkKey(key) {
   if (why) throw new TypeError(`files: invalid key ${JSON.stringify(key)}: it ${why}`);
 }
 
-/**
- * Bytes the page's directory uses on disk: databases (with their WAL and
- * shared memory files), the file store (writes in progress included) and
- * anything else the code wrote there. Snapshots live elsewhere and have their
- * own quota (see Limits).
- */
-export async function pageUsage(pageDir) {
-  let total = 0;
-  let entries;
-  try {
-    entries = await fs.readdir(pageDir, { recursive: true, withFileTypes: true });
-  } catch (err) {
-    if (err.code === 'ENOENT') return 0;
-    throw err;
-  }
-  for (const e of entries) {
-    if (!e.isFile()) continue;
-    const dir = e.parentPath ?? e.path;
-    try {
-      total += (await fs.lstat(path.join(dir, e.name))).size;
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err; // deleted meanwhile
-    }
-  }
-  return total;
-}
+// What the quota counts (usage.mjs), re-exported for the runner.
+export { pageUsage } from './usage.mjs';
 
 export class FileStore {
   #pageDir;
@@ -132,7 +109,7 @@ export class FileStore {
     if (contentTypeProblem(contentType)) throw new TypeError('files.put: invalid contentType');
     const stream = new Response(body).body;
 
-    const used = await pageUsage(this.#pageDir);
+    const used = await pageUsage(this.#pageDir, this.#snapshotsDir);
     const budget = this.#quota - used;
     const tmpDir = path.join(this.#pageDir, 'files', 'tmp');
     await fs.mkdir(tmpDir, { recursive: true });
@@ -156,7 +133,7 @@ export class FileStore {
       // Measured again with the write on disk: concurrent puts each saw
       // the room left before any of them wrote, and the last of them to get
       // here sees every other one's bytes (in files/tmp or committed).
-      const now = await pageUsage(this.#pageDir);
+      const now = await pageUsage(this.#pageDir, this.#snapshotsDir);
       if (now > this.#quota) throw new QuotaExceededError(now - size, this.#quota);
     } catch (err) {
       await fs.rm(tmp, { force: true });

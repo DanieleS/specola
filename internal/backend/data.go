@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -54,13 +55,20 @@ func (r *Runner) DeleteSnapshot(ctx context.Context, page, sid string) (*http.Re
 }
 
 // RestoreSnapshot asks POST /pages/{id}/snapshots/{sid}/restore: {before}.
-func (r *Runner) RestoreSnapshot(ctx context.Context, page, sid string) (*http.Response, error) {
-	return r.data(ctx, workCall, http.MethodPost, "/pages/"+url.PathEscape(page)+"/snapshots/"+url.PathEscape(sid)+"/restore", nil, 0, "", nil)
+// current is the page's current version, in X-Specola-Version: when the
+// runner has not run it yet (a version just restored with its data), the
+// data is restored for it, and the version it replaces neither runs again
+// nor takes that data for its own.
+func (r *Runner) RestoreSnapshot(ctx context.Context, page, sid string, current int) (*http.Response, error) {
+	return r.data(ctx, workCall, http.MethodPost, "/pages/"+url.PathEscape(page)+"/snapshots/"+url.PathEscape(sid)+"/restore", nil, 0, "",
+		http.Header{"X-Specola-Version": {strconv.Itoa(current)}})
 }
 
-// Export asks GET /pages/{id}/export: the zip, streamed.
-func (r *Runner) Export(ctx context.Context, page string) (*http.Response, error) {
-	return r.data(ctx, transferCall, http.MethodGet, "/pages/"+url.PathEscape(page)+"/export", nil, 0, "", nil)
+// Export asks GET /pages/{id}/export: the zip, streamed. title and version
+// are the page's as specola has them, for the zip's manifest.
+func (r *Runner) Export(ctx context.Context, page, title string, version int) (*http.Response, error) {
+	q := url.Values{"title": {title}, "version": {strconv.Itoa(version)}}
+	return r.data(ctx, transferCall, http.MethodGet, "/pages/"+url.PathEscape(page)+"/export?"+q.Encode(), nil, 0, "", nil)
 }
 
 // Import sends a zip (size bytes, -1 when unknown) to PUT /pages/{id}/import,

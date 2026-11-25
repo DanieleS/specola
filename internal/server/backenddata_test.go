@@ -37,6 +37,7 @@ type fakeData struct {
 
 type dataCall struct {
 	method, path, sub, ctype, body string
+	query, version                 string
 	size                           int64
 }
 
@@ -78,7 +79,8 @@ const snapshotJSON = `{"id":"20260101T000000Z-%s","kind":"%s","createdAt":"2026-
 
 func (fr *fakeRunner) serveData(w http.ResponseWriter, r *http.Request) {
 	d := &fr.data
-	c := dataCall{method: r.Method, path: r.URL.EscapedPath(), sub: r.Header.Get("X-Specola-Sub"), ctype: r.Header.Get("Content-Type")}
+	c := dataCall{method: r.Method, path: r.URL.EscapedPath(), sub: r.Header.Get("X-Specola-Sub"), ctype: r.Header.Get("Content-Type"),
+		query: r.URL.RawQuery, version: r.Header.Get("X-Specola-Version")}
 	_, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/pages/"), "/")
 	route := r.Method + " " + rest
 	if route == "PUT import" {
@@ -268,6 +270,11 @@ func TestBackendDataRoutes(t *testing.T) {
 		if body := readBody(t, res); res.StatusCode != 200 || !strings.Contains(body, `"kind":"before-restore"`) {
 			t.Fatalf("restore: %d %s", res.StatusCode, body)
 		}
+		// With the page's current version: the runner restores the data
+		// for it when it hasn't run it yet.
+		if c := fr.data.last(t); c.version != "1" {
+			t.Fatalf("restore sent X-Specola-Version %q", c.version)
+		}
 	})
 
 	t.Run("refused before the runner", func(t *testing.T) {
@@ -340,10 +347,40 @@ func TestBackendDataRoutes(t *testing.T) {
 		if err != nil || first != "PK-one|" {
 			t.Fatalf("first chunk %q %v", first, err)
 		}
+		// The manifest says the page as specola has it.
+		if c := fr.data.last(t); c.query != "title=Shop&version=1" {
+			t.Fatalf("export query %q", c.query)
+		}
 		// Only now does the runner send the rest: the first chunk came alone.
 		fr.data.exportNext <- struct{}{}
 		if rest, _ := io.ReadAll(rd); string(rest) != "PK-two" {
 			t.Fatalf("rest %q", rest)
+		}
+	})
+
+	t.Run("transfers per user and page are bounded", func(t *testing.T) {
+		fr.data.holdExport.Store(true)
+		defer fr.data.holdExport.Store(false)
+		var held []*http.Response
+		for range maxTransfersPerUserPage {
+			res := dataReq(t, ts, "editor@example.com", "GET", b+"/export", nil, nil)
+			if res.StatusCode != 200 {
+				t.Fatalf("export: %d", res.StatusCode)
+			}
+			held = append(held, res)
+		}
+		wantBackendError(t, dataReq(t, ts, "editor@example.com", "GET", b+"/export", nil, nil), http.StatusTooManyRequests, "too-many-requests")
+		wantBackendError(t, dataReq(t, ts, "editor@example.com", "GET", b+"/my-data", nil, nil), http.StatusTooManyRequests, "too-many-requests")
+		// Someone else's aren't held back, nor the editor's calls.
+		if res := dataReq(t, ts, "viewer@example.com", "GET", b+"/my-data", nil, nil); readBody(t, res) == "" || res.StatusCode != 200 {
+			t.Fatalf("another user's download: %d", res.StatusCode)
+		}
+		for _, res := range held {
+			fr.data.exportNext <- struct{}{}
+			readBody(t, res)
+		}
+		if res := dataReq(t, ts, "editor@example.com", "GET", b+"/my-data", nil, nil); readBody(t, res) == "" || res.StatusCode != 200 {
+			t.Fatalf("after: %d", res.StatusCode)
 		}
 	})
 

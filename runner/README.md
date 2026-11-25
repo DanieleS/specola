@@ -79,8 +79,8 @@ contract, "Wire formats (exact)"):
 | `GET /pages/{id}/data` | `{usage:{pageBytes, pageLimit, snapshotBytes, snapshotLimit}, snapshots}`, newest first |
 | `POST /pages/{id}/snapshots` | `{kind:"manual", label}` → 201 snapshot; 409 `too-many-snapshots` past 10, 409 `snapshot-quota` past the budget |
 | `DELETE /pages/{id}/snapshots/{sid}` | Manual ones only (409 `not-manual`) → 204 |
-| `POST /pages/{id}/snapshots/{sid}/restore` | → `{before}`: the snapshot taken first |
-| `GET /pages/{id}/export` | The zip (`manifest.json`, `shared.sqlite`, `files/index.json`, `files/data/<key>`), streamed |
+| `POST /pages/{id}/snapshots/{sid}/restore` | → `{before}`: the snapshot taken first. `X-Specola-Version`: the page's current version in specola |
+| `GET /pages/{id}/export?title=…&version=…` | The zip (`manifest.json`, `shared.sqlite`, `files/index.json`, `files/data/<key>`), streamed; the manifest names the page with the title and version given |
 | `PUT /pages/{id}/import` | The zip (≤ 1 GiB) → `{before}`; 400 `bad-import` naming what is wrong, nothing changed |
 | `POST /pages/{id}/wipe` | `{scope:"shared"\|"users"}` → `{before}` |
 | `GET` / `DELETE /pages/{id}/my-data` | The `X-Specola-Sub` user's database (404 `no-data`) / delete it → 204 |
@@ -98,12 +98,26 @@ aside first, so a bad zip never takes the page offline. "Delete my data"
 does not take the page offline: the worker closes and deletes that user's
 database itself, in one step, so the other users' calls go on.
 
-A restore marks the page's data as restored (in its state file) until a
-call runs on it. A version switch in between takes no version snapshot:
-that data is not what the leaving version left (its own is in the
-before-restore snapshot). This is what restoring a version with its data
-from the history does: the version first, then its snapshot, before the
-new version's first call.
+What a restore, an import or a wipe replaces is built complete under
+`swap/{pageId}/new/` first (nothing of the page changes if that fails),
+then `swap/{pageId}/journal.json` is written and the databases are swapped
+in by renames. A runner that dies after the journal finishes the swap the
+next time it loads the page; one that dies before it drops it.
+
+Exports, imports and "my data" downloads each hold a copy of up to a
+page's data while they stream: at most 2 run at once per page and 8 in all
+(more answer `429 too-many-requests`).
+
+A restore sent with an `X-Specola-Version` newer than the version the
+runner runs marks the data as restored for that version (in the state
+file). That is what restoring a version with its data from the history
+does: the version first, then its snapshot, before the new version's first
+call. Until that version runs, calls of older ones answer `409 superseded`
+(they would run old code on the restored data), and the switch to it takes
+no version snapshot: the data is not what the leaving version left (its
+own is in the before-restore snapshot). A restore for the version already
+running (from the panel) marks nothing: the restored data is that
+version's, and the next switch snapshots it as usual.
 
 Node's own time limit for receiving a request is 2 hours, so a 1 GiB import
 uploaded slowly through specola is not cut; calls keep their own limits.
@@ -112,12 +126,13 @@ uploaded slowly through specola is not cut; calls keep their own limits.
 
 ```
 /data/code/{codeHash}/…                      extracted .specola/ files, read-only
-/data/state/{pageId}.json                    the version the page runs, and whether its data was just restored (outside the page's reach)
+/data/state/{pageId}.json                    the version the page runs, and the version its data was restored for (outside the page's reach)
 /data/pages/{pageId}/shared.sqlite           ctx.db
 /data/pages/{pageId}/users/{sha256(sub)}.sqlite   ctx.userDb
 /data/pages/{pageId}/files.sqlite            ctx.files index
 /data/pages/{pageId}/files/blobs/{sha256}    ctx.files contents
 /data/snapshots/{pageId}/{id}/               a snapshot and its meta.json (outside the page's reach)
+/data/swap/{pageId}/                         the data a restore, import or wipe swaps in, and its journal
 /data/tmp/                                   imports and downloads in progress (emptied at start)
 ```
 
@@ -134,6 +149,12 @@ store's blobs stay in the page's directory and are deleted only when
 neither the live index nor a snapshot names them. While an export streams,
 a `.tmp-export-*` directory under the page's snapshots holds its copies and
 keeps every blob it names.
+
+A blob that only snapshots name (the files a wipe or an import replaced)
+counts against the snapshots' budget, not the page's quota: the page's
+usage is everything under its directory less those blobs, and snapshot
+retention, which frees them, counts them once with the snapshots that name
+them.
 
 A database the page's code broke (one that SQLite says is not a database,
 or malformed) is left out of a snapshot with a warning in the backend log,

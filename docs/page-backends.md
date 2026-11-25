@@ -690,6 +690,36 @@ timeout, then 503 `backend-unavailable`), and the next call starts a fresh
 worker. Daily snapshots are taken by the runner after a call, in the
 background, when the newest `daily` one is older than 24 h.
 
+**Details settled in implementation.**
+
+- *Quota accounting*: blobs only snapshots still name count toward the
+  snapshot budget, not the page's 1 GiB, so a wipe frees the page's quota.
+  A manual snapshot that doesn't fit the snapshot budget is refused with
+  409 `snapshot-quota` (manual snapshots are never deleted for budget).
+- *Atomic maintenance*: restore, import and wipe stage the new data under
+  `{data}/swap/{pageId}/` with a journal and swap it in; a runner that dies
+  midway finishes a committed swap at start and drops an uncommitted one.
+- *Empty pages*: `before-*` snapshots of a page with no data are empty (so
+  restoring one empties the page); `version` and `daily` ones are skipped.
+- *Restore with data*: after a version is restored together with its data,
+  that version's first call switches without taking a `version` snapshot
+  (the data is no longer what the leaving version left; it is in the
+  `before-restore` snapshot). The runner's restore takes the current
+  version in `X-Specola-Version` for this; export takes `?title=&version=`
+  for its manifest.
+- *Transfer limits*: at most 2 exports, imports or my-data downloads at
+  once per user and page in specola, plus per-page and global caps in the
+  runner: 429 `too-many-requests`. An import over 1 GiB is 413
+  `body-too-large`; a content type other than `application/zip` or
+  `application/x-zip-compressed` is 400 `bad-import`.
+- *Archived pages*: the data routes answer 404 like everything else for an
+  archived page; `GET /api/archived` also gives archived **folders**
+  `backendPurgeAt` (the earliest among the pages inside, which aren't
+  listed). The purge notice in the viewer is for owners and editors.
+- *Delete my data* closes that database in the worker without taking the
+  page offline. ⚠️ It does not remove the user's database from existing
+  snapshots, and an owner's restore brings it back (see Open questions).
+
 **Purge** runs in specola every hour: pages with `backend_used_at` set and
 dormant for longer than the setting get `DELETE /pages/{id}` on the runner,
 then `backend_used_at` cleared. It never runs when backends are disabled
@@ -950,6 +980,10 @@ false and `specola.fetch` rejects with `BackendUnavailable`
    instructions.
 
 ## Open questions
+
+- **"Delete my data" and snapshots**: the user's database survives in
+  snapshots and comes back on restore. Options: tombstones that restore
+  honours, or rewriting the snapshots' copies. Needs a decision.
 
 - **Bun-compatible handlers**: the contract is web-standard, so it may run
   on another runtime later; nothing depends on it now.
