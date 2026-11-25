@@ -1,20 +1,46 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { api, Unauthorized, type PageMeta, type VersionInfo } from "./api";
+  import {
+    api,
+    backendErrorMessage,
+    secretsMissing,
+    Unauthorized,
+    type PageMeta,
+    type Snapshot,
+    type VersionInfo,
+  } from "./api";
+  import BackendPanel, { type BackendTab } from "./BackendPanel.svelte";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
+  import { backends, refreshBackends } from "./backends.svelte";
   import * as offline from "./offline.svelte";
-  import { serveStorage, storageName } from "./pagedata";
+  import { serveStorage, storageName, type Backend } from "./pagedata";
   import ShareDialog from "./ShareDialog.svelte";
+  import { versionSnapshot } from "./snapshots";
 
   let { id }: { id: string } = $props();
 
   let meta = $state<PageMeta | null>(null);
   let error = $state("");
   let sharing = $state(false);
-  let historyOpen = $state(false);
+  // The side panel open, if any.
+  let panel = $state<"history" | "backend" | null>(null);
+  // The Backend panel's tab, kept while it is closed and set by the
+  // missing-secrets notice.
+  let backendTab = $state<BackendTab>("log");
+  let historyOpen = $derived(panel === "history");
   let versions = $state<VersionInfo[]>([]);
   let viewing = $state<number | null>(null); // an older version, or null for current
   let busy = $state(false);
   let copied = $state(false);
+  // A backend call was refused because a newer version is current.
+  let superseded = $state(false);
+  // Restoring a version whose data was kept: asks whether to restore it too.
+  let restoreAsk = $state<{ from: number; snap: Snapshot } | null>(null);
+  let withData = $state(false);
+  // The version was restored but its data wasn't: said until dismissed.
+  let dataFailed = $state("");
+  // Bumped to load the frame again when the version shown stays the same.
+  let reloads = $state(0);
 
   let kept = $derived(offline.index.pages[id]);
   // Without the server, show the copy this device keeps: the version asked
@@ -24,7 +50,13 @@
     viewing ??
       (readOffline && kept && meta && !kept.versions.includes(meta.version) ? kept.versions.at(-1) : meta?.version),
   );
-  let src = $derived(meta && shown && !readOffline ? withVersion(meta.viewUrl, shown) : "");
+  // A page with a backend (docs/page-backends.md, "Versions") can only be
+  // opened at its current version: an older one is history, shown as a
+  // notice rather than loaded (the server would answer 410).
+  let closed = $derived(!!shown && isClosed(shown));
+  // Only the current version can have a backend that runs.
+  let hasBackend = $derived(!!meta?.backend && shown === meta.version);
+  let src = $derived(meta && shown && !readOffline && !closed ? withVersion(meta.viewUrl, shown) : "");
   let offlineSrc = $state("");
   // The kept bundle's files for the page in offlineSrc, if it is one.
   let offlineFiles: offline.BundleFile[] | undefined;
@@ -39,6 +71,28 @@
     return u.toString();
   }
   let canEdit = $derived(meta?.role === "owner" || meta?.role === "editor");
+  // The Backend panel (docs/page-backends.md, "Data lifecycle"): for a page
+  // with a backend, or with data a backend left, while backends may be on.
+  let hasPanel = $derived(
+    !!meta && (!!meta.backend || !!meta.backendData) && !readOffline && (backends.enabled || !backends.known),
+  );
+  // Secrets the backend declares and nobody has set (docs/page-backends.md,
+  // "Secrets"): told to owners and editors, who can set them or ask.
+  let missingSecrets = $derived(hasBackend && canEdit && !readOffline ? secretsMissing(meta) : []);
+  function openSecrets() {
+    backendTab = "secrets";
+    panel = "backend";
+  }
+  // The Secrets tab loaded them: the notice follows without asking again.
+  function setMissing(names: string[]) {
+    if (meta) (meta as PageMeta & { backendSecretsMissing?: string[] }).backendSecretsMissing = names;
+  }
+  function isClosed(n: number) {
+    if (!meta || n === meta.version) return false;
+    const v = versions.find((x) => x.version === n);
+    if (v?.viewable !== undefined) return !v.viewable;
+    return !!meta.backend || !!v?.backend;
+  }
   let shownBundle = $derived(
     versions.find((x) => x.version === shown)?.bundle ??
       (shown === meta?.version ? !!meta?.bundle : !!shown && offline.isBundle(id, shown)),
@@ -67,6 +121,7 @@
       updatedAt: k.updatedAt,
       role: k.role,
       bundle: offline.isBundle(k.id, k.versions.at(-1)!),
+      backend: !!k.backend,
       shared: false,
       favorite: false,
       public: false,
@@ -90,7 +145,13 @@
     meta = null;
     error = "";
     viewing = null;
+    superseded = false;
     load();
+  });
+
+  // Whether the runner is up changes: ask again when a page needs it.
+  $effect(() => {
+    if (meta?.backend && !readOffline) untrack(() => void refreshBackends());
   });
 
   // Online, keep what is shown for offline. Untracked: keeping updates the
@@ -98,7 +159,7 @@
   $effect(() => {
     const m = meta;
     const v = shown;
-    if (!m || !v || readOffline) return;
+    if (!m || !v || readOffline || isClosed(v)) return;
     untrack(() => offline.keep(m, v)).catch((e) => console.warn("keep offline:", e));
   });
 
@@ -109,7 +170,7 @@
     const v = shown;
     offlineSrc = "";
     missing = false;
-    if (!readOffline || !v) return;
+    if (!readOffline || !v || closed) return;
     let url = "";
     let live = true;
     const bundle = offline.isBundle(id, v) ? offline.bundle(id, v) : Promise.resolve(null);
@@ -135,9 +196,21 @@
   $effect(() => {
     const h = host;
     const url = src || offlineSrc;
+    void reloads;
     if (!h || !url) return;
     const title = untrack(() => meta?.name ?? "page");
     const files = src ? undefined : offlineFiles;
+    // Where the page's specola.fetch calls go, if it has a backend.
+    const backend: Backend | undefined = untrack(() =>
+      hasBackend && shown
+        ? {
+            status: () => ({ enabled: backends.enabled, available: backends.available && offline.net.online }),
+            version: shown,
+            offline: !src,
+            onSuperseded: () => (superseded = true),
+          }
+        : undefined,
+    );
     let live = true;
     let stop = () => {};
     storageName(id).then((name) => {
@@ -152,7 +225,7 @@
       if (name) f.name = name;
       f.src = url;
       h.replaceChildren(f);
-      if (name || files) stop = serveStorage(f, id, !!name, files);
+      if (name || files || backend) stop = serveStorage(f, id, !!name, files, backend);
     });
     return () => {
       live = false;
@@ -173,21 +246,75 @@
   }
 
   function toggleHistory() {
-    historyOpen = !historyOpen;
-    if (historyOpen) loadVersions();
+    panel = panel === "history" ? null : "history";
+    if (panel === "history") loadVersions();
   }
 
-  async function restore() {
-    if (viewing === null) return;
-    busy = true;
+  // After a call was refused as superseded: the current version again, in a
+  // new frame (as on any change of version), never by navigating the old one.
+  async function reload() {
+    superseded = false;
+    const before = shown;
     try {
-      await api.restoreVersion(id, viewing);
+      meta = await api.pageMeta(id);
       viewing = null;
-      load();
+      if (meta.version === before) reloads++;
+      if (panel === "history") loadVersions();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // Restore makes a new current version from an older one. On a backend
+  // page, an owner may also bring back the data that version left, when a
+  // snapshot of it was kept (docs/page-backends.md, "Versions").
+  async function restore() {
+    if (viewing === null || !meta) return;
+    const from = viewing;
+    let snap: Snapshot | undefined;
+    busy = true;
+    if (meta.role === "owner" && (meta.backend || meta.backendData) && backends.enabled) {
+      try {
+        snap = versionSnapshot((await api.backendData(id)).snapshots, from);
+      } catch {
+        // No snapshots to offer: the code can still be restored.
+      }
+    }
+    if (snap) {
+      busy = false;
+      withData = false;
+      restoreAsk = { from, snap };
+      return;
+    }
+    try {
+      await restoreVersion(from);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       busy = false;
+    }
+  }
+
+  async function restoreVersion(from: number) {
+    const r = await api.restoreVersion(id, from);
+    viewing = null;
+    load();
+    return r.version;
+  }
+
+  // The dialog's step: the version, then its data if asked. The version stays
+  // restored when the data can't be: that is said apart, not as the dialog's
+  // error, which would read as if nothing had happened.
+  async function restoreWithData() {
+    const a = restoreAsk;
+    if (!a) return;
+    const v = await restoreVersion(a.from);
+    if (!withData) return;
+    try {
+      await api.restoreSnapshot(id, a.snap.id);
+      reloads++;
+    } catch (e) {
+      dataFailed = `Version ${a.from} is restored as v${v}, but its data couldn't be restored: ${backendErrorMessage(e)} The data is as it was; its snapshot can be restored from the Backend panel.`;
     }
   }
 
@@ -244,6 +371,26 @@
           title="An app published with the Specola Vite plugin, made of several files">bundle</span
         >
       {/if}
+      {#if hasBackend}
+        <span
+          class="shrink-0 text-[10px] uppercase tracking-wide text-emerald-300/80 border border-emerald-300/30 rounded px-1.5 py-0.5"
+          title="Has a backend: server code that runs on Specola">backend</span
+        >
+      {/if}
+      {#if missingSecrets.length && hasPanel}
+        <button
+          data-secrets-missing
+          class="shrink-0 text-[10px] uppercase tracking-wide text-amber-400 border border-amber-400/40 rounded px-1.5 py-0.5 hover:bg-amber-500/10"
+          title="The backend declares {missingSecrets.join(', ')}, with no value set: what needs {missingSecrets.length === 1
+            ? 'it'
+            : 'them'} fails. {meta?.role === 'owner' ? 'Set them' : 'An owner sets them'} in the Backend panel's Secrets tab."
+          aria-label={missingSecrets.length === 1 ? "1 secret missing" : `${missingSecrets.length} secrets missing`}
+          onclick={openSecrets}
+          ><!-- Short at phone width, where the row has no room for more. --><span class="sm:hidden">! secrets</span><span
+            class="hidden sm:inline">{missingSecrets.length === 1 ? "1 secret missing" : `${missingSecrets.length} secrets missing`}</span
+          ></button
+        >
+      {/if}
       {#if readOffline}
         <span
           class="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/80 border border-amber-400/30 rounded px-1.5 py-0.5"
@@ -270,6 +417,11 @@
       {/if}
       <button class={action} onclick={copyLink}>{copied ? "Copied" : "Copy link"}</button>
       <button class={action} aria-pressed={historyOpen} onclick={toggleHistory}>History</button>
+      {#if hasPanel}
+        <button class={action} aria-pressed={panel === "backend"} onclick={() => (panel = panel === "backend" ? null : "backend")}
+          >Backend</button
+        >
+      {/if}
       {#if meta?.role === "owner" && !readOffline}
         <button class={action} onclick={() => (sharing = true)}>{meta.shared || meta.public ? "Shared" : "Share"}</button>
       {/if}
@@ -296,11 +448,63 @@
     </div>
   {/if}
 
+  {#if superseded}
+    <div
+      data-superseded
+      class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 sm:px-5 py-2 text-sm bg-sky-500/10 border-b border-sky-500/20"
+    >
+      <span>A new version is available.</span>
+      <button class="px-3 py-1 rounded-md bg-amber-500 text-black font-medium hover:bg-amber-400" onclick={reload}>Reload</button>
+    </div>
+  {/if}
+
+  {#if dataFailed}
+    <div
+      data-restore-data-failed
+      role="alert"
+      class="flex items-start justify-between gap-3 px-3 sm:px-5 py-2 text-sm bg-red-500/10 border-b border-red-500/20 text-red-200"
+    >
+      <span class="break-words">{dataFailed}</span>
+      <button class="shrink-0 text-white/60 hover:text-white" aria-label="Dismiss" onclick={() => (dataFailed = "")}>✕</button>
+    </div>
+  {/if}
+
+  {#if meta?.backendPurgeAt && canEdit && !readOffline}
+    <p data-purge-notice class="px-3 sm:px-5 py-1.5 text-xs text-red-300/90 border-b border-white/10">
+      This page's backend data will be deleted on {new Date(meta.backendPurgeAt).toLocaleDateString(undefined, {
+        dateStyle: "long",
+      })}: its current version has no backend. Export it from the Backend panel to keep a copy.
+    </p>
+  {/if}
+
+  {#if hasBackend && !closed}
+    {#if readOffline}
+      <p data-backend-notice class="px-3 sm:px-5 py-1.5 text-xs text-white/50 border-b border-white/10">
+        Offline: this page's backend can't be reached, so what needs it won't work until you're back online.
+      </p>
+    {:else if backends.known && !backends.enabled}
+      <p data-backend-notice class="px-3 sm:px-5 py-1.5 text-xs text-white/50 border-b border-white/10">
+        This page has a backend, but page backends are not enabled on this instance: what needs it won't work.
+      </p>
+    {:else if backends.known && !backends.available}
+      <p data-backend-notice class="px-3 sm:px-5 py-1.5 text-xs text-white/50 border-b border-white/10">
+        This page's backend is unavailable right now: what needs it may not work.
+      </p>
+    {/if}
+  {/if}
+
   {#if error}
     <p class="p-5 text-red-400">{error}</p>
   {:else}
     <div class="relative flex flex-1 min-h-0">
-      {#if missing}
+      {#if closed && meta}
+        <div data-closed-version class="flex-1 p-5 text-white/60">
+          <p>This page has a backend: only its current version can be opened.</p>
+          <button class="mt-2 text-amber-400 hover:text-amber-300" onclick={() => (viewing = null)}
+            >Open the current version (v{meta.version})</button
+          >
+        </div>
+      {:else if missing}
         <p class="flex-1 p-5 text-white/50">
           Version {shown} isn't {shownBundle ? "available offline" : "kept on this device"}. It can be opened when you're back
           online.
@@ -331,6 +535,14 @@
                     <span class="font-medium">v{v.version}</span>
                     {#if current}<span class="text-[10px] uppercase text-amber-400/80">current</span>{/if}
                     {#if v.bundle}<span class="text-[10px] uppercase text-sky-300/70">bundle</span>{/if}
+                    {#if v.backend}<span class="text-[10px] uppercase text-emerald-300/70">backend</span>{/if}
+                    {#if isClosed(v.version)}
+                      <span
+                        class="text-[10px] uppercase text-white/40"
+                        title="This page has a backend: only its current version can be opened. It can still be restored."
+                        >not viewable</span
+                      >
+                    {/if}
                     {#if readOffline && kept?.versions.includes(v.version)}
                       <span class="text-[10px] uppercase text-white/40" title="Kept on this device">offline</span>
                     {/if}
@@ -347,9 +559,42 @@
           </ul>
         </aside>
       {/if}
+      {#if panel === "backend" && hasPanel && meta}
+        <BackendPanel
+          page={meta}
+          bind:tab={backendTab}
+          onclose={() => (panel = null)}
+          ondatachange={() => reloads++}
+          onsecretsmissing={setMissing}
+        />
+      {/if}
     </div>
   {/if}
 </div>
+
+{#if restoreAsk && meta}
+  {@const a = restoreAsk}
+  <ConfirmDialog
+    title="Restore version {a.from}?"
+    confirmLabel="Restore as v{meta.version + 1}"
+    run={restoreWithData}
+    onclose={() => (restoreAsk = null)}
+  >
+    <p>This makes a new current version, v{meta.version + 1}, from version {a.from}'s code.</p>
+    <label class="flex items-start gap-2 pt-1 text-white/90">
+      <input type="checkbox" class="mt-1 accent-amber-500" bind:checked={withData} data-restore-data />
+      <span>Also restore the data as version {a.from} left it ({fmt(a.snap.createdAt)})</span>
+    </label>
+    {#if withData}
+      <p class="text-white/50">
+        That replaces all of the page's backend data, every user's included, with that snapshot's. A snapshot of the data as it
+        is now is taken first, so you can go back.
+      </p>
+    {:else}
+      <p class="text-white/50">The data stays as it is now.</p>
+    {/if}
+  </ConfirmDialog>
+{/if}
 
 {#if sharing && meta}
   <ShareDialog

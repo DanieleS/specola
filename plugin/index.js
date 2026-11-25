@@ -1,21 +1,30 @@
 // @specola/vite-plugin: builds a Vite app as a Specola bundle.
-// The contract it implements is docs/spa-bundles.md in the Specola repository.
+// The contract it implements is docs/spa-bundles.md in the Specola repository,
+// and docs/page-backends.md for an app with a server (the `server` option).
 
 import { readdirSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
+import { buildServer, isServerModule, listOutput, resolveBackend } from './lib/backend.js';
+import { CRON_PREFIX, DEV_DATA_DIR, DEV_PREFIX, EVENTS_PATH, createDevBackend, describeCron } from './lib/dev.js';
 import { escapeHTML, injectBody, injectHead, rewriteIndexRefs } from './lib/html.js';
+import { BACKEND_PREFIX } from './lib/manifest.js';
 import { DEFAULT_LIMITS, bundleProblems, isHTMLPath, isJunk } from './lib/rules.js';
 import { findSprites, spriteWarning } from './lib/sprites.js';
+import { standInScript } from './lib/standin.js';
 import { VERSION } from './lib/version.js';
 
 export { VERSION };
 
-// Stand-in for the boot data the Specola page SDK provides, so that apps that
-// read window.specola run under `vite dev`. Storage is the browser's own.
-const DEV_SPECOLA =
-  'if (typeof window.specola === "undefined") {' +
-  ' window.specola = { base: "/", basename: "", persistent: false, flush: async () => {} };' +
-  ' }';
+/**
+ * Stand-in for what the Specola page SDK provides, so that apps that read
+ * window.specola run under `vite dev` (lib/standin.js). Storage is the
+ * browser's own. specola.fetch and specola.subscribe go to the dev backend
+ * when the app has one; otherwise fetch rejects as it does on a page without
+ * a backend, and subscribe hears nothing.
+ */
+export function devSpecola(hasBackend) {
+  return standInScript(hasBackend);
+}
 
 /**
  * The Specola Vite plugin.
@@ -31,6 +40,8 @@ export function specola(options = {}) {
   let userBase;
   let userWorkerFormat;
   let config;
+  let backend = null;
+  let devBackend = null;
 
   return {
     name: 'specola',
@@ -47,11 +58,18 @@ export function specola(options = {}) {
     config(user) {
       userBase = user.base;
       userWorkerFormat = user.worker?.format;
-      return { base: './', worker: { format: 'iife', ...workerSplitOptions(this?.meta?.viteVersion) } };
+      return {
+        base: './',
+        worker: { format: 'iife', ...workerSplitOptions(this?.meta?.viteVersion) },
+        // The dev backend's databases change on every write.
+        server: { watch: { ignored: [`**/${DEV_DATA_DIR}/**`] } },
+      };
     },
 
     configResolved(resolved) {
       config = resolved;
+      // A build of the project's own SSR entry is none of the plugin's business.
+      if (!resolved.build.ssr) backend = resolveBackend(options, resolved);
       if (userBase !== undefined && userBase !== './' && userBase !== '') {
         resolved.logger.warn(`[specola] ignoring base ${JSON.stringify(userBase)}: Specola bundles are built with base "./"`);
       }
@@ -66,8 +84,49 @@ export function specola(options = {}) {
       order: 'pre',
       handler() {
         if (config?.command !== 'serve') return undefined;
-        return [{ tag: 'script', children: DEV_SPECOLA, injectTo: 'head-prepend' }];
+        return [{ tag: 'script', children: devSpecola(backend !== null), injectTo: 'head-prepend' }];
       },
+    },
+
+    // Mounted directly (not in a returned function) so that it runs before
+    // Vite's own middlewares, whose SPA fallback would answer index.html.
+    async configureServer(server) {
+      if (!backend) return;
+      // The project's Vite, for .env files: secrets come from there too.
+      const { loadEnv } = await import('vite');
+      const envDir = server.config.envDir === false ? null : (server.config.envDir ?? server.config.root);
+      devBackend = createDevBackend({
+        root: server.config.root,
+        manifest: backend.manifest,
+        load: () => server.ssrLoadModule(backend.entry),
+        env: () => ({ ...(envDir ? loadEnv(server.config.mode, envDir, '') : {}), ...process.env }),
+        logger: {
+          info: (m) => server.config.logger.info(m, { timestamp: true }),
+          warn: (m) => server.config.logger.warn(m, { timestamp: true }),
+          error: (...a) => console.error(...a),
+        },
+      });
+      server.middlewares.use(DEV_PREFIX, devBackend.middleware);
+      server.middlewares.use(EVENTS_PATH, devBackend.events);
+      server.middlewares.use(CRON_PREFIX, devBackend.cron);
+      // Jobs don't run on their schedule here: say which there are and how
+      // to run one.
+      if (backend.manifest.cron.length > 0) {
+        const print = () => {
+          const addr = server.httpServer?.address();
+          const port = addr && typeof addr === 'object' ? addr.port : server.config.server.port;
+          server.config.logger.info(describeCron(backend.manifest, `http://localhost:${port ?? 5173}`));
+        };
+        if (server.httpServer && !server.httpServer.listening) server.httpServer.once('listening', print);
+        else print();
+      }
+    },
+
+    closeBundle() {
+      if (config?.command === 'serve') {
+        devBackend?.close();
+        devBackend = null;
+      }
     },
 
     generateBundle(_outputOptions, bundle) {
@@ -76,6 +135,26 @@ export function specola(options = {}) {
 
       const publicFiles = listPublicFiles(config);
       const files = new Set([...Object.keys(bundle), ...publicFiles.map((f) => f.path)]);
+
+      // .specola/ is the backend's, written by the server build only: the
+      // app must not put files there (they would never be served), nor
+      // bundle the server's code (which would be).
+      const reserved = [...files].filter((p) => p.startsWith(BACKEND_PREFIX));
+      if (reserved.length > 0) {
+        this.error(`${BACKEND_PREFIX} is reserved for the page backend, but the app's build has ${reserved.join(', ')}`);
+      }
+      if (backend) {
+        for (const f of Object.values(bundle)) {
+          if (f.type !== 'chunk') continue;
+          const leaked = (f.moduleIds ?? Object.keys(f.modules ?? {})).filter((id) => isServerModule(id, backend, config.root));
+          if (leaked.length > 0) {
+            this.error(
+              `the app imports server code (${leaked.map((id) => relative(config.root, id.split('?')[0])).join(', ')}) into ${f.fileName}: ` +
+                'it would be served to every viewer. Reach the backend with specola.fetch instead, and keep shared code outside the server directory.',
+            );
+          }
+        }
+      }
 
       const otherHTML = [...files].filter((p) => isHTMLPath(p) && p !== 'index.html');
       if (otherHTML.length > 0) {
@@ -110,6 +189,22 @@ export function specola(options = {}) {
       if (problems.length > 0) {
         this.error(`the build is not a valid Specola bundle:\n  - ${problems.join('\n  - ')}`);
       }
+    },
+
+    // After the app is written: the server build, into .specola/ of the same
+    // output, then the limits again over everything that will be uploaded.
+    writeBundle: {
+      sequential: true,
+      async handler() {
+        if (!backend || config.command !== 'build' || config.build.ssr) return;
+        if (this.environment && this.environment.config?.consumer === 'server') return;
+        await buildServer(await import('vite'), config, backend);
+        const outDir = resolve(config.root, config.build.outDir);
+        const problems = bundleProblems(listOutput(outDir).filter((f) => !isJunk(f.path)), limits);
+        if (problems.length > 0) {
+          throw new Error(`[specola] the build with its backend is not a valid Specola bundle:\n  - ${problems.join('\n  - ')}`);
+        }
+      },
     },
   };
 }

@@ -109,6 +109,10 @@ func (s *Store) RedeemUpload(ctx context.Context, token, html string) (id string
 		case g.kind == GrantUploadVersion && g.assetID != nil:
 			id = *g.assetID
 			version, err = addVersion(ctx, tx, id, html, g.note, g.sub, nil)
+			if err == nil {
+				// A plain version: the page's scheduled jobs end (cron.go).
+				err = syncBackendCron(ctx, tx, id, time.Now())
+			}
 		default:
 			return ErrGrantKind
 		}

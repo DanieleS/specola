@@ -72,9 +72,27 @@ func main() {
 	st := store.New(pool)
 	go sweepGrants(ctx, st)
 
+	if cfg.TestCronEvery != 0 || cfg.TestClockOffset != 0 {
+		slog.Warn("test hooks set: for tests only", "SPECOLA_TEST_CRON_EVERY", cfg.TestCronEvery, "SPECOLA_TEST_CLOCK_OFFSET", cfg.TestClockOffset)
+	}
+	h := server.New(cfg, st, authn, tokens)
+	if cfg.BackendsEnabled() {
+		slog.Info("page backends: enabled", "runner", cfg.RunnerURL)
+		go h.WatchRunner(ctx)
+		// Scheduled jobs: every replica ticks; claims keep them from running
+		// a slot twice.
+		go h.RunCron(ctx)
+		if cfg.BackendPurgeAfterDays > 0 {
+			slog.Info("page backends: purging the data of pages dormant for longer than", "days", cfg.BackendPurgeAfterDays)
+			go h.PurgeBackends(ctx)
+		}
+	} else {
+		slog.Info("page backends: disabled (set SPECOLA_RUNNER_URL, SPECOLA_RUNNER_TOKEN and SPECOLA_SECRETS_KEY to enable)")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           server.New(cfg, st, authn, tokens),
+		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

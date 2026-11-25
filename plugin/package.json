@@ -1,7 +1,7 @@
 {
   "name": "@specola/vite-plugin",
-  "version": "1.0.0",
-  "description": "Build a Vite app as a Specola bundle and publish it with specola-publish",
+  "version": "1.1.0",
+  "description": "Build a Vite app (and its page backend) as a Specola bundle and publish it with specola-publish",
   "type": "module",
   "exports": {
     ".": {
@@ -10,6 +10,9 @@
     },
     "./client": {
       "types": "./client.d.ts"
+    },
+    "./server": {
+      "types": "./server.d.ts"
     },
     "./package.json": "./package.json"
   },
@@ -21,6 +24,7 @@
     "index.js",
     "index.d.ts",
     "client.d.ts",
+    "server.d.ts",
     "lib/",
     "bin/",
     "README.md"

@@ -30,14 +30,14 @@ func TestPublicLinkExpiryAndOwnership(t *testing.T) {
 	if link.ExpiresAt == nil || time.Until(*link.ExpiresAt) < 59*time.Minute {
 		t.Fatalf("expires at %v, want in an hour", link.ExpiresAt)
 	}
-	if html, _, err := st.OpenPublicLink(ctx, token); err != nil || html != "<p>plan</p>" {
-		t.Fatalf("open = %q, %v", html, err)
+	if sv, err := st.OpenPublicLink(ctx, token); err != nil || sv.HTML != "<p>plan</p>" {
+		t.Fatalf("open = %+v, %v", sv, err)
 	}
 
 	if _, err := pool.Exec(ctx, `UPDATE public_link SET expires_at = now() - interval '1 second' WHERE id = $1::uuid`, link.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.OpenPublicLink(ctx, token); !errors.Is(err, ErrLinkExpired) {
+	if _, err := st.OpenPublicLink(ctx, token); !errors.Is(err, ErrLinkExpired) {
 		t.Fatalf("expired: %v, want ErrLinkExpired", err)
 	}
 	links, err := st.PublicLinks(ctx, "alice", page)
@@ -63,7 +63,7 @@ func TestPublicLinkExpiryAndOwnership(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE public_link SET created_by_sub = 'bob' WHERE secret_hash = $1`, hashToken(token)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.OpenPublicLink(ctx, token); !errors.Is(err, ErrNotFound) {
+	if _, err := st.OpenPublicLink(ctx, token); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("creator not an owner: %v, want ErrNotFound", err)
 	}
 
@@ -75,7 +75,7 @@ func TestPublicLinkExpiryAndOwnership(t *testing.T) {
 	if err := st.Archive(ctx, "alice", KindFolder, folder); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.OpenPublicLink(ctx, token); !errors.Is(err, ErrNotFound) {
+	if _, err := st.OpenPublicLink(ctx, token); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("folder archived: %v, want ErrNotFound", err)
 	}
 }

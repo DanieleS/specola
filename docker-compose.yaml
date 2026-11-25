@@ -8,6 +8,8 @@ services:
     networks:
       - database_network
       - traefik_public
+      # Page backends: uncomment with the runner service below.
+      # - runner_internal
     deploy:
       placement:
         constraints: [node.labels.name==nucworker]
@@ -26,8 +28,47 @@ services:
         - traefik.http.routers.specola.service=specola
         - traefik.http.services.specola.loadbalancer.server.port=8080
 
+  # Page backends (optional, see docs/page-backends.md). Uncomment this
+  # service, the runner_internal network (here, under specola and at the
+  # bottom) and the runner_data volume, then give specola, in specola.env:
+  #   SPECOLA_RUNNER_URL=http://runner:8081
+  #   SPECOLA_RUNNER_TOKEN=<the same token as below>
+  #   SPECOLA_SECRETS_KEY=<32 random bytes, base64>
+  # Specola refuses to start with only some of the three. Anyone who can
+  # publish a bundle can then run code on the runner: enable it on an
+  # instance among trusted people (runner/README.md, "Security model").
+  # The image is built from runner/: docker build -t ghcr.io/danieles/specola-runner:latest runner
+  #
+  # runner:
+  #   image: ghcr.io/danieles/specola-runner:latest
+  #   environment:
+  #     SPECOLA_URL: http://specola:8080
+  #     # Same value as specola's; set it in the shell that deploys the stack.
+  #     SPECOLA_RUNNER_TOKEN: ${SPECOLA_RUNNER_TOKEN}
+  #   volumes:
+  #     - runner_data:/data   # page databases, files and snapshots: back it up
+  #   networks:
+  #     - runner_internal     # private: reachable by specola only
+  #   deploy:
+  #     replicas: 1           # single replica by design: the data is on its volume
+  #     placement:
+  #       constraints: [node.labels.name==nucworker]
+  #     resources:
+  #       limits:
+  #         # Each busy page runs a worker of up to 256 MiB of heap.
+  #         memory: 2G
+  #         cpus: "1"
+  #     restart_policy:
+  #       condition: any
+  #       delay: 10s
+
 networks:
   database_network:
     external: true
   traefik_public:
     external: true
+  # runner_internal:       # not `internal: true`: backends call external APIs
+  #   driver: overlay
+
+# volumes:
+#   runner_data:
