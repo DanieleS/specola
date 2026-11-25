@@ -138,6 +138,45 @@ func TestSecretsRoutes(t *testing.T) {
 		t.Fatalf("missing after delete = %q", m)
 	}
 
+	// The secrets together are bounded, so that every call's head fits:
+	// two of 8 KiB fit, a third (even undeclared, as a later version may
+	// declare it) is refused, and replacing one with a short value is fine.
+	big := strings.Repeat("k", 8<<10)
+	for _, name := range []string{"API_KEY", "OTHER_KEY"} {
+		if res := req("alice", "PUT", base+"/"+name, `{"value":"`+big+`"}`); res.StatusCode != http.StatusNoContent {
+			t.Fatalf("set big %s: %d %s", name, res.StatusCode, readBody(t, res))
+		}
+	}
+	res = req("alice", "PUT", base+"/THIRD_KEY", `{"value":"`+big+`"}`)
+	if body := readBody(t, res); res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "too large") {
+		t.Fatalf("third big secret: %d %s", res.StatusCode, body)
+	}
+	if res := req("alice", "PUT", base+"/OTHER_KEY", `{"value":"short"}`); res.StatusCode != http.StatusNoContent {
+		t.Fatalf("shorten: %d", res.StatusCode)
+	}
+	// JSON escapes count: 2 KiB of < is 12 KiB in the head, too much now,
+	// where 2 KiB of letters fits.
+	res = req("alice", "PUT", base+"/THIRD_KEY", `{"value":"`+strings.Repeat("<", 2<<10)+`"}`)
+	wantBackendError(t, res, http.StatusBadRequest, "bad-request")
+	if res := req("alice", "PUT", base+"/THIRD_KEY", `{"value":"`+strings.Repeat("k", 2<<10)+`"}`); res.StatusCode != http.StatusNoContent {
+		t.Fatalf("2 KiB third: %d %s", res.StatusCode, readBody(t, res))
+	}
+	if res := req("alice", "PUT", base+"/THIRD_KEY", `{"value":"`+big+`"}`); res.StatusCode != http.StatusNoContent {
+		t.Fatalf("third after shortening: %d %s", res.StatusCode, readBody(t, res))
+	}
+	// A call carrying the largest secrets the budget allows still goes.
+	res = callBackend(t, ts, ctx, "viewer", "GET", "/api/pages/"+page+"/x/s", 1, nil, nil)
+	if res.Header.Get("X-Specola-Error") != "" {
+		t.Fatalf("call with big secrets: %d %s", res.StatusCode, readBody(t, res))
+	}
+	readBody(t, res)
+	if c := fr.last(t); len(c.head.Secrets["API_KEY"]) != 8<<10 {
+		t.Fatalf("big secret not sent: %d bytes", len(c.head.Secrets["API_KEY"]))
+	}
+	for _, name := range []string{"API_KEY", "OTHER_KEY", "THIRD_KEY", "FUTURE_KEY"} {
+		req("alice", "DELETE", base+"/"+name, "")
+	}
+
 	// A page without a backend: no missing list at all.
 	plain := newPlainPage(t, ts, "alice")
 	code, body := call(t, ts, "alice", "GET", "/api/pages/"+plain, "")

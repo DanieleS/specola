@@ -1,11 +1,9 @@
 # Page backends — design and contract
 
-Status: **step 1 of the delivery plan is implemented** (runner, `specola.fetch`
-with streaming, `db`/`userDb`/`files`, plugin server build and dev server,
-backend log, disabled/unavailable states, only-current-version rules, the
-version-switch snapshot), checked end to end in Chromium by
-`e2e/backends.mjs`. The rest is design: the contract for later steps may
-still change, and what is still open is listed at the end.
+Status: **implemented** — all seven steps of the delivery plan, checked
+end to end in Chromium by `e2e/backends.mjs`. Where the code refines this
+contract, the "Settled in implementation" notes say so; known limits and
+open questions are listed there and at the end.
 
 A **page backend** is server-side code that ships inside an SPA bundle,
 next to the app, and that the page reaches through Specola. It runs in
@@ -881,6 +879,44 @@ page without a backend they answer an error saying so.
   only the current version live, and these four tools for testing.
   `get_page` carries `backend: {manifest, secrets_missing}` for the
   current version.
+
+### Settled in implementation (steps 3–7)
+
+- **Node version**: the runner refuses to start on Node that doesn't route
+  `http`/`https` through `NODE_USE_ENV_PROXY` (below 22.21 on 22.x, 23.x,
+  24.0–24.4), since the egress allowlist would silently not apply. The
+  runner's `engines` is `^22.21 || >=24.5`.
+- **Secrets**: names match `^[A-Z][A-Z0-9_]{0,63}$`; the associated data is
+  the canonical uuid as text, `0x00`, the name; all of a page's secrets
+  together must fit in 24 KiB of the invoke head (a `PUT` past it is 400);
+  `PUT` answers 503 `backend-disabled` without a key.
+- **Egress**: an entry may carry a port (`host:443` allows only 443); the
+  proxy refuses more ranges than listed above; a name that doesn't resolve
+  or an upstream failure is 502.
+- **`backend_query`**: `node:sqlite` ignores Node's permission model, so
+  the read-only guarantee comes from `readOnly` + `query_only` and a
+  statement allowlist (one `SELECT`, `WITH`, `VALUES`, `EXPLAIN`, or a
+  read-only `PRAGMA`); integers beyond 2^53 come back as strings.
+- **Push**: events for a non-current version answer 200 and send
+  `event: superseded` at once; `superseded`/`forbidden` carry `data: {}`.
+- **Cron**: `next_run_at` is NULL for a schedule that never fires (31
+  February); pages published before the table existed get their jobs when
+  the ticker starts; the result carries `message` too, stored in
+  `last_error` as `<message> (ref <ref>)`.
+- **Public links**: the shell also sends `X-Frame-Options: DENY` and
+  `nosniff`; paths with `.`/`..` segments, an encoded `/` or `\\` are
+  `not-public`; an expired link on `/p/…` is 410 `link-expired`.
+- **MCP**: the four backend tools exist only when backends are enabled;
+  `call_backend`'s method defaults to GET.
+- **Test-only hooks** (documented in the READMEs, never for production):
+  `RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS`, `SPECOLA_TEST_CRON_EVERY`,
+  `SPECOLA_TEST_CLOCK_OFFSET`.
+- **Known limits, not yet addressed**: a non-public subscribe in the public
+  shell stops every push there; public event streams have no open-stream
+  limit and outlive a revoked link by up to 5 minutes; the 5-minute cron
+  limit is reported, not enforced; pushes from one page can arrive out of
+  order; a stream on an old version gets the new version's pushes for up
+  to 10 s; the first `X-Forwarded-For` hop is spoofable when trusted.
 
 ## Plugin and CLI
 

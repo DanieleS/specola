@@ -34,8 +34,9 @@ running it.
 - Read-only SQL on a page's shared database, for MCP's `backend_query`.
 
 No npm dependencies and no build step: Node built-ins only (`node:sqlite`,
-`node:http`, `child_process`). Runs on Node ≥ 22.13; the image is
-`node:24-slim`.
+`node:http`, `child_process`). Runs on Node ≥ 22.21 on 22.x, or ≥ 24.5:
+it refuses to start on older releases, whose workers would ignore the
+egress proxy. The image is `node:24-slim`.
 
 ## Running it
 
@@ -220,8 +221,9 @@ contained and pages from stepping on each other:
   workers' outbound HTTP. Each worker gets `NODE_USE_ENV_PROXY=1`,
   `HTTP_PROXY`/`HTTPS_PROXY` = `http://w-<id>:<random token>@127.0.0.1:<port>`
   and an empty `NO_PROXY`, so the global `fetch` and `http`/`https`
-  requests go through the proxy, localhost included (Node 22's late
-  releases and 24 honour `NODE_USE_ENV_PROXY`; the tests check it). The credential says which worker,
+  requests go through the proxy, localhost included (Node ≥ 22.21 and ≥ 24.5 honour
+  `NODE_USE_ENV_PROXY` for both; the runner refuses to start on older releases,
+  and the tests check it). The credential says which worker,
   so which page and which `egress` list; it stops working when the worker
   exits. The proxy allows `CONNECT` to port 443 or 80 and plain HTTP to port
   80 for listed hosts only (`*.example.com` matches subdomains, not

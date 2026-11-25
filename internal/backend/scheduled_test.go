@@ -90,3 +90,36 @@ func TestRunnerScheduled(t *testing.T) {
 		t.Fatalf("closed runner: %v", err)
 	}
 }
+
+// A head whose secrets push it over the runner's header limit isn't sent:
+// the run is an error that says why, not the runner's bare 400.
+func TestRunnerScheduledSecretsTooLarge(t *testing.T) {
+	called := false
+	rs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
+	defer rs.Close()
+	secrets := map[string]string{}
+	for _, n := range []string{"A", "B", "C", "D", "E"} {
+		secrets[n] = strings.Repeat("s", 8<<10)
+	}
+	res, err := NewRunner(rs.URL, "tok").Scheduled(context.Background(), ScheduledHead{Secrets: secrets, Event: Event{Name: "j"}})
+	if err != nil || res.Status != CronError || !strings.Contains(res.Message, "secrets are too large") || called {
+		t.Fatalf("%+v %v called=%v", res, err, called)
+	}
+}
+
+func TestSecretsHeadBytes(t *testing.T) {
+	if n := SecretsHeadBytes(map[string]string{}); n != 3 { // "{}"
+		t.Fatalf("empty = %d", n)
+	}
+	// encoding/json's escapes count: < is \u003c.
+	if a, b := SecretsHeadBytes(map[string]string{"K": "<<<"}), SecretsHeadBytes(map[string]string{"K": "aaa"}); a <= b {
+		t.Fatalf("escaped %d, plain %d", a, b)
+	}
+	if SecretsTooLarge(map[string]string{"K": "v"}) != "" {
+		t.Fatal("a small secret is too large")
+	}
+	big := map[string]string{"A": strings.Repeat("x", 8<<10), "B": strings.Repeat("x", 8<<10), "C": strings.Repeat("x", 8<<10)}
+	if msg := SecretsTooLarge(big); !strings.Contains(msg, "at most 24 KiB") {
+		t.Fatalf("message %q", msg)
+	}
+}

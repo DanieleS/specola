@@ -70,6 +70,20 @@ type pushMessage struct {
 	To    string          `json:"to,omitempty"`
 }
 
+// marshalPush encodes a push without encoding/json's HTML escaping, which
+// it applies inside a json.RawMessage too: each <, > or & of the data would
+// become six bytes, and data checked against maxPushData could then exceed
+// Postgres's NOTIFY limit. Neither the channel nor the event stream is HTML.
+func marshalPush(v any) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+}
+
 // handleRunnerPublish takes a push from the runner and sends it to every
 // replica. Only the runner, with its token, may post; anyone else, and
 // everyone when backends are disabled, gets 404 as for any /internal/ path.
@@ -113,14 +127,15 @@ func (s *Server) handleRunnerPublish(w http.ResponseWriter, r *http.Request) {
 		backendAccessError(w, err)
 		return
 	}
-	payload, err := json.Marshal(m)
+	payload, err := marshalPush(m)
 	if err != nil {
 		backendAccessError(w, err)
 		return
 	}
 	if len(payload) >= maxNotifyPayload {
 		// Only a very long topic or recipient gets here, the data being
-		// within its limit.
+		// within its limit (and sent as checked: marshalPush doesn't
+		// escape it).
 		backendError(w, http.StatusRequestEntityTooLarge, "body-too-large",
 			fmt.Sprintf("a push, with its topic and recipient, must be under %d bytes", maxNotifyPayload))
 		return
@@ -482,7 +497,7 @@ func (h *pushHub) deliver(payload string) {
 		slog.Warn("push: bad payload", "err", err)
 		return
 	}
-	frame, err := json.Marshal(struct {
+	frame, err := marshalPush(struct {
 		Topic string          `json:"topic"`
 		Data  json.RawMessage `json:"data"`
 	}{m.Topic, m.Data})

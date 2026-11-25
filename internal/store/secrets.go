@@ -193,26 +193,79 @@ func (s *Store) ListPageSecrets(ctx context.Context, sub, pageID string) ([]Secr
 
 // SetPageSecret sets a secret of a page sub owns. The name need not be
 // declared yet: an owner may set it ahead of the version that will.
+//
+// Every set secret may go with each call (when declared), in a head of
+// bounded size: a value that would take the page's secrets together over
+// backend.MaxSecretsHeadBytes is refused, as all of them are counted (an
+// undeclared one may be declared by the next version).
 func (s *Store) SetPageSecret(ctx context.Context, sub, pageID, name, value string, key []byte) error {
 	if err := CheckSecret(name, value); err != nil {
 		return err
 	}
-	id, err := canonicalPage(ctx, s.pool, sub, pageID, RoleOwner)
+	aead, err := secretsCipher(key)
 	if err != nil {
 		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	id, err := canonicalPage(ctx, tx, sub, pageID, RoleOwner)
+	if err != nil {
+		return err
+	}
+	// Two owners setting secrets at once must not both fit the budget alone
+	// and exceed it together: one waits for the other.
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM asset WHERE id = $1::uuid FOR UPDATE`, id); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT name, ciphertext, nonce FROM page_secret WHERE asset_id = $1::uuid`, id)
+	if err != nil {
+		return err
+	}
+	all := map[string]string{}
+	for rows.Next() {
+		var (
+			n                 string
+			ciphertext, nonce []byte
+		)
+		if err := rows.Scan(&n, &ciphertext, &nonce); err != nil {
+			rows.Close()
+			return err
+		}
+		v, err := openSecret(key, id, n, ciphertext, nonce)
+		if err != nil {
+			// Under an older key: setting values again is how an owner
+			// recovers, so count it by its size rather than refuse.
+			v = strings.Repeat("x", max(len(ciphertext)-aead.Overhead(), 0))
+		}
+		all[n] = v
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	all[name] = value
+	if size := backend.SecretsHeadBytes(all); size > backend.MaxSecretsHeadBytes {
+		return &ErrInvalid{fmt.Sprintf("this page's secrets together would be too large to send with each call to its backend (%d KiB encoded, at most %d KiB): remove or shorten others first",
+			(size+1023)>>10, backend.MaxSecretsHeadBytes>>10)}
 	}
 	ciphertext, nonce, err := sealSecret(key, id, name, value)
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		INSERT INTO page_secret (asset_id, name, ciphertext, nonce, updated_by, updated_at)
 		VALUES ($1::uuid, $2, $3, $4, $5, now())
 		ON CONFLICT (asset_id, name) DO UPDATE SET
 		  ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce,
 		  updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at`,
 		id, name, ciphertext, nonce, sub)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // DeletePageSecret removes a secret of a page sub owns; removing one that

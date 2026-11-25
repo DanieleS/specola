@@ -45,6 +45,29 @@ const LIMIT_ENV = {
   snapshotDiskBytes: 'RUNNER_SNAPSHOT_DISK_BYTES',
 };
 
+// The oldest Node releases whose workers honour NODE_USE_ENV_PROXY for
+// both the global fetch and http/https.request: 22.21 on 22.x, 24.5 on 24.x
+// (24.0-24.4 proxy fetch only). Egress is held to a page's list only
+// through that variable ("Egress proxy (step 3)"): on an older release a
+// worker's requests go out directly, with no refusal and no log line, so
+// the runner refuses to start rather than run with egress silently open.
+const MIN_NODE = { 22: 21, 24: 5 };
+
+/**
+ * Why this Node release can't run the runner, or null when it can.
+ * `version` is process.versions.node ("22.23.0").
+ */
+export function nodeVersionProblem(version) {
+  const m = /^(\d+)\.(\d+)\./.exec(version);
+  if (!m) return `cannot read the Node version ${JSON.stringify(version)}`;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  if (major >= 25) return null;
+  if (major in MIN_NODE && minor >= MIN_NODE[major]) return null;
+  return `Node ${version} does not route workers' outbound requests through the egress proxy (NODE_USE_ENV_PROXY); ` +
+    'run the runner on Node 22.21 or later on 22.x, or 24.5 or later';
+}
+
 function positiveInt(name, value) {
   if (!/^\d+$/.test(value) || Number(value) < 1 || !Number.isSafeInteger(Number(value))) {
     throw new Error(`${name} must be a positive integer, got ${JSON.stringify(value)}`);

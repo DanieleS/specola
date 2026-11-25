@@ -96,6 +96,12 @@ func (s *Server) handlePublicShell(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Robots-Tag", "noindex")
 	h.Set("X-Content-Type-Options", "nosniff")
+	// The doc's CSP for the shell has no frame-ancestors, but a public link
+	// without a backend may not be framed ('none'), and a framed shell would
+	// let any site drive the page's public calls from its visitors'
+	// browsers (clickjacking, or racing the page's first hello by
+	// navigating the inner frame). Refused here without touching the CSP.
+	h.Set("X-Frame-Options", "DENY")
 	// json.Marshal escapes <, > and &, so nothing in boot can close the
 	// script it lands in.
 	_, _ = io.WriteString(w, strings.Replace(publicShellHTML, shellBootPlaceholder, string(boot), 1))

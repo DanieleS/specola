@@ -602,18 +602,23 @@ try {
 
   // One port per load: the frame navigating to another document is refused.
   const again = await frame('again');
-  await again.evaluate(() => location.reload());
-  let reloaded;
-  for (let i = 0; i < 100 && !reloaded; i++) {
-    reloaded = page.frames().find((x) => x.name() === 'again');
+  // The old document is marked: until the reload replaces it, it still
+  // answers (with its own earlyCall), and then its context goes away under
+  // whatever was reading it. So wait for an unmarked document, and retry
+  // the read too.
+  await again.evaluate(() => {
+    window.beforeReload = true;
+    location.reload();
+  });
+  let againErr;
+  for (let i = 0; i < 100 && !againErr; i++) {
     try {
-      await reloaded.waitForFunction(() => window.earlyCall, null, { timeout: 200 });
-    } catch {
-      reloaded = null;
-    }
+      const reloaded = page.frames().find((x) => x.name() === 'again');
+      await reloaded.waitForFunction(() => !window.beforeReload && window.earlyCall, null, { timeout: 200 });
+      againErr = await reloaded.evaluate(() => window.earlyCall);
+    } catch {}
   }
-  const againErr = await reloaded.evaluate(() => window.earlyCall);
-  check(againErr.name === 'BackendUnavailable' && againErr.reason === 'unavailable', 'a second hello is refused: BackendUnavailable (unavailable)', againErr);
+  check(againErr?.name === 'BackendUnavailable' && againErr.reason === 'unavailable', 'a second hello is refused: BackendUnavailable (unavailable)', againErr);
 
   // specola.subscribe, over a fake parent that records the port.
   {
@@ -950,19 +955,23 @@ try {
     check(!note.hidden && /new version is available/i.test(note.text) && note.reload, 'superseded shows the reload notice', note);
     check(cspErrors.length === 0, "the shell runs under its own CSP", cspErrors);
 
-    // One port per load: the frame reloading itself is refused.
-    await pfr.evaluate(() => location.reload());
-    let again2;
-    for (let i = 0; i < 100 && !again2; i++) {
-      again2 = sp.frames().find((x) => x.url().includes('/~page'));
+    // One port per load: the frame reloading itself is refused. As above,
+    // the old document is marked (it has an earlyCall of its own, a
+    // successful one) and the read is retried, its context going away under
+    // it while the reload replaces it.
+    await pfr.evaluate(() => {
+      window.beforeReload = true;
+      location.reload();
+    });
+    let reErr;
+    for (let i = 0; i < 100 && !reErr; i++) {
       try {
-        await again2.waitForFunction(() => window.earlyCall, null, { timeout: 200 });
-      } catch {
-        again2 = null;
-      }
+        const again2 = sp.frames().find((x) => x.url().includes('/~page'));
+        await again2.waitForFunction(() => !window.beforeReload && window.earlyCall, null, { timeout: 200 });
+        reErr = await again2.evaluate(() => window.earlyCall);
+      } catch {}
     }
-    const reErr = await again2.evaluate(() => window.earlyCall);
-    check(reErr.name === 'BackendUnavailable' && reErr.reason === 'unavailable', 'the shell refuses a second hello', reErr);
+    check(reErr?.name === 'BackendUnavailable' && reErr.reason === 'unavailable', 'the shell refuses a second hello', reErr);
     await sp.close();
   }
 } finally {

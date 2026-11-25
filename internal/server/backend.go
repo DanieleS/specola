@@ -413,6 +413,12 @@ func (s *Server) callBackend(w http.ResponseWriter, r *http.Request, c backendCa
 		return
 	}
 	if len(head) > backend.MaxInvokeHeadBytes {
+		// Secrets set before their total was bounded can be the cause: not
+		// the viewer's doing, so not a 400 that blames their headers.
+		if msg := backend.SecretsTooLarge(secrets); msg != "" {
+			backendError(w, http.StatusInternalServerError, "backend-error", msg)
+			return
+		}
 		backendError(w, http.StatusBadRequest, "bad-request", "the request's headers are too large")
 		return
 	}

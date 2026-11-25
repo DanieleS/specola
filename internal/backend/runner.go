@@ -202,6 +202,24 @@ type Invoke struct {
 // fits the runner's header limit.
 const MaxInvokeHeadBytes = 48 << 10
 
+// MaxSecretsHeadBytes bounds what a page's secrets add to an invoke or
+// scheduled head (SecretsHeadBytes). Each value may be 8 KiB, and a
+// manifest may declare 100: unbounded, their sum would push every call's
+// head past MaxInvokeHeadBytes, and the page's backend would refuse every
+// call and run until an owner worked out which to remove. Half the head is
+// theirs; the rest is the request's own headers and the page's fields.
+const MaxSecretsHeadBytes = 24 << 10
+
+// SecretsHeadBytes is how much secrets take in an encoded head: the JSON
+// encoding/json writes for them (escapes included), base64url-encoded.
+func SecretsHeadBytes(secrets map[string]string) int {
+	b, err := json.Marshal(secrets)
+	if err != nil {
+		return 0 // a map of strings always marshals
+	}
+	return base64.RawURLEncoding.EncodedLen(len(b))
+}
+
 // EncodeInvoke is the value of X-Specola-Invoke: base64url of the JSON.
 func EncodeInvoke(head *Invoke) (string, error) {
 	b, err := json.Marshal(head)

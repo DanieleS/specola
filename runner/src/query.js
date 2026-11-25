@@ -100,6 +100,21 @@ export function tokenize(sql) {
 const STARTS = new Set(['SELECT', 'WITH', 'VALUES']);
 // PRAGMAs that only read and name nothing outside the database: the plain
 // form, or with one argument (a table, an index, a number).
+// The pragmas of PRAGMAS whose parenthesised argument only says what to
+// read. For any other, PRAGMA name(value) is the setter, as "= value" is.
+const PRAGMA_ARGS = new Set([
+  'foreign_key_check',
+  'foreign_key_list',
+  'index_info',
+  'index_list',
+  'index_xinfo',
+  'integrity_check',
+  'quick_check',
+  'table_info',
+  'table_list',
+  'table_xinfo',
+]);
+
 const PRAGMAS = new Set([
   'application_id',
   'auto_vacuum',
@@ -155,15 +170,16 @@ export function statementProblem(sql) {
   }
   if (STARTS.has(first)) return null;
   if (first === 'PRAGMA') {
-    // PRAGMA [schema.]name [ ( arg ) ]: never "= value", which sets.
+    // PRAGMA [schema.]name [ ( arg ) ]: never "= value", which sets, nor
+    // "(value)" but for the pragmas whose argument names what to read.
     let k = 1;
     if (stmt[k + 1]?.text === '.') k += 2;
     const name = stmt[k]?.kind === 'word' ? stmt[k].text.toLowerCase() : '';
     const rest = stmt.slice(k + 1).map((t) => t.text);
     const argOk =
       rest.length === 0 ||
-      (rest.length === 3 && rest[0] === '(' && rest[2] === ')' && !/^[()=]$/.test(rest[1])) ||
-      (rest.length === 4 && rest[0] === '(' && rest[1] === '-' && /^\d+$/.test(rest[2]) && rest[3] === ')');
+      (PRAGMA_ARGS.has(name) && rest.length === 3 && rest[0] === '(' && rest[2] === ')' && !/^[()=]$/.test(rest[1])) ||
+      (PRAGMA_ARGS.has(name) && rest.length === 4 && rest[0] === '(' && rest[1] === '-' && /^\d+$/.test(rest[2]) && rest[3] === ')');
     if (PRAGMAS.has(name) && argOk) return null;
     return `PRAGMA ${name || '?'} is not allowed here. ${READ_ONLY_HINT}`;
   }

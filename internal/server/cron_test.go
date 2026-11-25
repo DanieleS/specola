@@ -143,8 +143,12 @@ func TestCronTicker(t *testing.T) {
 	cr := newCronRunner(t)
 	pool := testdb.New(t)
 	var mu sync.Mutex
-	// Far enough ahead that every slot computed at publish time is due.
-	now := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Minute).Add(20 * time.Second)
+	// Far enough ahead that every slot computed at publish time is due, and
+	// at a fixed time of day: at 10:01, the next minute (10:02) is a slot of
+	// the every-minute job only, not of */5 (10:05) or the daily 03:00 one,
+	// whatever the clock says when the test runs.
+	day := time.Now().UTC().Add(72 * time.Hour)
+	now := time.Date(day.Year(), day.Month(), day.Day(), 10, 1, 20, 0, time.UTC)
 	ts, s := newCronServer(t, cr, pool, &now, &mu)
 	setNow := func(t time.Time) { mu.Lock(); now = t; mu.Unlock() }
 
@@ -269,8 +273,20 @@ func TestCronTicker(t *testing.T) {
 	if s.runner.Available() {
 		t.Fatal("an unreachable runner is still available")
 	}
-	if status := *listCron(t, ts, "alice", page).Jobs[0].LastStatus; status != "unavailable" {
-		t.Fatalf("runner gone: %s", status)
+	// The jobs run at once: the first whose call fails marks the runner
+	// down, and one that checks after that is skipped rather than tried.
+	unavailable := 0
+	for _, job := range listCron(t, ts, "alice", page).Jobs {
+		switch *job.LastStatus {
+		case "unavailable":
+			unavailable++
+		case "skipped":
+		default:
+			t.Fatalf("runner gone: %s %s", job.Name, *job.LastStatus)
+		}
+	}
+	if unavailable == 0 {
+		t.Fatal("runner gone: no job recorded unavailable")
 	}
 }
 

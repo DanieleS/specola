@@ -47,6 +47,11 @@ describe('statementProblem', () => {
     'PRAGMA query_only = 0': /PRAGMA query_only/,
     'PRAGMA query_only(0)': /PRAGMA query_only/,
     'PRAGMA user_version = 3': /PRAGMA user_version/,
+    // The parenthesised form sets too, but where the argument names what to read.
+    'PRAGMA user_version(5)': /PRAGMA user_version/,
+    'PRAGMA foreign_keys(1)': /PRAGMA foreign_keys/,
+    'PRAGMA main.journal_mode(delete)': /PRAGMA journal_mode/,
+    'PRAGMA page_size(1024)': /PRAGMA page_size/,
     "PRAGMA temp_store_directory = '/tmp'": /PRAGMA temp_store_directory/,
     'PRAGMA writable_schema': /PRAGMA writable_schema/,
     '(SELECT 1)': /not allowed/,

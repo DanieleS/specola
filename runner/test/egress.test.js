@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import { after, before, describe, test } from 'node:test';
+import { nodeVersionProblem } from '../src/config.js';
 import { forbiddenAddress, hostAllowed, normalizeHost, parseEgress, startEgressProxy } from '../src/egress.js';
 
 describe('forbiddenAddress', () => {
@@ -482,4 +483,15 @@ describe('egress proxy', () => {
     // undici tunnels http too; a refused CONNECT is a network error.
     assert.ok(refused === 'error' || refused.startsWith('403'), refused);
   });
+});
+
+test('the runner refuses Node releases whose workers would ignore the proxy', () => {
+  for (const v of ['22.13.0', '22.20.1', '23.11.0', '24.0.0', '24.4.1', '20.19.0', 'x']) {
+    assert.match(nodeVersionProblem(v) ?? 'accepted', /Node|cannot read/, v);
+  }
+  for (const v of ['22.21.0', '22.23.0', '24.5.0', '24.11.1', '25.0.0', '26.1.0']) {
+    assert.equal(nodeVersionProblem(v), null, v);
+  }
+  // The Node running the tests is one the runner accepts.
+  assert.equal(nodeVersionProblem(process.versions.node), null);
 });

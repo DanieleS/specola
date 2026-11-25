@@ -98,6 +98,8 @@ func TestPublicShell(t *testing.T) {
 			"Referrer-Policy":         "no-referrer",
 			"X-Robots-Tag":            "noindex",
 			"Content-Type":            "text/html; charset=utf-8",
+			// Not framed, as public links without a backend aren't.
+			"X-Frame-Options": "DENY",
 		}
 		for k, v := range want {
 			if res.Header.Get(k) != v {

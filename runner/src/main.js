@@ -1,8 +1,16 @@
 // The runner's entry point: configuration from the environment, then serve
 // until SIGTERM/SIGINT, stopping the page workers on the way out.
 
-import { loadConfig } from './config.js';
+import { loadConfig, nodeVersionProblem } from './config.js';
 import { createRunner, RUNNER_VERSION } from './server.js';
+
+// Refuse an old Node before anything else: there, workers' egress would be
+// open whatever their egress list says.
+const tooOld = nodeVersionProblem(process.versions.node);
+if (tooOld) {
+  console.error(`specola-runner: ${tooOld}`);
+  process.exit(2);
+}
 
 let config;
 try {

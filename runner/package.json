@@ -6,7 +6,7 @@
   "type": "module",
   "main": "src/main.js",
   "engines": {
-    "node": ">=22.13"
+    "node": "^22.21 || >=24.5"
   },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/main.js",

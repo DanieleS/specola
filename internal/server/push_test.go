@@ -309,6 +309,11 @@ func TestPushDeliveryOfLargeData(t *testing.T) {
 	big := strings.Repeat("y", maxPushData-2)
 	mustPublish(t, ts, `{"page":"`+page+`","topic":"a","data":"`+big+`"}`)
 	st.want(t, "message", `{"topic":"a","data":"`+big+`"}`)
+	// HTML characters are sent as they are, not as six-byte escapes that
+	// would take data within its limit over Postgres's NOTIFY limit.
+	html := strings.Repeat("<b>&amp;</b>", (maxPushData-2)/12)
+	mustPublish(t, ts, `{"page":"`+page+`","topic":"a","data":"`+html+`"}`)
+	st.want(t, "message", `{"topic":"a","data":"`+html+`"}`)
 }
 
 func TestPushListenerStopsAndRestarts(t *testing.T) {

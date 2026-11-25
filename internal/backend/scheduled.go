@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -81,6 +82,11 @@ func (r *Runner) Scheduled(ctx context.Context, head ScheduledHead) (ScheduledRe
 	if err != nil {
 		return ScheduledResult{}, err
 	}
+	// The runner refuses a head over its limit with a bare 400; say why
+	// here, where it is known (secrets are all a scheduled head can grow by).
+	if base64.RawURLEncoding.EncodedLen(len(b)) > MaxInvokeHeadBytes {
+		return ScheduledResult{Status: CronError, Message: secretsTooLarge(head.Secrets)}, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, ScheduledTimeout+scheduledGrace)
 	defer cancel()
 	req, err := r.newRequest(ctx, http.MethodPost, "/scheduled", http.NoBody)
@@ -129,4 +135,21 @@ func (r *Runner) Scheduled(ctx context.Context, head ScheduledHead) (ScheduledRe
 		return ScheduledResult{Status: CronError, Message: "the runner answered an unknown status " + out.Status}, nil
 	}
 	return out, nil
+}
+
+// secretsTooLarge says why a head carrying secrets is over the limit, for
+// the owner who has to remove some.
+func secretsTooLarge(secrets map[string]string) string {
+	return fmt.Sprintf("this page's secrets are too large together to send to its backend (%d KiB encoded, at most %d KiB): remove or shorten some",
+		(SecretsHeadBytes(secrets)+1023)>>10, MaxSecretsHeadBytes>>10)
+}
+
+// SecretsTooLarge is the message for a call whose secrets push its head
+// over MaxInvokeHeadBytes, or "" when the secrets fit their budget (the
+// request's own headers are then what is too large).
+func SecretsTooLarge(secrets map[string]string) string {
+	if SecretsHeadBytes(secrets) <= MaxSecretsHeadBytes {
+		return ""
+	}
+	return secretsTooLarge(secrets)
 }
