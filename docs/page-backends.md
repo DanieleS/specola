@@ -323,6 +323,80 @@ Versions).
 `/internal/*` is only on the app listener, requires the runner token, and
 answers 404 otherwise.
 
+### Wire formats (exact)
+
+**Errors that specola or the runner produce** (as opposed to the handler's
+own responses, which pass through untouched whatever their status) carry
+the header `X-Specola-Error: <code>` and a JSON body
+`{"error":"<code>","message":"…","ref"?:"…"}`. Codes: `no-backend` (404),
+`superseded` (409), `backend-disabled` (503), `backend-unavailable` (503),
+`body-too-large` (413), `too-many-requests` (429), `backend-error` (500,
+uncaught exception, `ref` names the log line), `backend-crashed` (502),
+`backend-timeout` (504), `bad-request` (400). The viewer turns
+`backend-disabled`, `backend-unavailable` and `superseded` into
+`{op:"error", id, name:"BackendUnavailable", reason, message}` (`reason` is
+`disabled`, `unavailable` or `superseded`); every other response, these
+codes included, reaches the page as a `Response`.
+
+**Boot data**: the SDK's boot JSON gains `backend: bool`, true when the
+version served has a backend (`asset_version.backend` non-null) and
+backends are enabled. The viewer's port handover becomes
+`{specola:"port", backend:{enabled, available}}` (the same values as
+`GET /api/me`), and the SDK exposes them as `specola.backend`
+(`{enabled:false, available:false}` until the port arrives, or forever on
+a page without a backend).
+
+**Version data**: `GET /api/pages/{id}`, `GET /api/pages/{id}/versions`
+and MCP `list_versions` carry, per version, `backend: bool` and
+`viewable: bool` (the rule in Versions). The page carries `backend` for its
+current version.
+
+**`asset_version` columns**: `backend jsonb NULL` (the validated manifest,
+normalised: defaults filled in) and `backend_hash text NULL`: the hex
+sha256 of the lines `"<path>\t<sha256>\n"` of every file under `.specola/`
+(path relative to `.specola/`), sorted by path. It identifies the code.
+
+**specola → runner `POST /invoke`**: headers `Authorization: Bearer
+<token>`, `X-Specola-Invoke: <base64url(JSON)>`, body the request body
+(raw, possibly empty). The JSON:
+
+```json
+{
+  "page": {"id": "…", "version": 3, "title": "…"},
+  "versionId": "<asset_version.id>",
+  "codeHash": "<backend_hash>",
+  "user": {"sub": "…", "email": "…", "name": "…"},
+  "role": "owner",
+  "link": null,
+  "secrets": {},
+  "egress": [],
+  "request": {"method": "POST", "path": "/api/orders?x=1", "headers": [["content-type", "application/json"]]}
+}
+```
+
+The runner answers with the handler's status, headers and body
+(streamed), or with one of the error codes above. `user` is null for
+anonymous and cron calls.
+
+**runner → specola `GET /internal/runner/code/{versionId}`**: bearer
+token; answers `{"codeHash":"…","files":[{"path":"backend.json","content":"<base64>"},
+{"path":"server/index.mjs","content":"<base64>"}]}`: every file under
+`.specola/`, paths relative to it. 404 for a version without a backend.
+
+**runner `GET /logs?page=<id>&since=<seq>`** → `{"lines":[{"seq":12,
+"time":"<RFC 3339>","level":"log|info|warn|error","text":"…","ref"?:"…"}]}`,
+oldest first, at most 1000. specola exposes it to owners and editors as
+`GET /api/pages/{id}/backend/logs?since=<seq>` (same body).
+
+**runner `GET /health`** → `{"ok":true,"version":"<runner version>"}`.
+
+**Version switch**: the runner keeps, per page, the version its worker
+runs. An `/invoke` for a newer version of the page snapshots the data
+(`VACUUM INTO` every database under `snapshots/<UTC timestamp>-v<old>/`,
+plus a copy of `files.sqlite`), keeps the last 5 such snapshots, starts the
+new worker and drains the old one. An `/invoke` for an older version than
+the one running answers `superseded` (specola should have refused it).
+
 ## Runner
 
 A small Node service (`runner/` in this repo, its own image on
@@ -465,7 +539,8 @@ bad migrations, **not** from losing the volume. Back up the volume.
 
 ### Export, import, wipe
 
-- **Export** (owner): a zip of `shared.sqlite`, the files and a
+- **Export** (owners and editors, who can read all of it through code
+  anyway): a zip of `shared.sqlite`, the files and a
   `manifest.json` (page, version, date). Users' private databases are not
   in it: each user exports their own (**My data**, any viewer, their
   `userDb` only). `GET /api/pages/{id}/backend/export`,
@@ -578,8 +653,5 @@ false and `specola.fetch` rejects with `BackendUnavailable`
 
 ## Open questions
 
-- **Editors and data**: export, import and snapshots are owner-only, while
-  editors can read everything through code anyway. Should editors at least
-  export?
 - **Bun-compatible handlers**: the contract is web-standard, so it may run
   on another runtime later; nothing depends on it now.
