@@ -35,7 +35,6 @@ func TestShortName(t *testing.T) {
 	}
 }
 
-
 func TestLookOf(t *testing.T) {
 	page := `<meta name="theme-color" content="#123456">`
 	l := LookOf("id-1", "Budget plan for 2027", page, Settings{})

@@ -249,9 +249,12 @@ interface Ctx {
   user: { sub: string; email: string; name: string } | null; // null: anonymous or cron
   role: "owner" | "editor" | "viewer" | "public" | "cron";
   link: { id: string; label: string } | null;                 // the public link used, if any
+  visitor: { id: string } | null; // a public link's anonymous visitor (docs/page-apps.md)
   page: { id: string; version: number; title: string };
   db: DatabaseSync;            // node:sqlite, shared by everyone on this page
-  userDb: DatabaseSync | null; // node:sqlite, private to ctx.user (null when anonymous/cron)
+  userDb: DatabaseSync | null; // node:sqlite, private to ctx.user, or to ctx.visitor (at most
+                               // 16 MiB); null when there is neither (cron, an anonymous
+                               // caller without a visitor)
   files: FileStore;            // per-page key/value blobs on disk
   secrets: Record<string, string>; // only the names declared in the manifest
   publish(topic: string, data: unknown, opts?: { to?: string /* sub */ }): void;
@@ -521,22 +524,25 @@ one run, then the next slot. Archived pages don't run.
 
 ## Public links
 
-Today `/s/{token}` serves the page as the whole document, with no viewer
-around it to relay. For a **backend version** it instead serves a minimal
-shell that frames the page (same sandbox) and relays the port to
+`/s/{token}` serves a minimal shell that frames the page (same sandbox) —
+for every link since page apps (docs/page-apps.md, "Public apps"), with or
+without a backend — and relays the port to
 `ANY /p/{token}/x/{path…}` and `GET /p/{token}/events` (no session), served
 on the same origin as `/s/{token}` (the view origin when set), so the shell
 needs no CORS:
 
 - only routes matching `public` reach the runner; others answer 403
   `not-public` without invoking anything;
-- `ctx.user = null`, `ctx.role = "public"`, `ctx.link` set, `userDb = null`;
+- `ctx.user = null`, `ctx.role = "public"`, `ctx.link` set; `ctx.visitor`
+  and `userDb` are the caller's anonymous visitor and its own database when
+  the shell sent one (X-Specola-Visitor, docs/page-apps.md, "Anonymous
+  visitors"), else `null`;
 - links on a backend page always follow the current version (see
   Versions);
 - rate limits per link and per client IP (below);
 - revoking the link stops calls at once, as it stops serving.
 
-Pages without a backend keep today's `/s/{token}` behaviour.
+A page without a backend gets the same shell, with no calls to relay.
 
 ## Observability
 
@@ -832,26 +838,28 @@ file (`routesSecrets`, `routesPush`, …), called from `server.go`.
 
 ### Public links (step 6)
 
-- For a backend page, `/s/{token}` and `/s/{token}/*` serve the **shell**:
-  a small HTML document (embedded in the binary, inline script, its own
-  CSP: `default-src 'none'; script-src 'self' 'unsafe-inline'; frame-src
-  'self'; connect-src 'self'; style-src 'unsafe-inline'`), `Cache-Control:
-  no-store`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex`. It
-  frames `/s/{token}/~page/<rest of the path>?<query>`, which serves the
-  page exactly as `/s/{token}` does today, with basename
-  `/s/{token}/~page`. A page without a backend keeps today's behaviour (and
-  `~page` answers 404 for it).
+- `/s/{token}` and `/s/{token}/*` serve the **shell** (for every link since
+  page apps; docs/page-apps.md has what it gained there: manifest, offline,
+  visitors): a small HTML document (embedded in the binary, inline script,
+  its own CSP: `default-src 'none'; script-src 'self' 'unsafe-inline';
+  frame-src 'self' blob:; connect-src 'self'; style-src 'unsafe-inline';
+  manifest-src 'self'; img-src 'self'; worker-src 'self'`),
+  `Cache-Control: no-store`, `Referrer-Policy: no-referrer`,
+  `X-Robots-Tag: noindex`. It frames `/s/{token}/~page/<rest of the
+  path>?<query>`, which serves the page with basename `/s/{token}/~page`.
 - The shell implements the viewer's side of the port: the backend state
   (from boot data in the shell), `fetch` → `ANY /p/{token}/x/{path}` with
   `X-Specola-Version` and `X-Specola-Headers`, streaming, abort,
-  `sub`/`unsub` → `GET /p/{token}/events?v=&topic=`. It hands no
-  `localStorage` data, so the page's storage stays in memory as today.
+  `sub`/`unsub` → `GET /p/{token}/events?v=&topic=`. The page's
+  `localStorage` is the visitor's (docs/page-apps.md, "Anonymous
+  visitors"), and calls carry the visitor in `X-Specola-Visitor`.
 - `/p/{token}/x/*`: the link must be valid as for serving (else 404/410);
   the method and path (without query) must match one of the version's
   `public` patterns (else 403 `not-public`, the runner is not called); rate
   limits 60 requests/min per (link, client IP) and 600/min per link (429
   `too-many-requests`, `Retry-After`). The head has `user: null`,
-  `role: "public"`, `link: {"id","label"}`. Same header rules, limits and
+  `role: "public"`, `link: {"id","label"}`, and `visitor: {"id"}` (the
+  sha256 of its secret) when the call carries a visitor the link knows. Same header rules, limits and
   errors as `/api/pages/{id}/x`.
 - `/p/{token}/events`: only topics in `topics.public` (others 403
   `not-public`), never targeted events.
