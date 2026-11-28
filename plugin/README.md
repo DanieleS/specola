@@ -234,8 +234,9 @@ export default {
   fails, pnpm's output. Packages without a prebuilt binary for Linux need
   a runner image with a toolchain.
 - `ctx.dataDir` is a directory of the page's own for files such libraries
-  open; it counts against the page's 1 GiB, and isn't in snapshots or
-  exports yet (`ctx.db` is). Under `vite dev` it is `.specola-dev/data/`.
+  open; it counts against the page's 1 GiB and is in snapshots, exports
+  and imports (SQLite databases there are copied consistently, even while
+  open). Under `vite dev` it is `.specola-dev/data/`.
 - A backend with dependencies can load native code, which isn't held by
   the runner's sandbox: on instances that turned installs off
   (`RUNNER_DEPS=off`) it answers 500.

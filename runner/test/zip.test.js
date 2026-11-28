@@ -158,7 +158,7 @@ describe('an import is checked before anything is built', () => {
   test('a valid export is staged: shared.sqlite, the index and the blobs', async () => {
     const files = [{ key: 'a.txt', data: 'aaa' }, { key: 'dir/b.bin', data: randomBytes(100), contentType: 'application/octet-stream' }, { key: 'same.txt', data: 'aaa' }];
     const { work, result } = await stage(exportEntries({ shared, files }));
-    assert.deepEqual(await result, { shared: true, files: 3, bytes: shared.length + 3 + 100 });
+    assert.deepEqual(await result, { shared: true, files: 3, data: null, bytes: shared.length + 3 + 100 });
     assert.deepEqual((await fs.readdir(path.join(work, 'blobs'))).sort(), [sha256('aaa'), sha256(Buffer.from(files[1].data))].sort());
     const db = new DatabaseSync(path.join(work, 'files.sqlite'), { readOnly: true });
     assert.deepEqual(db.prepare('SELECT key, size, content_type AS t FROM files ORDER BY key').all().map((r) => ({ ...r })), [
@@ -244,7 +244,7 @@ describe('an import is checked before anything is built', () => {
   test('stages the same content once', async () => {
     const files = [{ key: 'a', data: 'same' }, { key: 'b', data: 'same' }, { key: 'c', data: 'same' }];
     const { work, result } = await stage(exportEntries({ files }), 4);
-    assert.deepEqual(await result, { shared: false, files: 3, bytes: 4 });
+    assert.deepEqual(await result, { shared: false, files: 3, data: null, bytes: 4 });
     assert.deepEqual(await fs.readdir(path.join(work, 'blobs')), [sha256('same')]);
   });
 

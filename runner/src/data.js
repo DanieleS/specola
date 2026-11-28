@@ -12,7 +12,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
 import { RunnerError } from './errors.js';
-import { USER_DB, dirBytes, sqliteCheck, vacuumCopy, writeIndex } from './snapshot.js';
+import { DATA_DIR, USER_DB, copyData, dirBytes, sqliteCheck, vacuumCopy, writeIndex } from './snapshot.js';
 import { contentTypeProblem } from './worker/files.mjs';
 import { pathProblem } from './worker/paths.mjs';
 import { ZipError, entryData, readZip, zipStream } from './zip.js';
@@ -23,6 +23,8 @@ const SHA = /^[0-9a-f]{64}$/;
 const MAX_MANIFEST = 1024 * 1024;
 const MAX_INDEX = 64 * 1024 * 1024;
 const DATA_PREFIX = 'files/data/';
+// The page's data directory (ctx.dataDir) in the zip.
+const DIR_PREFIX = DATA_DIR + '/';
 const SIDECARS = ['', '-wal', '-shm', '-journal'];
 
 // Content that is compressed already: deflating it again costs time for
@@ -53,8 +55,9 @@ export const userHash = (sub) => createHash('sha256').update(sub).digest('hex');
 /**
  * Copies what an export needs into `pin` (a .tmp- directory under the page's
  * snapshots, so the blob collection leaves alone every blob it names while
- * the zip streams): shared.sqlite and files.sqlite, consistent copies.
- * Returns {shared: bool, rows}.
+ * the zip streams): shared.sqlite and files.sqlite, consistent copies, and
+ * the data directory. Returns {shared: bool, rows, data: [{path, size}],
+ * skipped: [why]} (data files an import would refuse are left out).
  */
 export async function prepareExport(pageDir, pin) {
   await fs.mkdir(pin, { recursive: true });
@@ -79,14 +82,19 @@ export async function prepareExport(pageDir, pin) {
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
-  return { shared, rows };
+  const { files: data, skipped } = await copyData(path.join(pageDir, DATA_DIR), path.join(pin, DATA_DIR), true);
+  return { shared, rows, data, skipped };
 }
 
-/** Streams the export zip of a prepared pin: manifest, shared.sqlite, files. */
-export function exportZip({ pageDir, pin, shared, rows, page, now }) {
+/**
+ * Streams the export zip of a prepared pin: manifest, shared.sqlite, files,
+ * the data directory. The manifest's `data: true` says the zip carries the
+ * data directory (possibly empty): importing it replaces the page's.
+ */
+export function exportZip({ pageDir, pin, shared, rows, data = [], page, now }) {
   const date = new Date(now);
   const manifest = Buffer.from(
-    JSON.stringify({ format: FORMAT, formatVersion: FORMAT_VERSION, page, exportedAt: date.toISOString() }, null, 2),
+    JSON.stringify({ format: FORMAT, formatVersion: FORMAT_VERSION, page, exportedAt: date.toISOString(), data: true }, null, 2),
   );
   const index = Buffer.from(JSON.stringify(rows.map((r) => ({ key: r.key, contentType: r.contentType, size: r.size, sha256: r.sha256 }))));
   const once = (buf) => async function* () {
@@ -103,6 +111,9 @@ export function exportZip({ pageDir, pin, shared, rows, page, now }) {
     for (const r of rows) {
       const p = path.join(pageDir, 'files', 'blobs', r.sha256);
       yield { name: DATA_PREFIX + r.key, size: r.size, method: COMPRESSED.test(r.contentType) ? 0 : 8, data: file(p) };
+    }
+    for (const d of data) {
+      yield { name: DIR_PREFIX + d.path, size: d.size, method: 8, data: file(path.join(pin, DATA_DIR, d.path)) };
     }
   }
   return Readable.from(zipStream(entries(), { date }));
@@ -152,12 +163,18 @@ async function stage(zipFile, work, room, now) {
     const shown = JSON.stringify(e.name);
     if (e.dir) {
       const d = e.name.slice(0, -1);
-      if (d !== 'files' && d !== 'files/data' && !(d.startsWith(DATA_PREFIX) && !pathProblem(d.slice(DATA_PREFIX.length)))) {
+      const inData = d === DATA_DIR || (d.startsWith(DIR_PREFIX) && !pathProblem(d.slice(DIR_PREFIX.length)));
+      if (d !== 'files' && d !== 'files/data' && !inData && !(d.startsWith(DATA_PREFIX) && !pathProblem(d.slice(DATA_PREFIX.length)))) {
         throw bad(`${shown} is not part of the export format.`);
       }
       continue;
     }
     if (e.name === 'manifest.json' || e.name === 'shared.sqlite' || e.name === 'files/index.json') continue;
+    if (e.name.startsWith(DIR_PREFIX)) {
+      const why = pathProblem(e.name.slice(DIR_PREFIX.length));
+      if (why) throw bad(`${shown}: the path ${why}.`);
+      continue;
+    }
     if (!e.name.startsWith(DATA_PREFIX)) throw bad(`${shown} is not part of the export format.`);
     const why = pathProblem(e.name.slice(DATA_PREFIX.length));
     if (why) throw bad(`${shown}: the file key ${why}.`);
@@ -173,6 +190,11 @@ async function stage(zipFile, work, room, now) {
     throw bad('manifest.json: page is not {id, title, version}.');
   }
   if (typeof manifest.exportedAt !== 'string' || Number.isNaN(Date.parse(manifest.exportedAt))) throw bad('manifest.json: exportedAt is not a date.');
+  if (manifest.data !== undefined && typeof manifest.data !== 'boolean') throw bad('manifest.json: data is not true or false.');
+  const dataFiles = entries.filter((e) => !e.dir && e.name.startsWith(DIR_PREFIX));
+  // Exports from before the data directory have no `data`: importing them
+  // leaves the page's data directory as it is.
+  const hasDataDir = manifest.data === true || dataFiles.length > 0;
 
   const ie = byName.get('files/index.json');
   if (!ie) throw bad('files/index.json is missing.');
@@ -212,7 +234,7 @@ async function stage(zipFile, work, room, now) {
     }
     blobs.set(k.sha256, k.size);
   }
-  const expanded = (s?.usize ?? 0) + [...blobs.values()].reduce((a, b) => a + b, 0);
+  const expanded = (s?.usize ?? 0) + [...blobs.values()].reduce((a, b) => a + b, 0) + dataFiles.reduce((a, e) => a + e.usize, 0);
   if (expanded > room) throw bad(`Its data takes ${expanded} bytes, more than the page has room for (${room} bytes).`);
   // And what is written is counted as it is written, whatever the entries
   // declare: the staging space is no page's quota.
@@ -266,15 +288,23 @@ async function stage(zipFile, work, room, now) {
     staged.add(got);
     await fs.rename(part, path.join(work, 'blobs', got));
   }
+  if (hasDataDir) {
+    await fs.mkdir(path.join(work, DATA_DIR), { recursive: true });
+    for (const e of dataFiles) {
+      const to = path.join(work, DATA_DIR, ...e.name.slice(DIR_PREFIX.length).split('/'));
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      await pipeline(Readable.from(entryData(zipFile, e)), count, createWriteStream(to));
+    }
+  }
   const rows = [...keys.values()].map(({ key, contentType, size, sha256 }) => ({ key, contentType, size, sha256 }));
   await writeIndex(path.join(work, 'files.sqlite'), rows, new Date(now).toISOString());
-  return { shared: Boolean(s), files: rows.length, bytes: expanded };
+  return { shared: Boolean(s), files: rows.length, data: hasDataDir ? dataFiles.length : null, bytes: expanded };
 }
 
 // --- replacing data, all or nothing ---------------------------------------
 //
 // A restore, an import or a wipe replaces some of the page's data: its
-// "slots", shared.sqlite, files.sqlite and users/. Replacing them one by one
+// "slots", shared.sqlite, files.sqlite, users/ and data/ (ctx.dataDir). Replacing them one by one
 // in place would leave a mix (the snapshot's shared data beside the old file
 // index, users' databases half copied) when the disk fills up or the runner
 // dies midway. So the new data is built complete aside, in a swap directory
@@ -285,7 +315,8 @@ async function stage(zipFile, work, room, now) {
 // swap a previous process left with its journal (and drops one left
 // without: it never committed).
 
-export const SLOTS = Object.freeze(['shared.sqlite', 'files.sqlite', 'users']);
+export const SLOTS = Object.freeze(['shared.sqlite', 'files.sqlite', 'users', DATA_DIR]);
+const DIR_SLOTS = new Set(['users', DATA_DIR]);
 const JOURNAL = 'journal.json';
 
 /** Where a swap builds the new data (`<swapDir>/new`). */
@@ -338,7 +369,7 @@ export async function finishSwap(pageDir, swapDir) {
     if (journal.has[slot] && !(await exists(src))) continue;
     // The old one and its sidecars go first: a WAL left beside the new
     // file would be replayed into it.
-    if (slot === 'users') await fs.rm(dest, { recursive: true, force: true });
+    if (DIR_SLOTS.has(slot)) await fs.rm(dest, { recursive: true, force: true });
     else await removeDb(dest);
     if (journal.has[slot]) await fs.rename(src, dest);
   }
@@ -349,8 +380,8 @@ export async function finishSwap(pageDir, swapDir) {
 /**
  * Builds a staged import (stageImport's `work`) into a swap: its blobs go
  * straight into the page's store (content-addressed, so adding them changes
- * nothing until an index names them), its databases into swapNew(swapDir).
- * Commit with the slots shared.sqlite and files.sqlite: users' databases
+ * nothing until an index names them), its databases and data directory
+ * into swapNew(swapDir). Commit with importSlots(staged): users' databases
  * stay.
  */
 export async function stageSwapImport(pageDir, work, swapDir) {
@@ -359,9 +390,17 @@ export async function stageSwapImport(pageDir, work, swapDir) {
   for (const n of await fs.readdir(path.join(work, 'blobs'))) {
     if (SHA.test(n)) await fs.rename(path.join(work, 'blobs', n), path.join(blobs, n));
   }
-  for (const db of ['shared.sqlite', 'files.sqlite']) {
-    if (await exists(path.join(work, db))) await fs.rename(path.join(work, db), path.join(swapNew(swapDir), db));
+  for (const slot of ['shared.sqlite', 'files.sqlite', DATA_DIR]) {
+    if (await exists(path.join(work, slot))) await fs.rename(path.join(work, slot), path.join(swapNew(swapDir), slot));
   }
+}
+
+/** The slots an import replaces: the data directory only when the zip carries one. */
+export const importSlots = (staged) => ['shared.sqlite', 'files.sqlite', ...(staged.data !== null ? [DATA_DIR] : [])];
+
+/** The slots a restore of the snapshot in snapDir replaces: data/ only when the snapshot has it. */
+export async function restoreSlots(snapDir) {
+  return (await exists(path.join(snapDir, DATA_DIR))) ? SLOTS : SLOTS.filter((s) => s !== DATA_DIR);
 }
 
 /**
@@ -378,10 +417,11 @@ export async function stageSwapRestore(snapDir, swapDir, skip = new Set()) {
   const users = (await userDbs(path.join(snapDir, 'users'))).filter((n) => !skip.has(n));
   if (users.length) await fs.mkdir(path.join(to, 'users'));
   for (const n of users) await fs.copyFile(path.join(snapDir, 'users', n), path.join(to, 'users', n));
+  if (await exists(path.join(snapDir, DATA_DIR))) await fs.cp(path.join(snapDir, DATA_DIR), path.join(to, DATA_DIR), { recursive: true });
 }
 
-/** The slots a wipe empties: the shared database and file index ("shared") or every user's database ("users"). */
-export const wipeSlots = (scope) => (scope === 'shared' ? ['shared.sqlite', 'files.sqlite'] : ['users']);
+/** The slots a wipe empties: the shared database, file index and data directory ("shared") or every user's database ("users"). */
+export const wipeSlots = (scope) => (scope === 'shared' ? ['shared.sqlite', 'files.sqlite', DATA_DIR] : ['users']);
 
 /** Bytes the users' databases take (they stay through an import). */
 export async function usersBytes(pageDir) {

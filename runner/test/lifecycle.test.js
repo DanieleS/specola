@@ -593,7 +593,7 @@ describe('snapshots', () => {
       assert.match(log, /\[warn\] snapshot of version 1's data: left out users\/a{64}\.sqlite \(file is not a database\)/);
       const dir = path.join(r.dataDir, 'snapshots', 'snap-2');
       const [snap] = (await fs.readdir(dir)).filter((n) => n.includes('-version-'));
-      assert.deepEqual((await fs.readdir(path.join(dir, snap), { recursive: true })).sort(), ['meta.json', 'shared.sqlite', 'users']);
+      assert.deepEqual((await fs.readdir(path.join(dir, snap), { recursive: true })).sort(), ['data', 'meta.json', 'shared.sqlite', 'users']);
     }));
 
   test('a failed snapshot leaves nothing behind, and half-written ones are swept', async () => {

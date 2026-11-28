@@ -250,7 +250,7 @@ describe('snapshots', () => {
     withRunner({}, async (r) => {
       const res = await r.api('POST', '/pages/empty/snapshots', { json: { kind: 'manual', label: 'nothing yet' } });
       assert.equal(res.status, 201);
-      assert.deepEqual(await fs.readdir(path.join(r.dataDir, 'snapshots', 'empty', res.body.id)), ['meta.json']);
+      assert.deepEqual(await fs.readdir(path.join(r.dataDir, 'snapshots', 'empty', res.body.id)), ['data', 'meta.json']);
     }));
 
   test('version snapshots carry the version that left', () =>
@@ -616,7 +616,7 @@ print(json.dumps({i.filename: i.compress_type for i in z.infolist()}))
         'files/data/ünï code.json': 8,
       });
       const manifest = JSON.parse(execFileSync('unzip', ['-p', zipFile, 'manifest.json']));
-      assert.deepEqual(Object.keys(manifest), ['format', 'formatVersion', 'page', 'exportedAt']);
+      assert.deepEqual(Object.keys(manifest), ['format', 'formatVersion', 'page', 'exportedAt', 'data']);
       assert.equal(manifest.format, 'specola-backend-data');
       assert.equal(manifest.formatVersion, 1);
       assert.deepEqual(manifest.page, { id: 'x-src', title: 'Test page', version: 1 });
@@ -638,7 +638,7 @@ print(json.dumps({i.filename: i.compress_type for i in z.infolist()}))
       assert.deepEqual(await dst.list(), await src.list());
       for (const [k, d] of files) assert.ok((await dst.get(k)).equals(d), k);
       assert.deepEqual(await dst.mine(), ['dst-user'], 'users\' databases are not imported or replaced');
-      assert.match(await logText(r, 'x-dst'), /data imported: a shared database and 6 file\(s\)/);
+      assert.match(await logText(r, 'x-dst'), /data imported: a shared database, 6 file\(s\)/);
 
       // And back: the before-import snapshot restores what was there.
       await r.api('POST', `/pages/x-dst/snapshots/${imp.body.before.id}/restore`);
@@ -670,6 +670,7 @@ print(json.dumps({i.filename: i.compress_type for i in z.infolist()}))
       const before = await state();
       const cases = [
         [craftZip([...exportEntries({ files: [{ key: 'a', data: 'a' }] }), { name: 'files/data/../../../state/evil.json', data: 'x' }]), /"\.\." segment/],
+        [craftZip([...exportEntries(), { name: 'data/../../state/evil.json', data: 'x' }]), /data\/\.\.\/\.\.\/state\/evil\.json": the path has a "\.\." segment/],
         [craftZip(exportEntries({ files: [{ key: 'a', data: 'a' }], index: [{ key: 'a', contentType: 'text/plain', size: 1, sha256: sha256('b') }] })), /does not match its sha256/],
         [craftZip([{ name: 'manifest.json', data: '{}' }]), /format is not/],
         [craftZip([...exportEntries(), { name: 'files/data/l', data: '/etc', method: 0, attrs: (0o120777 << 16) >>> 0 }]), /symbolic link/],
@@ -1135,5 +1136,167 @@ describe('step 1 snapshots', () => {
       assert.deepEqual({ ...meta, sizeBytes: 0 }, { kind: 'version', version: 3, createdAt: '2026-11-20T10:15:00.123Z', sizeBytes: 0 });
       const again = (await r.api('GET', '/pages/old-1/data')).body.snapshots.find((s) => s.kind === 'version');
       assert.equal(again.id, '20261120T101500Z-version-v3');
+    }));
+});
+
+// ctx.dataDir (docs/page-backends.md, "Data lifecycle"): files the code
+// opens by path, here a text file and a SQLite database kept open in WAL
+// mode, as better-sqlite3 would keep one.
+const DIR_BACKEND = backend(`import { DatabaseSync } from 'node:sqlite';
+import fs from 'node:fs';
+import path from 'node:path';
+let db = null;
+const open = (ctx) => {
+  if (!db) {
+    db = new DatabaseSync(path.join(ctx.dataDir, 'app.db'));
+    db.exec('PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS t (v TEXT)');
+  }
+  return db;
+};
+export default {
+  async fetch(request, ctx) {
+    const url = new URL(request.url);
+    const q = (k) => url.searchParams.get(k);
+    switch (url.pathname) {
+      case '/put': {
+        const f = path.join(ctx.dataDir, q('name'));
+        fs.mkdirSync(path.dirname(f), { recursive: true });
+        fs.writeFileSync(f, q('v'));
+        return new Response('ok');
+      }
+      case '/get': {
+        const f = path.join(ctx.dataDir, q('name'));
+        return fs.existsSync(f) ? new Response(fs.readFileSync(f)) : new Response('', { status: 404 });
+      }
+      case '/add':
+        open(ctx).prepare('INSERT INTO t VALUES (?)').run(q('v'));
+        return new Response('ok');
+      case '/rows':
+        return Response.json(open(ctx).prepare('SELECT v FROM t ORDER BY rowid').all().map((r) => r.v));
+    }
+    return new Response('', { status: 404 });
+  },
+};`);
+
+function dirPage(r, id) {
+  const v = r.publish(DIR_BACKEND, 'dir-1');
+  const call = async (p) => {
+    const res = await r.invoke({ ...v, page: id, path: p });
+    return { status: res.status, text: await res.text() };
+  };
+  return {
+    call,
+    put: (name, value) => call(`/put?name=${encodeURIComponent(name)}&v=${encodeURIComponent(value)}`),
+    get: async (name) => {
+      const res = await call(`/get?name=${encodeURIComponent(name)}`);
+      return res.status === 200 ? res.text : null;
+    },
+    add: (value) => call(`/add?v=${encodeURIComponent(value)}`),
+    rows: async () => JSON.parse((await call('/rows')).text),
+    snap: (label) => r.api('POST', `/pages/${id}/snapshots`, { json: { kind: 'manual', label } }),
+  };
+}
+
+describe('the data directory', () => {
+  test('is snapshotted (databases while open) and restored, and the restore can be undone', () =>
+    withRunner({}, async (r) => {
+      const p = dirPage(r, 'd-1');
+      await p.put('a.txt', 'one');
+      await p.put('deep/b.txt', 'bee');
+      await p.add('x');
+      const s = (await p.snap('good')).body;
+      const snapDir = path.join(r.dataDir, 'snapshots', 'd-1', s.id, 'data');
+      assert.deepEqual((await fs.readdir(snapDir, { recursive: true })).sort(), ['a.txt', 'app.db', 'deep', 'deep/b.txt']);
+      assert.ok(s.sizeBytes > 0);
+
+      await p.put('a.txt', 'two');
+      await p.put('c.txt', 'new');
+      await p.add('y');
+      const res = await r.api('POST', `/pages/d-1/snapshots/${s.id}/restore`);
+      assert.equal(res.status, 200);
+      assert.equal(await p.get('a.txt'), 'one');
+      assert.equal(await p.get('deep/b.txt'), 'bee');
+      assert.equal(await p.get('c.txt'), null);
+      assert.deepEqual(await p.rows(), ['x']);
+
+      await r.api('POST', `/pages/d-1/snapshots/${res.body.before.id}/restore`);
+      assert.equal(await p.get('a.txt'), 'two');
+      assert.equal(await p.get('c.txt'), 'new');
+      assert.deepEqual(await p.rows(), ['x', 'y']);
+    }));
+
+  test('a version switch snapshots it even without databases of the runner\'s', () =>
+    withRunner({}, async (r) => {
+      const p = dirPage(r, 'd-2');
+      await p.put('only.txt', 'here');
+      const v2 = r.publish(DIR_BACKEND, 'dir-2');
+      assert.equal((await r.invoke({ ...v2, page: 'd-2', version: 2, path: '/get?name=only.txt' })).status, 200);
+      const { body } = await r.api('GET', '/pages/d-2/data');
+      const snap = body.snapshots.find((x) => x.kind === 'version');
+      assert.ok(snap, 'a version snapshot');
+      assert.equal(await fs.readFile(path.join(r.dataDir, 'snapshots', 'd-2', snap.id, 'data', 'only.txt'), 'utf8'), 'here');
+    }));
+
+  test('a shared wipe empties it', () =>
+    withRunner({}, async (r) => {
+      const p = dirPage(r, 'd-3');
+      await p.put('a.txt', 'one');
+      await p.add('x');
+      const w = await r.api('POST', '/pages/d-3/wipe', { json: { scope: 'shared' } });
+      assert.equal(w.status, 200);
+      assert.equal(await p.get('a.txt'), null);
+      assert.deepEqual(await p.rows(), []);
+      await r.api('POST', `/pages/d-3/snapshots/${w.body.before.id}/restore`);
+      assert.equal(await p.get('a.txt'), 'one');
+    }));
+
+  test('a snapshot from before the data directory leaves it alone', () =>
+    withRunner({}, async (r) => {
+      const p = dirPage(r, 'd-4');
+      await p.add('x');
+      const s = (await p.snap('old style')).body;
+      await fs.rm(path.join(r.dataDir, 'snapshots', 'd-4', s.id, 'data'), { recursive: true });
+      await p.put('a.txt', 'kept');
+      assert.equal((await r.api('POST', `/pages/d-4/snapshots/${s.id}/restore`)).status, 200);
+      assert.equal(await p.get('a.txt'), 'kept');
+    }));
+
+  test('is exported and imported, replacing the importing page\'s', () =>
+    withRunner({}, async (r) => {
+      const src = dirPage(r, 'd-src');
+      await src.put('a.txt', 'one');
+      await src.put('dir/b.txt', 'bee');
+      await src.add('x');
+      await src.add('y');
+      const dst = dirPage(r, 'd-dst');
+      await dst.put('gone.txt', 'old');
+      await dst.add('old');
+
+      const exp = await r.api('GET', '/pages/d-src/export');
+      assert.equal(exp.status, 200);
+      const zipFile = path.join(r.dataDir, 'd.zip');
+      await fs.writeFile(zipFile, exp.body);
+      const names = execFileSync('unzip', ['-Z1', zipFile]).toString().trim().split('\n');
+      assert.deepEqual(names.filter((n) => n.startsWith('data/')).sort(), ['data/a.txt', 'data/app.db', 'data/dir/b.txt']);
+      assert.equal(JSON.parse(execFileSync('unzip', ['-p', zipFile, 'manifest.json']).toString()).data, true);
+
+      const imp = await r.api('PUT', '/pages/d-dst/import', { body: exp.body });
+      assert.equal(imp.status, 200, JSON.stringify(imp.body));
+      assert.equal(await dst.get('a.txt'), 'one');
+      assert.equal(await dst.get('dir/b.txt'), 'bee');
+      assert.equal(await dst.get('gone.txt'), null);
+      assert.deepEqual(await dst.rows(), ['x', 'y']);
+      assert.match(await logText(r, 'd-dst'), /and 3 file\(s\) in the data directory/);
+    }));
+
+  test('an export without it (from before) leaves the page\'s alone', () =>
+    withRunner({}, async (r) => {
+      // The manifest as it was: no "data".
+      const old = craftZip(exportEntries());
+      const p = dirPage(r, 'd-5');
+      await p.put('a.txt', 'kept');
+      const imp = await r.api('PUT', '/pages/d-5/import', { body: old });
+      assert.equal(imp.status, 200, JSON.stringify(imp.body));
+      assert.equal(await p.get('a.txt'), 'kept');
     }));
 });

@@ -20,6 +20,7 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { DatabaseSync } from 'node:sqlite';
 import { RunnerError } from './errors.js';
 import { INDEX_SCHEMA } from './worker/files.mjs';
+import { pathProblem } from './worker/paths.mjs';
 import { heldBlobs } from './worker/usage.mjs';
 
 /** A snapshot id, exactly as the contract has it. */
@@ -34,6 +35,11 @@ const SQLITE_BROKEN = new Set([11, 26]);
 // The databases the runner itself creates in a page's directory. Anything
 // else there is the page code's own business and is not snapshotted.
 export const USER_DB = /^[0-9a-f]{64}\.sqlite$/;
+// ctx.dataDir, relative to the page's directory: files the code opens by
+// path (better-sqlite3 and the like), snapshotted whole.
+export const DATA_DIR = 'data';
+const SQLITE_HEADER = Buffer.from('SQLite format 3\0');
+const SQLITE_SIDECAR = /^(.*)-(wal|shm|journal)$/;
 
 /** "20261125T101500Z": sortable, and no ":" in a file name. */
 export function stamp(ms) {
@@ -85,6 +91,7 @@ function thread(op) {
 
 const OPS = {
   copy: ({ pageDir, dest }) => copyDatabases(pageDir, dest),
+  data: ({ src, dest, strictNames }) => copyDataDir(src, dest, strictNames),
   vacuum: ({ src, dest }) => vacuumInto(src, dest),
   collect: ({ pageDir, snapshotsDir }) => collectBlobsNow(pageDir, snapshotsDir),
   names: ({ file }) => indexNames(file),
@@ -105,6 +112,13 @@ if (!isMainThread && workerData?.snapshotOp) {
 
 /** Copies src to dest with VACUUM INTO, on a worker thread. */
 export const vacuumCopy = (src, dest) => thread({ op: 'vacuum', src, dest });
+
+/**
+ * Copies a data directory (ctx.dataDir) on a worker thread → {files: [{path,
+ * size}], skipped: [why]}. strictNames leaves out files whose path an
+ * import would refuse (for exports).
+ */
+export const copyData = (src, dest, strictNames = false) => thread({ op: 'data', src, dest, strictNames });
 
 /** The sha256 of every blob a file index names, on a worker thread. */
 export const blobNames = (file) => thread({ op: 'names', file });
@@ -172,7 +186,96 @@ async function copyDatabases(pageDir, dest) {
       await fs.rm(path.join(dest, rel), { force: true });
     }
   }
+  // Always there in a snapshot, even empty: restoring it brings the data
+  // directory back as it was (snapshots taken before it existed have none,
+  // and restoring them leaves the data directory alone).
+  const data = await copyDataDir(path.join(pageDir, DATA_DIR), path.join(dest, DATA_DIR));
+  skipped.push(...data.skipped);
   return { skipped };
+}
+
+async function isSqlite(file) {
+  let fh;
+  try {
+    fh = await fs.open(file);
+    const head = Buffer.alloc(16);
+    const { bytesRead } = await fh.read(head, 0, 16, 0);
+    return bytesRead === 16 && head.equals(SQLITE_HEADER);
+  } catch {
+    return false;
+  } finally {
+    await fh?.close();
+  }
+}
+
+/**
+ * Copies the data directory src into dest: SQLite databases with VACUUM
+ * INTO (consistent while the worker writes; their WAL, shared memory and
+ * journal are folded in, so not copied), everything else byte for byte
+ * (best effort: a file being written meanwhile may be copied half
+ * written). Anything but files and directories is left out.
+ */
+async function copyDataDir(src, dest, strictNames = false) {
+  const files = [];
+  const skipped = [];
+  await fs.mkdir(dest, { recursive: true });
+  let entries;
+  try {
+    entries = await fs.readdir(src, { recursive: true, withFileTypes: true });
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return { files, skipped };
+    throw err;
+  }
+  entries.sort((a, b) => (a.parentPath ?? a.path).localeCompare(b.parentPath ?? b.path) || a.name.localeCompare(b.name));
+  for (const e of entries) {
+    const abs = path.join(e.parentPath ?? e.path, e.name);
+    const rel = path.relative(src, abs).split(path.sep).join('/');
+    if (e.isDirectory()) {
+      await fs.mkdir(path.join(dest, rel), { recursive: true });
+      continue;
+    }
+    if (!e.isFile()) continue;
+    const side = SQLITE_SIDECAR.exec(abs);
+    if (side && (await isSqlite(side[1]))) continue;
+    if (strictNames) {
+      const why = pathProblem(rel);
+      if (why) {
+        skipped.push(`data/${rel} (its path ${why})`);
+        continue;
+      }
+    }
+    const to = path.join(dest, rel);
+    await fs.mkdir(path.dirname(to), { recursive: true });
+    if (await isSqlite(abs)) {
+      try {
+        vacuumInto(abs, to);
+      } catch (err) {
+        // A database the code broke: its bytes as they are.
+        if (!SQLITE_BROKEN.has(err.errcode)) throw err;
+        await fs.rm(to, { force: true });
+        await fs.copyFile(abs, to);
+      }
+    } else {
+      try {
+        await fs.copyFile(abs, to);
+      } catch (err) {
+        if (err.code === 'ENOENT') continue; // deleted meanwhile
+        throw err;
+      }
+    }
+    files.push({ path: rel, size: (await fs.stat(to)).size });
+  }
+  return { files, skipped };
+}
+
+/** Whether the page's data directory holds any file. */
+export async function hasData(pageDir) {
+  try {
+    const entries = await fs.readdir(path.join(pageDir, DATA_DIR), { recursive: true, withFileTypes: true });
+    return entries.some((e) => e.isFile());
+  } catch {
+    return false;
+  }
 }
 
 function indexNames(file) {
@@ -375,7 +478,8 @@ async function freeId(snapshotsDir, kind, ms, version) {
 export async function takeSnapshot({ pageDir, snapshotsDir, kind, label, version, now = Date.now(), limits, protect }) {
   if (!KINDS.has(kind)) throw new Error(`unknown snapshot kind ${kind}`);
   const dbs = await databases(pageDir);
-  if (dbs.length === 0 && (kind === 'version' || kind === 'daily')) return { snapshot: null, skipped: [] };
+  const data = await hasData(pageDir);
+  if (dbs.length === 0 && !data && (kind === 'version' || kind === 'daily')) return { snapshot: null, skipped: [] };
   await fs.mkdir(snapshotsDir, { recursive: true });
   const id = await freeId(snapshotsDir, kind, now, version);
   const tmp = path.join(snapshotsDir, `.tmp-${id}`);
@@ -383,7 +487,8 @@ export async function takeSnapshot({ pageDir, snapshotsDir, kind, label, version
   let skipped = [];
   try {
     await fs.mkdir(tmp);
-    if (dbs.length) ({ skipped } = await thread({ op: 'copy', pageDir, dest: tmp }));
+    await fs.mkdir(path.join(tmp, DATA_DIR));
+    if (dbs.length || data) ({ skipped } = await thread({ op: 'copy', pageDir, dest: tmp }));
     const sizeBytes = await dirBytes(tmp);
     if (kind === 'manual') {
       const manual = (await listSnapshots(snapshotsDir)).filter((s) => s.kind === 'manual');

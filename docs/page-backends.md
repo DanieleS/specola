@@ -285,7 +285,8 @@ interface Ctx {
 - **`dataDir`** is `<page dir>/data/`, created on first access, for
   libraries that open files by path (`new Database(path.join(ctx.dataDir,
   "app.db"))` with `better-sqlite3`). It counts against the page's disk
-  quota; it is **not yet** in snapshots, exports, imports or wipes.
+  quota and is shared data of the page: it is in snapshots, exports and
+  imports, and a shared wipe empties it (see Data lifecycle).
 - **Outbound HTTP** is the global `fetch`, routed through the runner's
   egress proxy, which allows only the manifest's `egress` hosts (others get
   a `403` from the proxy, which `fetch` surfaces as a failed request with a
@@ -622,7 +623,13 @@ index nor a snapshot names them.
 ### Snapshots
 
 A **snapshot** is every database of the page, copied with `VACUUM INTO`
-(consistent while the worker runs), plus the file index.
+(consistent while the worker runs), plus the file index and the data
+directory (`ctx.dataDir`): the SQLite databases in it (told by their
+header) through `VACUUM INTO` too, their `-wal`, `-shm` and `-journal`
+folded in; every other file byte for byte, best effort (a file being
+written during the copy may be copied half written). A snapshot always has
+a `data/` directory, even empty; one taken before `ctx.dataDir` existed has
+none, and restoring it leaves the data directory as it is.
 
 - **Taken automatically** when a new version becomes current, before its
   worker handles anything (labelled with the version that is leaving: it is
@@ -635,7 +642,7 @@ A **snapshot** is every database of the page, copied with `VACUUM INTO`
   their own quota per page (Limits); past it the oldest automatic ones go
   first.
 - **Restored** by an owner only: it replaces all of the page's data
-  (shared, every user's, files) with the snapshot. When restoring a version
+  (shared, every user's, files, the data directory) with the snapshot. When restoring a version
   from the history, the viewer offers to restore that version's snapshot
   in the same step.
 
@@ -645,15 +652,16 @@ bad migrations, **not** from losing the volume. Back up the volume.
 ### Export, import, wipe
 
 - **Export** (owners and editors, who can read all of it through code
-  anyway): a zip of `shared.sqlite`, the files and a
+  anyway): a zip of `shared.sqlite`, the files, the data directory and a
   `manifest.json` (page, version, date). Users' private databases are not
   in it: each user exports their own (**My data**, any viewer, their
   `userDb` only). `GET /api/pages/{id}/backend/export`,
   `GET /api/pages/{id}/backend/my-data`.
 - **Import** (owner): uploads a zip in the export format and replaces the
-  shared database and the files (snapshot first). It moves a page's data
+  shared database, the files and the data directory (snapshot first). It moves a page's data
   between instances, or seeds it. `PUT /api/pages/{id}/backend/import`.
-- **Wipe** (owner): "Reset shared data and files" or "Reset every user's
+- **Wipe** (owner): "Reset shared data and files" (the data directory
+  included) or "Reset every user's
   data", each after a snapshot. Any user: "Delete my data" (their `userDb`,
   no snapshot: it is theirs to delete).
 
@@ -710,15 +718,20 @@ leaving), `daily`, `manual` (with `label`), `before-restore`,
 optional `-v<N>`, matching `^[0-9]{8}T[0-9]{6}Z-[a-z-]+(-v[0-9]+)?$`.
 
 **Export zip**: `manifest.json` (`{"format":"specola-backend-data",
-"formatVersion":1, "page":{"id","title","version"}, "exportedAt"}`),
+"formatVersion":1, "page":{"id","title","version"}, "exportedAt", "data":true}`),
 `shared.sqlite` (absent when the page has none), `files/index.json`
 (`[{"key","contentType","size","sha256"}]`) and each file at
-`files/data/<key>`. Deflate for everything but the SQLite file and blobs
+`files/data/<key>`, and each file of the data directory at
+`data/<path>` (copied as for a snapshot; files whose path breaks the key
+rules are left out, with a warning in the backend log). `"data": true` says
+the zip carries the data directory, possibly empty; an export without it
+(made before it existed) imports leaving the page's data directory as it
+is. Deflate for everything but the SQLite file and blobs
 whose content type is already compressed. Import accepts exactly this
 layout (unknown entries, paths outside it, duplicate or invalid keys, a
 `sha256` that doesn't match, or an expanded size over the page quota are
-`bad-import`; nothing is changed then). Import replaces `shared.sqlite` and
-the file store, never users' databases.
+`bad-import`; nothing is changed then). Import replaces `shared.sqlite`,
+the file store and the data directory, never users' databases.
 
 **Runner** (bearer; specola has already checked access; page id
 canonical; the caller's sub, when one is needed, in
@@ -1094,8 +1107,7 @@ false and `specola.fetch` rejects with `BackendUnavailable`
 - **Dependencies, next steps**: start the install when a version is
   published (specola → runner) and have `specola-publish` wait for it and
   print the outcome; a distinct `reason: "preparing"` in the SDK;
-  `ctx.dataDir` in snapshots, exports, imports and wipes (SQLite files
-  through the online backup); removing installs no current version uses;
+  `backend_query` on databases in `ctx.dataDir`; removing installs no current version uses;
   pinning transitive versions with a lockfile under `.specola/`.
 
 

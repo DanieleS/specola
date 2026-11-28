@@ -107,7 +107,7 @@ export interface Ctx {
   /**
    * Absolute path of a directory of the page's own, for libraries that open
    * files by path (better-sqlite3 and the like). It counts against the
-   * page's disk quota. Not yet included in snapshots, exports, imports or
+   * page's disk quota and is in snapshots, exports, imports and shared
    * wipes. Under `vite dev` it is .specola-dev/data/.
    */
   readonly dataDir: string;

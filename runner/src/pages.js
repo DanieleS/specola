@@ -32,7 +32,7 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { entryOf } from './code.js';
 import { dependenciesOf } from './deps.js';
-import { SLOTS, commitSwap, exportZip, finishSwap, prepareExport, removeDb, stageImport, stageSwapImport, stageSwapRestore, swapNew, usersBytes, userHash, wipeSlots } from './data.js';
+import { commitSwap, exportZip, finishSwap, importSlots, prepareExport, removeDb, restoreSlots, stageImport, stageSwapImport, stageSwapRestore, swapNew, usersBytes, userHash, wipeSlots } from './data.js';
 import { RunnerError } from './errors.js';
 import { PageWorker } from './process.js';
 import { QUERY_TIMEOUT_MS, runQuery } from './query.js';
@@ -591,7 +591,7 @@ export class Pages {
       // user made after deleting theirs is in later snapshots, which come
       // back whole.
       const skip = new Set(page.erased.filter((e) => e.snapshots.includes(sid)).map((e) => `${e.user}.sqlite`));
-      await this.#replace(id, SLOTS, (dir) => stageSwapRestore(s.dir, dir, skip));
+      await this.#replace(id, await restoreSlots(s.dir), (dir) => stageSwapRestore(s.dir, dir, skip));
       const restoredFor = current !== null && page.version !== null && current > page.version ? current : null;
       if (restoredFor !== page.restoredFor) {
         page.restoredFor = restoredFor;
@@ -636,10 +636,11 @@ export class Pages {
     // written.
     const pin = path.join(this.snapshotsDir(id), `.tmp-export-${randomBytes(6).toString('hex')}`);
     try {
-      const { shared, rows } = await this.#dataLocked(page, () => prepareExport(pageDir, pin));
+      const { shared, rows, data, skipped } = await this.#dataLocked(page, () => prepareExport(pageDir, pin));
+      if (skipped.length) this.logs.append(id, 'warn', `export: left out ${skipped.join(', ')}`);
       res.writeHead(200, { 'Content-Type': 'application/zip', 'Cache-Control': 'no-store' });
       const manifest = { id, title: about.title ?? page.title, version: about.version !== undefined ? about.version : page.version };
-      const zip = exportZip({ pageDir, pin, shared, rows, page: manifest, now: this.now() });
+      const zip = exportZip({ pageDir, pin, shared, rows, data, page: manifest, now: this.now() });
       try {
         await pipeline(zip, res);
       } catch (err) {
@@ -688,9 +689,9 @@ export class Pages {
       return await this.#maintain(id, 'an import', async (page) => {
         const before = await this.#snapshot(page, { kind: 'before-import' });
         await fs.mkdir(this.pageDir(id), { recursive: true });
-        await this.#replace(id, ['shared.sqlite', 'files.sqlite'], (dir) => stageSwapImport(this.pageDir(id), work, dir));
+        await this.#replace(id, importSlots(staged), (dir) => stageSwapImport(this.pageDir(id), work, dir));
         await this.#afterReplace(id, before);
-        this.logs.append(id, 'info', `data imported: ${staged.shared ? 'a shared database' : 'no shared database'} and ${staged.files} file(s) (the data before it is in ${before.id})`);
+        this.logs.append(id, 'info', `data imported: ${staged.shared ? 'a shared database' : 'no shared database'}, ${staged.files} file(s)${staged.data !== null ? ` and ${staged.data} file(s) in the data directory` : ''} (the data before it is in ${before.id})`);
         return { before: publicSnapshot(before) };
       });
     } finally {

@@ -182,7 +182,7 @@ of each kind in the backend log.
 /data/pages/{pageId}/files/blobs/{sha256}    ctx.files contents
 /data/snapshots/{pageId}/{id}/               a snapshot and its meta.json (outside the page's reach)
 /data/swap/{pageId}/                         the data a restore, import or wipe swaps in, and its journal
-/data/pages/{pageId}/data/                   ctx.dataDir: files the code opens by path (not in snapshots yet)
+/data/pages/{pageId}/data/                   ctx.dataDir: files the code opens by path
 /data/tmp/                                   imports and downloads in progress (emptied at start)
 /data/deps/{key}/node_modules/…              dependencies installed for a set of packages, platform and Node ABI
 /data/deps/.store/                           pnpm's content-addressed store (installs hard-link from it)
@@ -225,7 +225,8 @@ the three before-* kinds together, and up to 10 manual ones. Step 1's
 version snapshots (`20261125T101500.123Z-v3`) are read as version
 snapshots and renamed, with a `meta.json`, at start.
 
-Snapshots hold copies of the databases (and the file index); the file
+Snapshots hold copies of the databases (and the file index) and of
+`data/` (SQLite files there with `VACUUM INTO`, others byte for byte); the file
 store's blobs stay in the page's directory and are deleted only when
 neither the live index nor a snapshot names them. While an export streams,
 a `.tmp-export-*` directory under the page's snapshots holds its copies and
@@ -239,9 +240,9 @@ them.
 
 A database the page's code broke (one that SQLite says is not a database,
 or malformed) is left out of a snapshot with a warning in the backend log,
-so it can't block version switches for good. Only the databases the runner
-creates are snapshotted; anything else the code writes in its directory is
-its own.
+so it can't block version switches for good. Besides `data/`, only the databases the runner
+creates are snapshotted; anything else the code writes in its directory
+(outside `ctx.dataDir`) is its own.
 
 ## Security model
 
