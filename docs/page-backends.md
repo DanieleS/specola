@@ -47,7 +47,8 @@ plugin/CLI, the page SDK and the SPA. Keep it in sync with the code.
   stays on an opaque origin. The bridge is the same `MessagePort` that
   carries `localStorage` today.
 - Non-goals (v1): backends for single-file pages (only bundles), npm
-  packages with native addons, more than one runner replica, per-page
+  packages with native addons (proposed in
+  [`native-addons.md`](native-addons.md)), more than one runner replica, per-page
   resource accounting/billing, a hostile-tenant sandbox (see Trust model).
 
 ## Trust model
