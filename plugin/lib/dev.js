@@ -230,6 +230,11 @@ export function createDevBackend({ root, load, manifest, env = process.env, logg
         files ??= new DevFileStore(dataDir);
         return files;
       },
+      get dataDir() {
+        const dir = join(dataDir, 'data');
+        mkdirSync(dir, { recursive: true });
+        return dir;
+      },
       secrets: secrets(env),
       publish,
       waitUntil(p) {

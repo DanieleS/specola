@@ -63,8 +63,43 @@ export function resolveBackend(options, config) {
   // The plugin decides where the entry is built; a version other than 1 is
   // left to the validator, which says what it must be.
   if ('entry' in raw) throw new Error(`[specola] ${source}: "entry" is set by the plugin (it builds ${options.server} into ${BACKEND_PREFIX}${DEFAULT_ENTRY}); remove it`);
-  const manifest = check({ version: 1, ...raw, entry: DEFAULT_ENTRY }, source);
+  const dependencies = pinDependencies(raw.dependencies, entry, source);
+  const manifest = check({ version: 1, ...raw, entry: DEFAULT_ENTRY, ...(dependencies && { dependencies }) }, source);
   return { entry, manifest, source };
+}
+
+/**
+ * The dependencies as the manifest has them, {name: exact version}: a list
+ * of names is pinned to the versions installed in the project (the ones
+ * vite dev runs with), found from the server entry as Node would find
+ * them. Undefined when there are none; an object is left to the validator.
+ */
+export function pinDependencies(deps, entry, source) {
+  if (!Array.isArray(deps)) return deps;
+  const out = {};
+  for (const name of deps) {
+    if (typeof name !== 'string') throw new Error(`[specola] ${source}: "dependencies" must list package names, got ${JSON.stringify(name)}`);
+    const version = installedVersion(name, dirname(entry));
+    if (!version) {
+      throw new Error(`[specola] ${source}: the dependency ${JSON.stringify(name)} is not installed in the project (no node_modules/${name}/package.json above ${dirname(entry)}): install it first`);
+    }
+    out[name] = version;
+  }
+  return out;
+}
+
+function installedVersion(name, from) {
+  for (let dir = from; ; dir = dirname(dir)) {
+    const file = join(dir, 'node_modules', name, 'package.json');
+    if (existsSync(file)) {
+      try {
+        return JSON.parse(readFileSync(file, 'utf8')).version ?? null;
+      } catch {
+        return null;
+      }
+    }
+    if (dirname(dir) === dir) return null;
+  }
 }
 
 function check(value, source) {
@@ -116,9 +151,10 @@ export async function buildServer(vite, config, backend) {
     customLogger: config.logger,
     resolve: { alias: config.resolve?.alias },
     define: config.define,
-    plugins: [noNativeAddons(config.root)],
-    // Everything in one tree the runner can load from its code directory:
-    // the runner has no node_modules, only the files under .specola/.
+    plugins: [installedOnRunner(Object.keys(backend.manifest.dependencies ?? {})), noNativeAddons(config.root)],
+    // Everything in one tree the runner can load from its code directory,
+    // except the declared dependencies, which the runner installs and the
+    // bundle imports by name.
     ssr: { noExternal: true, target: 'node' },
     build: {
       ssr: backend.entry,
@@ -151,17 +187,36 @@ export async function buildServer(vite, config, backend) {
 }
 
 /**
- * Fails the server build on a native addon: the runner loads no addons
- * (workers run with Node's permission model, which forbids them), so the
- * build would only fail later, at the first request.
+ * Leaves the declared dependencies (and their subpaths) out of the server
+ * build: the bundle keeps `import "name"`, which the runner resolves to its
+ * own install of the package.
+ */
+export function installedOnRunner(names) {
+  const set = new Set(names);
+  return {
+    name: 'specola:installed-on-runner',
+    enforce: 'pre',
+    resolveId(source) {
+      if (set.size && set.has(packageName(source))) return { id: source, external: true };
+      return null;
+    },
+  };
+}
+
+/**
+ * Fails the server build on a native addon that would be bundled: a .node
+ * file can't travel in the bundle (it is built for the author's machine),
+ * so the package that loads it must be a dependency the runner installs.
  */
 export function noNativeAddons(root) {
   const fail = (ctx, what, importer) => {
-    const from = importer ? ` (imported by ${relative(root, importer.split('?')[0]) || importer})` : '';
-    ctx.error(
-      `[specola] the backend uses the native addon ${what}${from}: page backends can't load native addons (.node files). ` +
-        'Use a pure-JavaScript or WebAssembly package instead (node:sqlite is built in for databases).',
-    );
+    const file = importer?.split('?')[0];
+    const from = file ? ` (imported by ${relative(root, file) || importer})` : '';
+    const pkg = file ? owningPackage(file) : '';
+    const hint = pkg
+      ? `Add ${JSON.stringify(pkg)} to the backend's dependencies, backend: { dependencies: [${JSON.stringify(pkg)}] }: the runner installs it for its own platform.`
+      : 'Add the package that loads it to the backend\'s dependencies, backend: { dependencies: ["name"] }: the runner installs it for its own platform.';
+    ctx.error(`[specola] the backend uses the native addon ${what}${from}: native addons (.node files) can't be bundled. ${hint}`);
   };
   return {
     name: 'specola:no-native-addons',
@@ -178,7 +233,16 @@ export function noNativeAddons(root) {
   };
 }
 
-function packageName(spec) {
+// The package a file in node_modules belongs to: the one after the last
+// node_modules segment (pnpm's .pnpm/<id>/node_modules/<name> included).
+function owningPackage(file) {
+  const parts = file.split(/[\\/]/);
+  const i = parts.lastIndexOf('node_modules');
+  if (i < 0 || i + 1 >= parts.length) return '';
+  return parts[i + 1].startsWith('@') ? parts.slice(i + 1, i + 3).join('/') : parts[i + 1];
+}
+
+export function packageName(spec) {
   if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('\0') || spec.includes(':')) return '';
   const parts = spec.split('/');
   return spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];

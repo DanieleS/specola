@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"regexp"
 	"slices"
@@ -39,6 +40,9 @@ const (
 	// maxListEntries bounds each of the manifest's other lists, which are
 	// sent along with calls: dozens are plenty.
 	maxListEntries = 100
+	// MaxDependencies is the most npm packages a backend may have the
+	// runner install.
+	MaxDependencies = 100
 )
 
 // Manifest is a validated backend.json with its defaults filled in, as
@@ -52,6 +56,10 @@ type Manifest struct {
 	Secrets []string  `json:"secrets"`
 	Cron    []CronJob `json:"cron"`
 	Topics  Topics    `json:"topics"`
+	// Dependencies are npm packages, at exact versions, that the build left
+	// out of the bundle and the runner installs (with pnpm) for the
+	// backend: anything that can't be bundled, native addons above all.
+	Dependencies map[string]string `json:"dependencies"`
 }
 
 // CronJob is one scheduled job: a name the handler sees and a 5-field cron
@@ -84,7 +92,12 @@ var (
 	secretName = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 	cronName   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 	topicName  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$`)
-	hostLabel  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	// npm package names (validate-npm-package-name, new packages): lower
+	// case, optionally scoped, at most 214 characters.
+	packageName = regexp.MustCompile(`^(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*$`)
+	// An exact semver version: no ranges, tags, URLs or git/file specs.
+	exactVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
+	hostLabel    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	// methods a public route may name.
 	methods = []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 )
@@ -107,6 +120,7 @@ func ParseManifest(content []byte, files []string) (*Manifest, error) {
 		Secrets []string         `json:"secrets"`
 		Cron    []CronJob        `json:"cron"`
 		Topics  *json.RawMessage `json:"topics"`
+		Deps    map[string]any   `json:"dependencies"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(content))
 	dec.DisallowUnknownFields()
@@ -120,7 +134,8 @@ func ParseManifest(content []byte, files []string) (*Manifest, error) {
 		return nil, invalid(`"version" must be 1`)
 	}
 	m := &Manifest{Version: 1, Entry: DefaultEntry,
-		Public: []string{}, Egress: []string{}, Secrets: []string{}, Cron: []CronJob{}, Topics: Topics{Public: []string{}}}
+		Public: []string{}, Egress: []string{}, Secrets: []string{}, Cron: []CronJob{}, Topics: Topics{Public: []string{}},
+		Dependencies: map[string]string{}}
 
 	if raw.Entry != nil {
 		m.Entry = *raw.Entry
@@ -209,7 +224,28 @@ func ParseManifest(content []byte, files []string) (*Manifest, error) {
 			m.Topics.Public = append(m.Topics.Public, name)
 		}
 	}
+
+	if len(raw.Deps) > MaxDependencies {
+		return nil, invalid(`"dependencies" can list at most %d packages`, MaxDependencies)
+	}
+	// Sorted, so the first bad entry reported is the same every time.
+	for _, name := range slices.Sorted(maps.Keys(raw.Deps)) {
+		v := raw.Deps[name]
+		if len(name) > 214 || !packageName.MatchString(name) {
+			return nil, invalid(`"dependencies" %q is not an npm package name`, name)
+		}
+		version, ok := v.(string)
+		if !ok || !exactVersion.MatchString(version) {
+			return nil, invalid(`"dependencies" %q: the version must be an exact one, like "1.2.3", got %s`, name, jsonText(v))
+		}
+		m.Dependencies[name] = version
+	}
 	return m, nil
+}
+
+func jsonText(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // checkEntry checks the entry: a path relative to .specola/, of a JavaScript

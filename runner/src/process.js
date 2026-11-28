@@ -135,6 +135,8 @@ export class PageWorker {
    * @param {{id: string, version: number, title: string}} o.page
    * @param {string} o.codeDir
    * @param {string} o.entry absolute path of the entry file
+   * @param {{dir: string, names: string[]} | null} [o.deps] the version's
+   *   installed dependencies (deps.js), or null when it has none
    * @param {string} o.pageDir
    * @param {string} o.snapshotsDir the page's snapshots, which it may read only
    * @param {object} o.limits
@@ -147,8 +149,8 @@ export class PageWorker {
    * @param {string[]} [o.secretNames] the secrets the version declares
    * @param {(pageId: string, m: object) => void} [o.onPublish] a ctx.publish
    */
-  constructor({ page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone, proxy = null, egress = [], secretNames = [], onPublish }) {
-    Object.assign(this, { page, codeDir, entry, pageDir, snapshotsDir, limits, logs, onGone, proxy, egress, secretNames, onPublish });
+  constructor({ page, codeDir, entry, deps = null, pageDir, snapshotsDir, limits, logs, onGone, proxy = null, egress = [], secretNames = [], onPublish }) {
+    Object.assign(this, { page, codeDir, entry, deps, pageDir, snapshotsDir, limits, logs, onGone, proxy, egress, secretNames, onPublish });
     this.id = nextWorkerId++;
     this.state = 'new'; // new → starting → ready → (draining) → stopped; or failed
     this.#ready = new Promise((resolve, reject) => {
@@ -193,6 +195,12 @@ export class PageWorker {
       // fetch of every worker.
       '--disable-warning=UNDICI-EHPA',
     ];
+    if (this.deps) {
+      // Installed packages may load native addons, which run outside the
+      // permission model: only versions that declare dependencies get them
+      // (docs/page-backends.md, "Dependencies").
+      execArgv.push(`--allow-fs-read=${this.deps.dir}`, '--allow-addons', '--disable-warning=SecurityWarning');
+    }
     // A minimal environment: nothing of the runner's (its token above all)
     // reaches page code.
     const env = { TZ: 'UTC', NODE_ENV: 'production', LANG: 'C.UTF-8' };
@@ -228,6 +236,7 @@ export class PageWorker {
       pageDir: this.pageDir,
       snapshotsDir: this.snapshotsDir,
       entry: this.entry,
+      deps: this.deps,
       diskQuota: this.limits.pageDiskBytes,
     });
     this.#log('info', `worker started for version ${this.page.version} (pid ${child.pid})`);

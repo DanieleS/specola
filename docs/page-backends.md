@@ -46,9 +46,8 @@ plugin/CLI, the page SDK and the SPA. Keep it in sync with the code.
 - The page still never reaches Specola directly, holds no credential, and
   stays on an opaque origin. The bridge is the same `MessagePort` that
   carries `localStorage` today.
-- Non-goals (v1): backends for single-file pages (only bundles), npm
-  packages with native addons (proposed in
-  [`native-addons.md`](native-addons.md)), more than one runner replica, per-page
+- Non-goals (v1): backends for single-file pages (only bundles), more
+  than one runner replica, per-page
   resource accounting/billing, a hostile-tenant sandbox (see Trust model).
 
 ## Trust model
@@ -152,7 +151,8 @@ the runner reads them, through the internal API.
   "egress": ["api.openai.com", "*.googleapis.com"],
   "secrets": ["OPENAI_API_KEY"],
   "cron": [{ "name": "nightly", "schedule": "0 3 * * *" }],
-  "topics": { "public": ["scoreboard"] }
+  "topics": { "public": ["scoreboard"] },
+  "dependencies": { "better-sqlite3": "12.4.1" }
 }
 ```
 
@@ -169,6 +169,12 @@ the runner reads them, through the internal API.
   are missing.
 - `cron` — up to 10 jobs; 5-field cron in UTC, at most once a minute.
 - `topics.public` — push topics a public-link visitor may subscribe to.
+- `dependencies` — npm packages the build left out of the bundle, at
+  exact versions, that the runner installs for the backend (see
+  Dependencies). At most 100; names are npm package names (lower case,
+  optionally scoped, ≤ 214 characters); versions are exact semver
+  (`1.2.3`, `1.2.3-rc.1`), never ranges, tags, URLs or git/file specs.
+  Checked in sorted order, so the first bad entry reported is stable.
 
 The upload's manifest step only knows paths and hashes, so it checks the
 layout (`.specola/` files need a `.specola/backend.json`, at most 64 KiB)
@@ -257,6 +263,7 @@ interface Ctx {
                                // 16 MiB); null when there is neither (cron, an anonymous
                                // caller without a visitor)
   files: FileStore;            // per-page key/value blobs on disk
+  dataDir: string;             // absolute path of a directory of the page's own
   secrets: Record<string, string>; // only the names declared in the manifest
   publish(topic: string, data: unknown, opts?: { to?: string /* sub */ }): void;
   waitUntil(p: Promise<unknown>): void; // keep the worker alive after responding
@@ -275,6 +282,10 @@ interface Ctx {
   `{body: ReadableStream, size, contentType} | null`, `delete(key)`,
   `list(prefix?)`. Keys like bundle paths. For uploads: the page sends a
   `FormData`, the handler reads `await request.formData()` and stores.
+- **`dataDir`** is `<page dir>/data/`, created on first access, for
+  libraries that open files by path (`new Database(path.join(ctx.dataDir,
+  "app.db"))` with `better-sqlite3`). It counts against the page's disk
+  quota; it is **not yet** in snapshots, exports, imports or wipes.
 - **Outbound HTTP** is the global `fetch`, routed through the runner's
   egress proxy, which allows only the manifest's `egress` hosts (others get
   a `403` from the proxy, which `fetch` surfaces as a failed request with a
@@ -464,7 +475,9 @@ always keeping the newest.
   its in-flight requests. Each worker runs
   with `node --permission --allow-fs-read=<its code dir>,<its page dir>,
   <its snapshots dir>,<the runner's worker bootstrap> --allow-fs-write=<its
-  page dir>` and no child processes, workers or addons,
+  page dir>` and no child processes, workers or addons (a version with
+  `dependencies` also reads its install and may load addons, see
+  Dependencies),
   `--max-old-space-size` from the limits, and its own minimal environment
   (`TZ=UTC`, `NODE_ENV=production`, `LANG=C.UTF-8`; no runner secrets). From
   step 3 it also gets `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY`/`HTTP_PROXY`
@@ -488,6 +501,41 @@ always keeping the newest.
 - **Single replica, by design**: the data lives on the runner's volume.
   Sharding pages across runners is possible later without changing this
   contract.
+
+### Dependencies
+
+Anything the bundle can't carry — native addons above all, a binary built
+for the author's machine — is a **dependency**: the plugin leaves it out of
+the server build (the bundle keeps `import Database from
+"better-sqlite3"`) and writes it, pinned, in the manifest's
+`dependencies`; the runner installs it for itself.
+
+- **Install**: `pnpm install --prod` of a `package.json` holding exactly
+  the manifest's `dependencies`, with install scripts allowed (native
+  packages fetch or build their binary in one), into
+  `/data/deps/{key}/`, `key` = sha256 of the sorted packages, the platform
+  (`linux-x64-glibc`) and the Node ABI. Pages with the same dependencies
+  share one install; a runner on a new Node installs again rather than load
+  addons built for another ABI. pnpm's store (`/data/deps/.store`) is shared
+  by every install, which hard-link from it. An install is written aside
+  and renamed into place, so an install directory that exists is complete;
+  concurrent first calls share one install.
+- **When**: before the version's worker starts. A call waits for it up to
+  the first-byte timeout, then answers 503 `backend-unavailable` ("the
+  backend's dependencies are being installed; retry in a few seconds")
+  while the install goes on. A failed install answers 500 `backend-error`
+  and is not tried again for 10 minutes. The backend log says what is
+  installed, for which platform and Node, how long it took and, on
+  failure, the end of pnpm's output.
+- **Loading**: the worker gets `--allow-fs-read=<its install>` and
+  `--allow-addons`, and a resolve hook (`module.registerHooks`) resolves
+  a bare import of a listed package, or of one of its subpaths, from the
+  install. Nothing else resolves there.
+- **Isolation**: native code is outside Node's permission model, and
+  install scripts run as the runner's user: a backend with dependencies can
+  reach whatever the runner can. That fits the trust model above;
+  `RUNNER_DEPS=off` turns installs off (such backends then answer 500).
+- `GET /health` carries `dependencies: {enabled, platform, node, abi}`.
 
 ## Secrets
 
@@ -942,8 +990,13 @@ page without a backend they answer an error saying so.
   the client build;
 - writes `.specola/backend.json` from the `backend` option (or a
   `specola.backend.json` next to `vite.config`);
-- fails the build on a native addon import or a manifest that doesn't
-  validate;
+- leaves `backend.dependencies` out of the build (each package and its
+  subpaths stay `import "name"`); a list of names is pinned to the
+  versions installed in the project, found from the server entry as Node
+  would, and a name that isn't installed fails the build;
+- fails the build on a native addon that would be bundled (a `.node` file,
+  or a loader such as `bindings`), naming the package to add to
+  `dependencies`, and on a manifest that doesn't validate;
 - **dev server**: mounts the handler at `/__specola/x/*`, with SQLite and
   files under `.specola-dev/`, secrets from `.env` (only the declared
   names), `ctx.user` from `SPECOLA_DEV_USER`, and the stand-in
@@ -1006,6 +1059,10 @@ amount; the log warns at 99%.
 | `SPECOLA_URL` | runner | specola's internal base URL |
 | `RUNNER_DATA_DIR` | runner | the volume (default `/data`) |
 | `RUNNER_LISTEN` | runner | listen address (default `:8081`) |
+| `RUNNER_DEPS` | runner | `off` refuses backends with dependencies (default `on`) |
+| `RUNNER_PNPM` | runner | the pnpm command (default `pnpm`, in the image) |
+| `RUNNER_NPM_REGISTRY` | runner | registry for dependency installs |
+| `RUNNER_DEPS_INSTALL_TIMEOUT_MS` | runner | one install (default 300000) |
 | `SPECOLA_BACKEND_PURGE_AFTER_DAYS` | specola | purge backend data of pages dormant this long (default: never) |
 
 `docker-compose.yaml` gains a `runner` service and volume, commented out by
@@ -1033,6 +1090,13 @@ false and `specola.fetch` rejects with `BackendUnavailable`
    instructions.
 
 ## Open questions
+
+- **Dependencies, next steps**: start the install when a version is
+  published (specola → runner) and have `specola-publish` wait for it and
+  print the outcome; a distinct `reason: "preparing"` in the SDK;
+  `ctx.dataDir` in snapshots, exports, imports and wipes (SQLite files
+  through the online backup); removing installs no current version uses;
+  pinning transitive versions with a lockfile under `.specola/`.
 
 
 - **Bun-compatible handlers**: the contract is web-standard, so it may run

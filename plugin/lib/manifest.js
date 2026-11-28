@@ -16,13 +16,18 @@ export const DEFAULT_ENTRY = 'server/index.mjs';
 export const MAX_MANIFEST_BYTES = 64 * 1024;
 export const MAX_CRON_JOBS = 10;
 const MAX_LIST_ENTRIES = 100;
+export const MAX_DEPENDENCIES = 100;
 
 const SECRET_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
 const CRON_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const TOPIC_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+// npm package names (lower case, optionally scoped) and exact semver
+// versions, as the server checks them.
+const PACKAGE_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+const EXACT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/;
 const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
-const FIELDS = ['version', 'entry', 'public', 'egress', 'secrets', 'cron', 'topics'];
+const FIELDS = ['version', 'entry', 'public', 'egress', 'secrets', 'cron', 'topics', 'dependencies'];
 
 /** A manifest that doesn't validate; its message names the field. */
 export class ManifestError extends Error {
@@ -77,7 +82,7 @@ export function validateManifest(content, files) {
   };
 
   if (value.version !== 1) throw invalid('"version" must be 1');
-  const m = { version: 1, entry: DEFAULT_ENTRY, public: [], egress: [], secrets: [], cron: [], topics: { public: [] } };
+  const m = { version: 1, entry: DEFAULT_ENTRY, public: [], egress: [], secrets: [], cron: [], topics: { public: [] }, dependencies: {} };
 
   if (value.entry !== undefined && value.entry !== null) {
     if (typeof value.entry !== 'string') throw invalid('not a valid manifest: "entry" must be a string');
@@ -150,7 +155,27 @@ export function validateManifest(content, files) {
       m.topics.public.push(name);
     });
   }
+
+  const deps = value.dependencies ?? {};
+  if (typeof deps !== 'object' || Array.isArray(deps)) {
+    throw invalid('not a valid manifest: "dependencies" must be an object of {"package": "exact version"}');
+  }
+  const names = Object.keys(deps);
+  if (names.length > MAX_DEPENDENCIES) throw invalid(`"dependencies" can list at most ${MAX_DEPENDENCIES} packages`);
+  // Sorted (by bytes, as Go sorts), so the first bad entry reported is the server's.
+  for (const name of names.sort(byBytes)) {
+    if (name.length > 214 || !PACKAGE_NAME.test(name)) throw invalid(`"dependencies" ${q(name)} is not an npm package name`);
+    const v = deps[name];
+    if (typeof v !== 'string' || !EXACT_VERSION.test(v)) {
+      throw invalid(`"dependencies" ${q(name)}: the version must be an exact one, like "1.2.3", got ${JSON.stringify(v)}`);
+    }
+    m.dependencies[name] = v;
+  }
   return m;
+}
+
+function byBytes(a, b) {
+  return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
 }
 
 /** The entry: a path relative to .specola/, of a JavaScript module the bundle has. */

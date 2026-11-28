@@ -18,7 +18,7 @@ func TestParseManifestDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := json.Marshal(m)
-	want := `{"version":1,"entry":"server/index.mjs","public":[],"egress":[],"secrets":[],"cron":[],"topics":{"public":[]}}`
+	want := `{"version":1,"entry":"server/index.mjs","public":[],"egress":[],"secrets":[],"cron":[],"topics":{"public":[]},"dependencies":{}}`
 	if string(b) != want {
 		t.Fatalf("normalised = %s\nwant %s", b, want)
 	}
@@ -32,18 +32,20 @@ func TestParseManifestFull(t *testing.T) {
 		"egress": ["API.openai.com", "*.googleapis.com", "example.com:443", "plain.example:80"],
 		"secrets": ["OPENAI_API_KEY", "A"],
 		"cron": [{"name": "nightly", "schedule": "0  3 * * *"}, {"name": "weekdays", "schedule": "*/15 9-17 * JAN-dec mon-FRI"}],
-		"topics": {"public": ["scoreboard", "room:1"]}
+		"topics": {"public": ["scoreboard", "room:1"]},
+		"dependencies": {"better-sqlite3": "12.4.1", "@img/sharp-linux-x64": "0.34.4-rc.1+build.2"}
 	}`), bundleFiles)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := &Manifest{
 		Version: 1, Entry: "server/chunk.js",
-		Public:  []string{"GET /api/stats", "POST /api/votes", "GET /api/public/*", "GET /"},
-		Egress:  []string{"api.openai.com", "*.googleapis.com", "example.com:443", "plain.example:80"},
-		Secrets: []string{"OPENAI_API_KEY", "A"},
-		Cron:    []CronJob{{"nightly", "0 3 * * *"}, {"weekdays", "*/15 9-17 * JAN-dec mon-FRI"}},
-		Topics:  Topics{Public: []string{"scoreboard", "room:1"}},
+		Public:       []string{"GET /api/stats", "POST /api/votes", "GET /api/public/*", "GET /"},
+		Egress:       []string{"api.openai.com", "*.googleapis.com", "example.com:443", "plain.example:80"},
+		Secrets:      []string{"OPENAI_API_KEY", "A"},
+		Cron:         []CronJob{{"nightly", "0 3 * * *"}, {"weekdays", "*/15 9-17 * JAN-dec mon-FRI"}},
+		Topics:       Topics{Public: []string{"scoreboard", "room:1"}},
+		Dependencies: map[string]string{"better-sqlite3": "12.4.1", "@img/sharp-linux-x64": "0.34.4-rc.1+build.2"},
 	}
 	if !reflect.DeepEqual(m, want) {
 		t.Fatalf("manifest = %+v\nwant %+v", m, want)
@@ -100,6 +102,14 @@ func TestParseManifestErrors(t *testing.T) {
 		"cron macro":        {`{"version":1,"cron":[{"name":"a","schedule":"@daily"}]}`, `"cron"[0].schedule`},
 		"topics shape":      {`{"version":1,"topics":{"private":[]}}`, `"topics"`},
 		"topic bad name":    {`{"version":1,"topics":{"public":["a b"]}}`, `"topics.public"[0]`},
+		"dep not object":    {`{"version":1,"dependencies":["a"]}`, "not a valid manifest"},
+		"dep range":         {`{"version":1,"dependencies":{"a":"^1.2.3"}}`, `"dependencies" "a"`},
+		"dep tag":           {`{"version":1,"dependencies":{"a":"latest"}}`, `"dependencies" "a"`},
+		"dep git":           {`{"version":1,"dependencies":{"a":"github:x/y"}}`, `"dependencies" "a"`},
+		"dep not string":    {`{"version":1,"dependencies":{"a":1}}`, `"dependencies" "a"`},
+		"dep upper name":    {`{"version":1,"dependencies":{"Abc":"1.0.0"}}`, `"dependencies" "Abc"`},
+		"dep path name":     {`{"version":1,"dependencies":{"../x":"1.0.0"}}`, `"dependencies" "../x"`},
+		"dep first sorted":  {`{"version":1,"dependencies":{"b":"x","a":"y"}}`, `"dependencies" "a"`},
 		"too large":         {`{"version":1,"x":"` + strings.Repeat("x", MaxManifestBytes) + `"}`, "larger than"},
 	} {
 		_, err := ParseManifest([]byte(tc.json), bundleFiles)

@@ -18,6 +18,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import { CodeCache } from './code.js';
+import { DepsCache } from './deps.js';
 import { RunnerError, sendError, sendJSON } from './errors.js';
 import { Logs } from './log.js';
 import { startEgressProxy } from './egress.js';
@@ -276,7 +277,9 @@ export function createRunner(config, { fetch: f, now, egress: egressOptions = {}
   });
   egress.catch(() => {}); // reported by listen() and by the calls that need it
   const publisher = new Publisher({ specolaUrl: config.specolaUrl, token: config.token, fetch: f ?? fetch, logs, options: publishOptions });
-  const pages = new Pages({ config, code, logs, now, egress, publisher });
+  // Tests without a deps section get the defaults: installs on, pnpm on PATH.
+  const deps = new DepsCache({ dataDir: config.dataDir, ...(config.deps ?? {}) });
+  const pages = new Pages({ config, code, deps, logs, now, egress, publisher });
   // Compared as digests: equal lengths for timingSafeEqual, whatever was sent.
   const expected = createHash('sha256').update(`Bearer ${config.token}`).digest();
   const authorized = (req) => {
@@ -299,7 +302,7 @@ export function createRunner(config, { fetch: f, now, egress: egressOptions = {}
     };
     switch (url.pathname) {
       case '/health':
-        if (allow('GET')) sendJSON(res, 200, { ok: true, version: RUNNER_VERSION });
+        if (allow('GET')) sendJSON(res, 200, { ok: true, version: RUNNER_VERSION, dependencies: { enabled: deps.enabled, platform: deps.platform.id, node: deps.platform.node, abi: deps.platform.abi } });
         return;
       case '/logs': {
         if (!allow('GET')) return;
@@ -366,6 +369,7 @@ export function createRunner(config, { fetch: f, now, egress: egressOptions = {}
      */
     async sweep() {
       await code.sweep();
+      await deps.sweep();
       await pages.sweep();
       await sweepSnapshots(config.dataDir);
       await pages.resumeErasures();

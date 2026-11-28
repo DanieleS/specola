@@ -30,6 +30,13 @@ export interface SpecolaBackendOptions {
   cron?: { name: string; schedule: string }[];
   /** Push topics a public-link visitor may subscribe to. */
   topics?: { public?: string[] };
+  /**
+   * npm packages the build leaves out of the bundle and the runner installs
+   * (with pnpm, for its own platform): for what can't be bundled, native
+   * addons above all. A list of names is pinned to the versions installed
+   * in the project; an object gives exact versions.
+   */
+  dependencies?: string[] | Record<string, string>;
   /** Always 1. */
   version?: 1;
 }

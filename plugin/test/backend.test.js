@@ -2,7 +2,7 @@
 // the server build of test/fixture-backend, and the dev server's handler.
 
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
@@ -67,6 +67,7 @@ test('the server is built into .specola/server/, next to the app', () => {
     secrets: ['API_KEY'],
     cron: [],
     topics: { public: [] },
+    dependencies: {},
   });
   const server = readFileSync(join(outDir, '.specola/server/index.mjs'), 'utf8');
   assert.match(server, /export \{[^}]*default/, 'an ES module with a default export');
@@ -122,12 +123,52 @@ test('the build fails on a native addon', async () => {
   writeFileSync(join(root, 'server', 'index.ts'), "import addon from './addon.node';\nexport default { fetch: () => new Response(String(addon)) };\n");
   await assert.rejects(
     buildApp(root, join(root, 'dist'), { server: 'server/index.ts' }),
-    /the backend uses the native addon "\.\/addon\.node" \(imported by server\/index\.ts\): page backends can't load native addons/,
+    /the backend uses the native addon "\.\/addon\.node" \(imported by server\/index\.ts\): native addons \(\.node files\) can't be bundled\. Add the package that loads it/,
   );
 
   const loader = copyFixture('native-loader');
   writeFileSync(join(loader, 'server', 'index.ts'), "import bindings from 'bindings';\nexport default { fetch: () => new Response(String(bindings)) };\n");
   await assert.rejects(buildApp(loader, join(loader, 'dist'), { server: 'server/index.ts' }), /native addon loader "bindings"/);
+});
+
+// A package that loads a native addon, as better-sqlite3 does through bindings.
+function addNativePackage(root) {
+  const pkg = join(root, 'node_modules', 'fake-native');
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'fake-native', version: '1.2.3', main: 'index.js' }));
+  writeFileSync(join(pkg, 'index.js'), "module.exports = require('bindings')('fake');\n");
+  writeFileSync(join(root, 'server', 'index.ts'), "import Fake from 'fake-native';\nimport sub from 'fake-native/index.js';\nexport default { fetch: () => new Response(String(Fake) + String(sub)) };\n");
+}
+
+test('a native package not declared fails the build, naming it', async () => {
+  const root = copyFixture('native-undeclared');
+  addNativePackage(root);
+  await assert.rejects(
+    buildApp(root, join(root, 'dist'), { server: 'server/index.ts' }),
+    /native addon loader "bindings" \(imported by node_modules\/fake-native\/index\.js\).*backend: \{ dependencies: \["fake-native"\] \}/,
+  );
+});
+
+test('dependencies are pinned, left out of the bundle and imported by name', async () => {
+  const root = copyFixture('native-declared');
+  addNativePackage(root);
+  const out = join(root, 'dist');
+  await buildApp(root, out, { server: 'server/index.ts', backend: { dependencies: ['fake-native'] } });
+  const manifest = JSON.parse(readFileSync(join(out, '.specola', 'backend.json'), 'utf8'));
+  assert.deepEqual(manifest.dependencies, { 'fake-native': '1.2.3' });
+  const code = readFileSync(join(out, '.specola', 'server', 'index.mjs'), 'utf8');
+  assert.match(code, /from "fake-native"/);
+  assert.match(code, /from "fake-native\/index\.js"/);
+  assert.doesNotMatch(code, /bindings/);
+
+  await assert.rejects(
+    buildApp(root, out, { server: 'server/index.ts', backend: { dependencies: ['not-installed'] } }),
+    /the dependency "not-installed" is not installed in the project/,
+  );
+  await assert.rejects(
+    buildApp(root, out, { server: 'server/index.ts', backend: { dependencies: { 'fake-native': '^1.2.3' } } }),
+    /"dependencies" "fake-native": the version must be an exact one/,
+  );
 });
 
 test('the build fails when the app imports server code', async () => {

@@ -31,6 +31,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { entryOf } from './code.js';
+import { dependenciesOf } from './deps.js';
 import { SLOTS, commitSwap, exportZip, finishSwap, prepareExport, removeDb, stageImport, stageSwapImport, stageSwapRestore, swapNew, usersBytes, userHash, wipeSlots } from './data.js';
 import { RunnerError } from './errors.js';
 import { PageWorker } from './process.js';
@@ -49,6 +50,8 @@ export class Pages {
    * @param {object} o
    * @param {object} o.config
    * @param {import('./code.js').CodeCache} o.code
+   * @param {import('./deps.js').DepsCache | null} [o.deps] installs the
+   *   versions' dependencies; null: a version that has some can't run
    * @param {import('./log.js').Logs} o.logs
    * @param {() => number} [o.now] the clock of snapshots and of the daily
    *   one (tests move it)
@@ -56,9 +59,10 @@ export class Pages {
    *   (egress.js), or a promise of it while it starts
    * @param {import('./push.js').Publisher} [o.publisher] where ctx.publish goes
    */
-  constructor({ config, code, logs, now = Date.now, egress = null, publisher = null }) {
+  constructor({ config, code, deps = null, logs, now = Date.now, egress = null, publisher = null }) {
     this.config = config;
     this.code = code;
+    this.deps = deps;
     this.logs = logs;
     this.now = now;
     this.egress = egress;
@@ -252,8 +256,11 @@ export class Pages {
       // Cheap refusal first: no need to fetch code that will not run.
       refuseOld(page, inv.page.version);
       const codeDir = await this.code.ensure(inv.versionId, inv.codeHash);
+      // Outside the lock: an install can take minutes, and needs no data.
+      const deps = await this.#depsFor(page.id, codeDir, deadline);
+      if (isGone()) return null;
       // Inside the lock, a maintenance that started meanwhile wins.
-      const worker = await this.#locked(page, () => (page.offline || page.purged ? null : this.#workerFor(page, inv, codeDir)));
+      const worker = await this.#locked(page, () => (page.offline || page.purged ? null : this.#workerFor(page, inv, codeDir, deps)));
       if (!worker) continue;
       if (isGone()) return null;
       page.title = inv.page.title;
@@ -261,7 +268,33 @@ export class Pages {
     }
   }
 
-  async #workerFor(page, inv, codeDir) {
+  // The version's dependencies, installed: {dir, names}, or null when it
+  // has none. A call doesn't wait for an install longer than it may wait
+  // for its first byte: it answers 503 and the install goes on, for the
+  // next call.
+  async #depsFor(pageId, codeDir, deadline) {
+    const deps = await dependenciesOf(codeDir);
+    const names = Object.keys(deps);
+    if (names.length === 0) return null;
+    if (!this.deps) throw new RunnerError(500, 'backend-error', 'This runner does not install backend dependencies.');
+    const install = this.deps.ensure(deps, (level, text) => this.logs.append(pageId, level, text));
+    install.catch(() => {}); // reported to the call that waits for it, or to the next
+    let timer;
+    const late = new Promise((resolve) => {
+      timer = setTimeout(resolve, Math.max(0, deadline - Date.now()), null);
+    });
+    try {
+      const dir = await Promise.race([install, late]);
+      if (dir === null) {
+        throw new RunnerError(503, 'backend-unavailable', 'The backend\'s dependencies are being installed; retry in a few seconds.');
+      }
+      return { dir, names };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async #workerFor(page, inv, codeDir, deps = null) {
     const v = inv.page.version;
     refuseOld(page, v);
     if (page.swapPending) {
@@ -287,6 +320,7 @@ export class Pages {
       page: { ...inv.page },
       codeDir,
       entry,
+      deps,
       pageDir: this.pageDir(page.id),
       snapshotsDir: this.snapshotsDir(page.id),
       limits: this.limits,

@@ -122,8 +122,8 @@ specola({
 ```
 
 The `backend` option (or a `specola.backend.json` next to `vite.config`,
-not both) is the manifest: `public`, `egress`, `secrets`, `cron`, `topics`
-(see the contract). The build fails on a manifest the server would refuse.
+not both) is the manifest: `public`, `egress`, `secrets`, `cron`, `topics`,
+`dependencies` (see the contract). The build fails on a manifest the server would refuse.
 
 ```ts
 // server/index.ts
@@ -185,17 +185,60 @@ app can without them, and say what needs a connection.
 ### What the build does
 
 After the app, `vite build` builds the server entry with Vite's SSR build
-(target Node 22, ES module, every dependency bundled in) into
+(target Node 22, ES module, every dependency bundled in but the
+`dependencies` below) into
 `dist/.specola/server/index.mjs`, and writes the manifest to
 `dist/.specola/backend.json`. Specola never serves `.specola/`; only the
 runner reads it. The build fails when:
 
 - the app imports the server entry, or anything in its directory: that code
   would be served to every viewer (keep shared code outside `server/`);
-- the backend imports a native addon (`.node`, or a loader such as
-  `bindings`): use a pure-JavaScript or WebAssembly package (`node:sqlite`
-  is built in);
+- the backend would bundle a native addon (`.node`, or a loader such as
+  `bindings`): the error names the package to add to `dependencies`;
+- a package listed in `dependencies` isn't installed in the project;
 - the app itself puts files under `.specola/` (say, in `public/`).
+
+### Dependencies (native addons)
+
+What can't be bundled — a native addon is a binary for your machine, not
+the runner's — goes in `dependencies`; the runner installs it with pnpm
+for its own platform and Node:
+
+```js
+specola({
+  server: 'server/index.ts',
+  backend: { dependencies: ['better-sqlite3'] },
+});
+```
+
+```ts
+// server/index.ts
+import Database from 'better-sqlite3';
+import path from 'node:path';
+
+export default {
+  fetch(request, ctx) {
+    const db = new Database(path.join(ctx.dataDir, 'app.db'));
+    // ...
+  },
+};
+```
+
+- A list of names is pinned to the versions installed in the project
+  (the ones `vite dev` runs with): the manifest gets
+  `{"better-sqlite3": "12.4.1"}`. An object of exact versions works too.
+- Those packages, and their subpaths, stay `import "name"` in the bundle;
+  everything else is still bundled.
+- The first call after publishing may answer 503 for a few seconds while
+  the runner installs them; the backend log shows the install and, if it
+  fails, pnpm's output. Packages without a prebuilt binary for Linux need
+  a runner image with a toolchain.
+- `ctx.dataDir` is a directory of the page's own for files such libraries
+  open; it counts against the page's 1 GiB, and isn't in snapshots or
+  exports yet (`ctx.db` is). Under `vite dev` it is `.specola-dev/data/`.
+- A backend with dependencies can load native code, which isn't held by
+  the runner's sandbox: on instances that turned installs off
+  (`RUNNER_DEPS=off`) it answers 500.
 
 ### Secrets
 
@@ -472,7 +515,6 @@ earlier.
 - External SVG sprites (`<use href="icons.svg#id">`): inline them.
 - Server-side rendering. Server code is a page backend (see Backend), on
   instances that enable them; elsewhere a bundle is static files.
-- Native addons in a backend.
 - Building on the server: bundles are built on your machine and uploaded.
 
 ## Developing the plugin

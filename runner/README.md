@@ -32,9 +32,15 @@ running it.
 - **Scheduled runs**: Specola keeps the schedule and calls `POST
   /scheduled`; the runner runs the entry's `scheduled(event, ctx)`.
 - Read-only SQL on a page's shared database, for MCP's `backend_query`.
+- **Dependencies**: the npm packages a version's manifest lists under
+  `dependencies` (native addons above all, such as `better-sqlite3`), which
+  the build leaves out of the bundle. The runner installs them with pnpm
+  for its own platform and Node, once per set of packages, and the worker
+  resolves them by name.
 
 No npm dependencies and no build step: Node built-ins only (`node:sqlite`,
-`node:http`, `child_process`). Runs on Node ≥ 22.21 on 22.x, or ≥ 24.5:
+`node:http`, `child_process`); pnpm (in the image) only installs the
+backends' own dependencies. Runs on Node ≥ 22.21 on 22.x, or ≥ 24.5:
 it refuses to start on older releases, whose workers would ignore the
 egress proxy. The image is `node:24-slim`.
 
@@ -70,6 +76,10 @@ same `SPECOLA_RUNNER_TOKEN`, and `SPECOLA_SECRETS_KEY` (see
 | `RUNNER_PAGE_DISK_BYTES` | 1 GiB | A page's databases and files, snapshots excluded. Databases get a SQLite `max_page_count` from it (writes past it fail with "database or disk is full"); `files.put` refuses with `QuotaExceededError` |
 | `RUNNER_IDLE_TIMEOUT_MS` | 300000 | An idle worker stops after this |
 | `RUNNER_SNAPSHOT_DISK_BYTES` | 2 GiB | A page's snapshots; past it the oldest automatic ones go first (the newest is always kept, manual ones never go: a manual one that does not fit is refused) |
+| `RUNNER_DEPS` | `on` | `off`: a backend whose manifest has `dependencies` answers `500 backend-error` instead of having them installed |
+| `RUNNER_PNPM` | `pnpm` | The pnpm command that installs dependencies |
+| `RUNNER_NPM_REGISTRY` | npm's | Registry the installs use (a mirror, a private registry); `npm_config_*` variables and the proxy variables of the runner's environment reach pnpm too |
+| `RUNNER_DEPS_INSTALL_TIMEOUT_MS` | 300000 | One install; past it, it is killed and fails |
 | `RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS` | unset | **Tests only.** `1` lets the egress proxy connect a host on a page's `egress` list that resolves to loopback, on any port, so an end-to-end test (`e2e/backends.mjs`) can serve the "outside" host itself. Every other egress rule stays. The runner refuses to start with it under `NODE_ENV=production`, and warns when it is set |
 
 Fixed, for now: a scheduled run gets 5 minutes; a page publishes at most
@@ -172,8 +182,40 @@ of each kind in the backend log.
 /data/pages/{pageId}/files/blobs/{sha256}    ctx.files contents
 /data/snapshots/{pageId}/{id}/               a snapshot and its meta.json (outside the page's reach)
 /data/swap/{pageId}/                         the data a restore, import or wipe swaps in, and its journal
+/data/pages/{pageId}/data/                   ctx.dataDir: files the code opens by path (not in snapshots yet)
 /data/tmp/                                   imports and downloads in progress (emptied at start)
+/data/deps/{key}/node_modules/…              dependencies installed for a set of packages, platform and Node ABI
+/data/deps/.store/                           pnpm's content-addressed store (installs hard-link from it)
+/data/deps/.home/                            pnpm's own home, cache and state
 ```
+
+### Dependencies
+
+A version whose `backend.json` has `"dependencies": {"better-sqlite3":
+"12.4.1"}` (exact versions; the plugin pins them from the project) runs
+once they are installed. The install is `pnpm install --prod` in
+`deps/.tmp-*`, renamed to `deps/{key}` when it succeeds, so a directory
+there is complete. `key` hashes the packages, the platform
+(`linux-x64-glibc`) and the Node ABI: pages with the same dependencies
+share one install, and a runner image with a new Node installs again
+instead of loading addons built for another ABI. Install scripts run
+(`dangerously-allow-all-builds`), as native packages fetch or build their
+binary in one; pnpm gets `HOME` under `deps/.home`, the proxy and `npm_config_*`
+variables of the runner's environment, and never the runner's token.
+
+The first call waits for the install up to the first-byte timeout, then
+answers `503 backend-unavailable` ("being installed; retry") while the
+install goes on. Progress, the time it took and, on failure, the end of
+pnpm's output are in the page's backend log; a failed install is not
+tried again for 10 minutes (or until the runner restarts). `GET /health`
+says `dependencies: {enabled, platform, node, abi}`.
+
+Packages with prebuilt binaries for the platform (`better-sqlite3`,
+`sharp`, `argon2`, `bcrypt`, …) need only the registry and the hosts their
+prebuilds come from (GitHub releases for most). Others compile with
+node-gyp, which needs the toolchain image: `docker build --build-arg
+TOOLCHAIN=1`. Nothing removes old installs yet: `deps/{key}` directories
+can be deleted by hand at any time (they are installed again on demand).
 
 A snapshot id is `<UTC stamp>-<kind>`, plus `-v<N>` for a version one
 (`20261125T101500Z-version-v3`, `20261126T080000Z-daily`,
@@ -211,7 +253,10 @@ contained and pages from stepping on each other:
   `--permission`, reading only its code directory, its page directory, its
   snapshots and the worker's own bootstrap files, writing only its page
   directory (so not its snapshots, which must survive its bugs); no
-  child processes, worker threads, native addons or WASI. A backend that
+  child processes, worker threads, native addons or WASI. A version that
+  declares `dependencies` also reads its install and **may load native
+  addons** (`--allow-addons`): native code is outside the permission
+  model, so such a backend can reach whatever the runner's user can. A backend that
   opens `node:sqlite` itself is held to its page directory too (Node 22's
   `node:sqlite` does not consult the permission model, so the worker routes
   it through a guard; the guard needs `module.registerHooks`, Node ≥ 22.15).
@@ -259,6 +304,10 @@ model"): a deliberately malicious author. In particular:
   processes' memory or `/proc` details the OS exposes, SQL `ATTACH` of a
   database path outside the page directory, side channels.
 - Pages that share the runner share its CPU and its volume's I/O.
+- **Dependencies' install scripts** run as the runner's user, outside any
+  worker, and native addons ignore the permission model. `RUNNER_DEPS=off`
+  closes both. A container egress policy must let pnpm reach the registry
+  and the prebuild hosts (or point `RUNNER_NPM_REGISTRY` at a mirror).
 
 An operator who wants more puts the runner container behind a network
 policy and an OS-level sandbox (gVisor, a seccomp profile, a separate VM);

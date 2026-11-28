@@ -97,7 +97,8 @@ export async function fakeSpecola() {
 /**
  * A runner on a random port. opts.now is its snapshot clock (a function),
  * for tests that move time; opts.egress and opts.publish go to
- * createRunner (the egress proxy's test seams, the publisher's timings).
+ * createRunner (the egress proxy's test seams, the publisher's timings);
+ * opts.deps is the config's deps section (deps.js).
  */
 export async function startRunner(limits = {}, opts = {}) {
   const specola = await fakeSpecola();
@@ -108,6 +109,8 @@ export async function startRunner(limits = {}, opts = {}) {
     specolaUrl: specola.url,
     dataDir,
     limits: { ...DEFAULT_LIMITS, ...limits },
+    // How backend dependencies are installed (deps.js); tests of them pass a fake pnpm.
+    ...(opts.deps ? { deps: opts.deps } : {}),
   };
   const runner = createRunner(config, { now: opts.now, egress: opts.egress, publish: opts.publish });
   const addr = await runner.listen(0, '127.0.0.1');

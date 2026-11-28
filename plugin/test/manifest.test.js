@@ -22,6 +22,7 @@ test('a minimal manifest is normalised with every field', () => {
     secrets: [],
     cron: [],
     topics: { public: [] },
+    dependencies: {},
   });
 });
 
@@ -34,7 +35,9 @@ test('a full manifest is normalised as the server stores it', () => {
     secrets: ['OPENAI_API_KEY'],
     cron: [{ name: 'nightly', schedule: '0  3 * *   *' }, { name: 'weekly', schedule: '*/15 1-5 1,15 jan-mar MON-FRI' }],
     topics: { public: ['scoreboard'] },
+    dependencies: { 'better-sqlite3': '12.4.1', '@img/sharp-linux-x64': '0.34.4-rc.1+b.2' },
   });
+  assert.deepEqual(Object.keys(m.dependencies), ['@img/sharp-linux-x64', 'better-sqlite3']);
   assert.deepEqual(m.public, ['GET /api/stats', 'POST /api/votes', 'GET /api/public/*', 'GET /']);
   assert.deepEqual(m.egress, ['api.openai.com', '*.googleapis.com', 'example.org:443']);
   assert.deepEqual(m.cron, [
@@ -90,6 +93,12 @@ test('invalid manifests are refused with the server messages', () => {
     [{ version: 1, topics: { private: [] } }, /"topics" must be \{"public": \[\.\.\.\]\}: json: unknown field "private"/],
     [{ version: 1, topics: { public: ['bad topic'] } }, /"topics\.public"\[0\] "bad topic": 1 to 128 letters/],
     [{ version: 1, topics: { public: ['a', 'a'] } }, /"topics\.public"\[1\] "a" is listed twice/],
+    [{ version: 1, dependencies: ['a'] }, /"dependencies" must be an object/],
+    [{ version: 1, dependencies: { a: '^1.2.3' } }, /"dependencies" "a": the version must be an exact one/],
+    [{ version: 1, dependencies: { a: 'latest' } }, /"dependencies" "a": the version must be an exact one/],
+    [{ version: 1, dependencies: { a: 1 } }, /"dependencies" "a": the version must be an exact one/],
+    [{ version: 1, dependencies: { Abc: '1.0.0' } }, /"dependencies" "Abc" is not an npm package name/],
+    [{ version: 1, dependencies: { b: 'x', a: 'y' } }, /"dependencies" "a"/],
     [{ version: 1, public: Array.from({ length: 101 }, (_, i) => `GET /r${i}`) }, /"public" can list at most 100 routes/],
     [JSON.stringify({ version: 1, secrets: [] }) + ' '.repeat(64 * 1024), /larger than 65536 bytes/],
   ];

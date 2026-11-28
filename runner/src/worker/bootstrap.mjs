@@ -153,6 +153,30 @@ function installSqliteGuard(dir) {
   return guardURL;
 }
 
+// Resolves the version's dependencies (deps.js) from the runner's install
+// of them: the bundle imports them by name, and its code directory has no
+// node_modules. Imports from inside the install resolve as usual.
+function installDepsResolver(deps) {
+  if (!deps?.names?.length || typeof module.registerHooks !== 'function') return;
+  const names = new Set(deps.names);
+  const base = pathToFileURL(path.join(deps.dir, 'package.json')).href;
+  const inside = pathToFileURL(deps.dir).href + '/';
+  module.registerHooks({
+    resolve(specifier, context, next) {
+      if (names.has(packageName(specifier)) && !context.parentURL?.startsWith(inside)) {
+        return next(specifier, { ...context, parentURL: base });
+      }
+      return next(specifier, context);
+    },
+  });
+}
+
+function packageName(spec) {
+  if (spec.startsWith('.') || spec.startsWith('/') || spec.includes(':')) return '';
+  const parts = spec.split('/');
+  return spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
+}
+
 // --- init -----------------------------------------------------------------
 
 async function init(msg) {
@@ -164,6 +188,7 @@ async function init(msg) {
   quota = new PageQuota(pageDir, diskQuota, (text) => log('warn', [text]), snapshotsDir);
   await quota.refresh();
   const guardURL = installSqliteGuard(pageDir);
+  installDepsResolver(msg.deps);
   const guard = await import(guardURL);
   const getBuiltin = process.getBuiltinModule?.bind(process);
   if (getBuiltin) {
@@ -244,6 +269,13 @@ function makeCtx(msg, call) {
     get files() {
       files ??= new FileStore(pageDir, diskQuota, snapshotsDir);
       return files;
+    },
+    // A directory of the page's own, for libraries that want a file path
+    // (better-sqlite3 and the like); it counts against the page's disk.
+    get dataDir() {
+      const dir = path.join(pageDir, 'data');
+      fs.mkdirSync(dir, { recursive: true });
+      return dir;
     },
     // Only the names the version declares: the runner filtered them.
     secrets: Object.freeze({ ...(msg.secrets ?? {}) }),

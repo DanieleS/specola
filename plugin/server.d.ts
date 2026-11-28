@@ -105,6 +105,13 @@ export interface Ctx {
   /** The page's file store. */
   readonly files: FileStore;
   /**
+   * Absolute path of a directory of the page's own, for libraries that open
+   * files by path (better-sqlite3 and the like). It counts against the
+   * page's disk quota. Not yet included in snapshots, exports, imports or
+   * wipes. Under `vite dev` it is .specola-dev/data/.
+   */
+  readonly dataDir: string;
+  /**
    * The secrets the manifest declares that the page's owner has set, by
    * name; a secret not set yet is missing. Values are set in Specola's UI
    * only, never by code or agents. Under `vite dev` they come from .env and

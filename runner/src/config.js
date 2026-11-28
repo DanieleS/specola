@@ -102,8 +102,19 @@ export function loadConfig(env = process.env) {
   if (egressAllowLoopbackForTests && env.NODE_ENV === 'production') {
     throw new Error('RUNNER_EGRESS_ALLOW_LOOPBACK_FOR_TESTS is for tests only and is refused with NODE_ENV=production');
   }
+  const depsFlag = env.RUNNER_DEPS || 'on';
+  if (depsFlag !== 'on' && depsFlag !== 'off') throw new Error(`RUNNER_DEPS must be on or off, got ${JSON.stringify(depsFlag)}`);
+  const registry = env.RUNNER_NPM_REGISTRY || '';
+  if (registry && !/^https?:\/\//.test(registry)) throw new Error(`RUNNER_NPM_REGISTRY must be an http(s) URL, got ${JSON.stringify(registry)}`);
   return {
     listen: parseListen(env.RUNNER_LISTEN || ':8081'),
+    // Backend dependencies (deps.js): installed with pnpm, from the registry.
+    deps: {
+      enabled: depsFlag === 'on',
+      pnpm: env.RUNNER_PNPM || 'pnpm',
+      registry,
+      timeoutMs: env.RUNNER_DEPS_INSTALL_TIMEOUT_MS ? positiveInt('RUNNER_DEPS_INSTALL_TIMEOUT_MS', env.RUNNER_DEPS_INSTALL_TIMEOUT_MS) : 300_000,
+    },
     egressAllowLoopbackForTests,
     token,
     specolaUrl: specolaUrl.replace(/\/+$/, ''),
